@@ -36,6 +36,13 @@ const record = (id: string, sequence: number, over: Partial<SubagentStep> = {}):
 /** Let the timer the follower schedules run a few times. */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 25));
 
+/** The URL the client was asked for on its `index`th read. */
+function requested(client: StubClient, index: number): URL {
+  const call = client.calls[index];
+  assert.ok(call !== undefined, `read ${index} must have been made`);
+  return new URL(call.path, "http://test.invalid");
+}
+
 function follow(client: StubClient, seen: string[][]) {
   return followSubagent({
     client: client.asClient(),
@@ -60,10 +67,10 @@ test("a running child's steps are followed from its own stream", async () => {
   stop();
   assert.deepEqual(seen[0], ["s1"]);
   assert.deepEqual(seen.at(-1), ["s1", "s2"]);
-  const first = new URL(client.calls[0]!.path, "http://test.invalid");
+  const first = requested(client, 0);
   assert.equal(first.pathname, "/api/sessions/session-1/runs/run-1/streams/subagent-child-1/events");
   assert.equal(first.searchParams.get("after"), "0");
-  assert.equal(new URL(client.calls[1]!.path, "http://test.invalid").searchParams.get("after"), "1");
+  assert.equal(requested(client, 1).searchParams.get("after"), "1");
 });
 
 test("following stops when the panel closes", async () => {
@@ -88,5 +95,5 @@ test("a read that failed does not end the following", async () => {
   await settle();
   stop();
   assert.deepEqual(seen.at(-1), ["s1"]);
-  assert.equal(new URL(client.calls[1]!.path, "http://test.invalid").searchParams.get("after"), "0");
+  assert.equal(requested(client, 1).searchParams.get("after"), "0");
 });

@@ -639,7 +639,8 @@ async function readSteps(events: SessionRunEvent[], after = 0) {
       page = await readSubagentSteps(client, "session-1", "run-1", "child-1", after);
     },
   );
-  return { page: page!, urls };
+  assert.ok(page !== undefined, "the read must have answered");
+  return { page, urls };
 }
 
 test("a child's steps are read from its own stream, from the cursor it left", async () => {
@@ -647,7 +648,9 @@ test("a child's steps are read from its own stream, from the cursor it left", as
     stepRecord("s1", 7, { status: "running" }),
     stepRecord("s1", 8, { content: "done", status: "completed" }),
   ], 6);
-  const url = new URL(urls[0]!, "http://test.invalid");
+  const [firstUrl] = urls;
+  assert.ok(firstUrl !== undefined, "the read must have asked the API");
+  const url = new URL(firstUrl, "http://test.invalid");
   assert.equal(url.pathname, "/api/sessions/session-1/runs/run-1/streams/subagent-child-1/events");
   assert.equal(url.searchParams.get("after"), "6");
   assert.equal(page.cursor, 8);
@@ -669,7 +672,7 @@ test("records on a child's stream that are not steps are ignored", async () => {
   // The same stream carries the child's agent records; only steps are what the
   // panel draws.
   const { page } = await readSteps([
-    outputRecord({ evidence: { agentId: "subagent:child-1" }, type: "agent.record" } as unknown as RunStreamEvent, 1),
+    outputRecord({ name: "state.committed", type: "agent.record" }, 1),
     stepRecord("s1", 2),
   ]);
   assert.deepEqual(page.steps.map((step) => step.id), ["s1"]);

@@ -262,22 +262,23 @@ export function App({ initialToken }: Props) {
    * before this window did, or that was continued by a later process, is not on
    * it at all — and the catalog read above answers only once the child settles.
    * Following the child's stream is what keeps 执行详情 filling while it runs. */
-  const [followedSteps, setFollowedSteps] = useState<SubagentStep[]>([]);
-  useEffect(() => {
-    setFollowedSteps([]);
-  }, [openSubagentId, state.sessionId]);
-  const followedRunId = resolvedSubagent?.status === "running"
-    && resolvedSubagent.parentTurnId !== ""
+  /** The followed stream's steps, bound to the record they were read for. A
+   *  snapshot outlives the selection that asked for it by one render, so it
+   *  carries its own id: another child's steps are never drawn under this one. */
+  const [followed, setFollowed] = useState<{ runId: string; steps: SubagentStep[]; subagentId: string }>();
+  const followedRunId = resolvedSubagent?.status === "running" && resolvedSubagent.parentTurnId
     ? resolvedSubagent.parentTurnId
     : undefined;
   useEffect(() => {
     if (openSubagentId === undefined || state.sessionId === undefined || followedRunId === undefined) return;
+    const subagentId = openSubagentId;
+    const runId = followedRunId;
     return followSubagent({
       client,
-      onSteps: setFollowedSteps,
-      runId: followedRunId,
+      onSteps: (steps) => setFollowed({ runId, steps, subagentId }),
+      runId,
       sessionId: state.sessionId,
-      subagentId: openSubagentId,
+      subagentId,
     });
   }, [client, followedRunId, openSubagentId, state.sessionId]);
 
@@ -291,11 +292,16 @@ export function App({ initialToken }: Props) {
     const held = resolvedSubagent.steps.length === 0 && catalogSubagent !== undefined
       ? catalogSubagent.steps
       : resolvedSubagent.steps;
+    const followedSteps = followed !== undefined
+      && followed.subagentId === openSubagentId
+      && followed.runId === followedRunId
+      ? followed.steps
+      : [];
     if (followedSteps.length === 0) {
       return held === resolvedSubagent.steps ? resolvedSubagent : { ...resolvedSubagent, steps: held };
     }
     return { ...resolvedSubagent, steps: mergeSubagentSteps(followedSteps, held) };
-  }, [catalogSubagent, followedSteps, resolvedSubagent]);
+  }, [catalogSubagent, followed, followedRunId, openSubagentId, resolvedSubagent]);
 
   // A selection belongs to one session's transcript. Carrying it into another
   // would open a panel on a subagent the reader cannot see.
