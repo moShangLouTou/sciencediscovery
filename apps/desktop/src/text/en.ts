@@ -160,8 +160,6 @@ export const EN: Text = {
     copyAnswer: "Copy answer",
     copied: "Copied",
     notices: {
-      review_notice: "Review notice",
-      reviewer_checkpoint: "Review progress",
       timeout_notice: "Timeout",
     },
     cancelledReason: "The run was cancelled",

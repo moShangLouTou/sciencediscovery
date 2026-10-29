@@ -164,8 +164,6 @@ export const ZH = {
     copied: "已复制",
     /** The system-notice kinds the transcript can carry. */
     notices: {
-      review_notice: "审阅提示",
-      reviewer_checkpoint: "审阅进度",
       timeout_notice: "超时",
     } as Record<string, string>,
     /** Fills in a cancellation whose reason the stream did not carry. */

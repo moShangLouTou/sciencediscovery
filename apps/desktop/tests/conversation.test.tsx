@@ -117,6 +117,27 @@ test("the reader's turn is its text alone, in the grey bubble", () => {
   assert.doesNotMatch(markup, />我</);
 });
 
+test("the reviewer's record is not drawn as part of the conversation", () => {
+  // The Reviewer Specialist writes its verdict into the session so the review
+  // can be audited, and the API keeps doing that. The desktop transcript is not
+  // where the record is read: drawn as a status line it sat under the answer
+  // like a further answer to the question above it.
+  const markup = render({
+    detail: detail([
+      message("question", "user", "QUESTION"),
+      message("checkpoint", "assistant", "REVIEWER-VERDICT", "reviewer_checkpoint"),
+      message("notice", "assistant", "REVIEW-NOTICE", "review_notice"),
+      message("timeout", "assistant", "TIMED-OUT-RUN", "timeout_notice"),
+    ]),
+  });
+  assert.doesNotMatch(markup, /REVIEWER-VERDICT/);
+  assert.doesNotMatch(markup, /REVIEW-NOTICE/);
+  assert.doesNotMatch(markup, /审阅/u);
+  // Every other notice still draws: this hides one record, not the row type.
+  assert.match(markup, /TIMED-OUT-RUN/);
+  assert.match(markup, /超时/u);
+});
+
 test("an answer's name is a header above the prose, not a column beside it", () => {
   // The handoff puts the mark and the name on their own line and starts the
   // answer below them at the column's left edge. Nesting the body inside a row

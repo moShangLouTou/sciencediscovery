@@ -54,6 +54,18 @@ interface Props {
 }
 
 /**
+ * Notices the desktop transcript does not draw.
+ *
+ * `review_notice` and `reviewer_checkpoint` are the Reviewer Specialist's
+ * internal record — a verdict on a version, written to the session so the
+ * review can be audited. The desktop conversation is not where that record is
+ * read from, and drawn as a status line it read as an answer to the question
+ * above it. The messages stay in the transcript on the server side; only this
+ * window stops rendering them.
+ */
+const HIDDEN_NOTICE_KINDS: ReadonlySet<string> = new Set(["review_notice", "reviewer_checkpoint"]);
+
+/**
  * Runtime notices that ride along in the persisted transcript. They are not
  * something either side typed, so they render as a status line rather than as
  * a message bubble. The labels live in `TEXT` and are read per render, since
@@ -114,6 +126,9 @@ function MessageRow({ message, uploads }: { message: ChatMessage; uploads?: read
   // started is anchored, and dropping it would send that run to the end of the
   // conversation instead of to the place it happened.
   if (message.kind === "wake_notice") return null;
+  // The review record is the Reviewer Specialist's own audit trail, not part of
+  // the conversation this window is reading.
+  if (message.kind !== undefined && HIDDEN_NOTICE_KINDS.has(message.kind)) return null;
   if (message.kind && message.kind !== "message") return <NoticeRow message={message} />;
   if (message.role === "user") return <UserRow content={message.content} files={uploads} />;
   return (
