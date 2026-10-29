@@ -33,7 +33,7 @@ import {
 
 const CATEGORY = "文献调研";
 const TOPIC = "研究现状综述";
-const TOPIC_PROMPT = "请检索并综述这个方向近三年的研究现状，列出主要技术路线、代表工作和仍未解决的问题。";
+const TOPIC_PROMPT = "请检索并综述近三年水体中微塑料检测方法的研究现状，列出主要技术路线、代表工作和仍未解决的问题。";
 
 async function upload(page: Page, name = "data.csv"): Promise<void> {
   const chooser = page.waitForEvent("filechooser");

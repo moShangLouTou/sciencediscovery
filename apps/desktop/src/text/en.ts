@@ -256,20 +256,17 @@ export const EN: Text = {
     },
     topics: {
       research: [
-        { label: "State of the field", prompt: "Search and summarize the research of this field over the last three years: the main approaches, representative work, and what is still open." },
-        { label: "Key techniques", prompt: "Survey the key techniques in this area, compare when each applies, their strengths and limits, and cite representative papers." },
-        { label: "Recent papers", prompt: "Find the important papers published in this area recently, group them by theme, and state each one's contribution." },
-        { label: "Competing approaches", prompt: "Analyze how the leading teams or products in this field approach the problem, and compare their trade-offs." },
+        { label: "State of the field", prompt: "Search and summarize the research on methods for detecting microplastics in water over the last three years: the main approaches, representative work, and what is still open." },
+        { label: "Key techniques", prompt: "Survey the key techniques for extracting natural products, such as ultrasound-assisted extraction and supercritical CO₂, and compare when each applies, their strengths and limits, with representative papers." },
+        { label: "Recent papers", prompt: "Find the important papers published recently on plant-derived natural antioxidants such as tea polyphenols and anthocyanins, group them by theme, and state each one's contribution." },
+        { label: "Competing approaches", prompt: "Analyze how the leading teams or products in probiotic formulations approach the problem, and compare their trade-offs." },
       ],
       experiment: [
-        { label: "Controlled design", prompt: "Design a controlled experiment for me: the treatment and control groups, variable control, number of replicates, and the metrics." },
-        { label: "Parameter tuning", prompt: "Plan a parameter optimization for this experiment: the ranges to sweep, the sampling method, and the acceptance criteria." },
-        { label: "Sample size", prompt: "Estimate the sample size this experiment needs, stating the assumptions, effect size, significance level, and test." },
-        { label: "Error analysis", prompt: "Analyze the main sources of error in this experiment and how to reduce systematic and random error." },
+        { label: "Controlled design", prompt: "Design a controlled experiment on cell proliferation inhibition for me: the treatment and control groups, variable control, number of replicates, and the metrics." },
+        { label: "Antioxidant assay", prompt: "Design an experiment to measure how well tea polyphenols scavenge free radicals: the reagents and equipment needed, how to group the samples, the steps, and the metrics." },
       ],
       analysis: [
-        { label: "Proteomics", prompt: "Analyze this proteomics data: preprocessing, differential analysis, enrichment, and how to read the results." },
-        { label: "Material formulas", prompt: "Analyze this set of material formula data and find the ingredients that drive performance and how they interact." },
+        { label: "Proteomics", prompt: "Walk me through a proteomics analysis pipeline, from raw mass-spec files to a list of differentially abundant proteins: the input at each step, the usual tools, and the quality-control points to watch." },
         { label: "Single-cell sequencing", prompt: "Plan a single-cell sequencing analysis: quality control, clustering, cell annotation, and differential expression." },
       ],
     },
