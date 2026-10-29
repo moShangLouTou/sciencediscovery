@@ -24,17 +24,19 @@ import {
 
 import { ApiClient } from "./api/client.js";
 import { listSubagents } from "./api/sessions.js";
-import type { Subagent } from "./api/types.js";
+import type { Subagent, SubagentStep } from "./api/types.js";
 import type { GuideStep } from "./app/guide.js";
 import { isEmptyTranscript, landingKey } from "./app/landing.js";
 import { useJiuwenReadiness, jwReadyFromBridge, wizardIntroHandled } from "./app/shell-bridge.js";
 import type { ToolDetail } from "./app/tool-io.js";
+import { followSubagent } from "./app/follow-subagent.js";
 import { useFileDrop } from "./app/use-file-drop.js";
 import { useLanguage } from "./app/use-language.js";
 import { usePanelWidth } from "./app/use-panel-width.js";
 import { useWorkspace } from "./app/use-workspace.js";
 import { formatByteLimit } from "./app/upload.js";
 import { allSubagents } from "./run-stream/model.js";
+import { mergeSubagentSteps } from "./run-stream/subagent.js";
 import {
   GUIDE_STORAGE_KEY,
   RIGHT_PANEL_STORAGE_KEY,
@@ -251,14 +253,49 @@ export function App({ initialToken }: Props) {
   const resolvedSubagent = foundSubagent
     ?? catalogSubagent
     ?? (lastSubagent.current?.id === openSubagentId ? lastSubagent.current : undefined);
+
+  /** The child's steps, read from its own stream while it is still working.
+   *
+   * The steps a child records are written to `subagent-<id>`; the run's own
+   * timeline keeps only the milestones. The live copy on the run stream reaches
+   * whoever is attached at the moment it is emitted, so a child that started
+   * before this window did, or that was continued by a later process, is not on
+   * it at all — and the catalog read above answers only once the child settles.
+   * Following the child's stream is what keeps 执行详情 filling while it runs. */
+  const [followedSteps, setFollowedSteps] = useState<SubagentStep[]>([]);
+  useEffect(() => {
+    setFollowedSteps([]);
+  }, [openSubagentId, state.sessionId]);
+  const followedRunId = resolvedSubagent?.status === "running"
+    && resolvedSubagent.parentTurnId !== ""
+    ? resolvedSubagent.parentTurnId
+    : undefined;
+  useEffect(() => {
+    if (openSubagentId === undefined || state.sessionId === undefined || followedRunId === undefined) return;
+    return followSubagent({
+      client,
+      onSteps: setFollowedSteps,
+      runId: followedRunId,
+      sessionId: state.sessionId,
+      subagentId: openSubagentId,
+    });
+  }, [client, followedRunId, openSubagentId, state.sessionId]);
+
   // Live snapshots are fresher and already carry steps. A replay's copy is the
   // terminal state but says nothing about what the child did, so its steps come
-  // from the catalog.
-  const openSubagent = resolvedSubagent === undefined
-    ? undefined
-    : resolvedSubagent.steps.length === 0 && catalogSubagent !== undefined
-      ? { ...resolvedSubagent, steps: catalogSubagent.steps }
-      : resolvedSubagent;
+  // from the catalog. The followed stream is the base: its order is the order
+  // the work happened in, and whatever this window already holds wins on an id
+  // it shares, because that copy is the fresher one.
+  const openSubagent = useMemo(() => {
+    if (resolvedSubagent === undefined) return undefined;
+    const held = resolvedSubagent.steps.length === 0 && catalogSubagent !== undefined
+      ? catalogSubagent.steps
+      : resolvedSubagent.steps;
+    if (followedSteps.length === 0) {
+      return held === resolvedSubagent.steps ? resolvedSubagent : { ...resolvedSubagent, steps: held };
+    }
+    return { ...resolvedSubagent, steps: mergeSubagentSteps(followedSteps, held) };
+  }, [catalogSubagent, followedSteps, resolvedSubagent]);
 
   // A selection belongs to one session's transcript. Carrying it into another
   // would open a panel on a subagent the reader cannot see.

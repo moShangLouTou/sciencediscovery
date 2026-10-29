@@ -13,7 +13,7 @@
 // limitations under the License.
 
 import type { ApiClient } from "./client.js";
-import type { RunStreamEvent, SendMessageRequest, SessionRunEvent } from "./types.js";
+import type { RunStreamEvent, SendMessageRequest, SessionRunEvent, SubagentStep } from "./types.js";
 import { TEXT } from "../text.js";
 
 /**
@@ -404,4 +404,59 @@ export async function readToolOutput(
     .join("");
   if (progress !== "" && result !== "") return `${progress}\n\n---\n\n${result}`;
   return progress || result || undefined;
+}
+
+/** The stream a child's own steps are appended to.
+ *
+ * The run's timeline keeps only the milestones; everything the child did is
+ * written here. The name is part of the route, not of the record, so it is
+ * spelled once — the API's own `subagentStreamId` writes the same string. */
+export function subagentStreamId(subagentId: string): string {
+  return `subagent-${subagentId}`;
+}
+
+/** What a read of a child's stream returned: the steps it carried, and the
+ *  cursor a later read asks from. */
+export interface FollowedSteps {
+  cursor: number;
+  steps: SubagentStep[];
+}
+
+/**
+ * Read the steps a child has recorded so far, from its own substream.
+ *
+ * This is the only complete account of a running child. `subagent.step` also
+ * travels on the run's live stream, but only the process running that child
+ * broadcasts it: a child continued after a restart, or one whose steps were
+ * written before this window attached, leaves nothing on the run stream. The
+ * catalog is a projection of this stream taken when the child settles, so it
+ * has no answer for one that is still working. Reading the stream itself is
+ * what lets the panel fill while the child runs.
+ *
+ * The stream numbers its events, so `after` is the previous read's cursor and
+ * each read carries only what it has not folded in yet. A step can be written
+ * more than once: a tool step is recorded when it starts, still `running`, and
+ * again when it ends with its result. The last copy of an id is therefore the
+ * current one, and the first appearance keeps the position the work happened
+ * in. (The intermediate progress snapshots are live-only and never stored.)
+ */
+export async function readSubagentSteps(
+  client: ApiClient,
+  sessionId: string,
+  runId: string,
+  subagentId: string,
+  after = 0,
+): Promise<FollowedSteps> {
+  const events = await client.request<SessionRunEvent[]>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}`
+    + `/streams/${encodeURIComponent(subagentStreamId(subagentId))}/events?after=${after}`,
+  );
+  let cursor = after;
+  const byId = new Map<string, SubagentStep>();
+  for (const record of events) {
+    if (record.sequence > cursor) cursor = record.sequence;
+    if (record.event.type !== "subagent.step") continue;
+    byId.set(record.event.step.id, record.event.step);
+  }
+  return { cursor, steps: [...byId.values()] };
 }

@@ -18,8 +18,8 @@ import assert from "node:assert/strict";
 
 import { ApiClient, ApiRequestError, isAbortError, isAuthFailure } from "../src/api/client.js";
 import { testModel } from "../src/api/models.js";
-import { MAX_FRAME_CHARACTERS, SseFrameDecoder, readToolOutput, streamMessage } from "../src/api/stream.js";
-import type { RunStreamEvent, SessionRunEvent } from "../src/api/types.js";
+import { MAX_FRAME_CHARACTERS, SseFrameDecoder, readSubagentSteps, readToolOutput, streamMessage } from "../src/api/stream.js";
+import type { RunStreamEvent, SessionRunEvent, SubagentStep } from "../src/api/types.js";
 
 /** Replace `globalThis.fetch` for one test, restore it afterwards, and hand
  *  back what the client actually sent. */
@@ -616,6 +616,69 @@ test("progress without a result is still shown, and an empty substream is undefi
   ]);
   assert.equal(progressOnly, "working\n");
   assert.equal(await readOutput([]), undefined);
+});
+
+/** One `subagent.step` record, as the child's own stream stores it. */
+const stepRecord = (id: string, sequence: number, over: Partial<SubagentStep> = {}): SessionRunEvent =>
+  outputRecord({
+    step: { content: "", createdAt: "2026-10-23T00:00:00Z", id, kind: "tool", ...over },
+    subagentId: "child-1",
+    type: "subagent.step",
+  }, sequence);
+
+async function readSteps(events: SessionRunEvent[], after = 0) {
+  const client = new ApiClient("t");
+  const urls: string[] = [];
+  let page: { cursor: number; steps: SubagentStep[] } | undefined;
+  await withFetch(
+    (url) => {
+      urls.push(url);
+      return Promise.resolve(jsonResponse(events));
+    },
+    async () => {
+      page = await readSubagentSteps(client, "session-1", "run-1", "child-1", after);
+    },
+  );
+  return { page: page!, urls };
+}
+
+test("a child's steps are read from its own stream, from the cursor it left", async () => {
+  const { page, urls } = await readSteps([
+    stepRecord("s1", 7, { status: "running" }),
+    stepRecord("s1", 8, { content: "done", status: "completed" }),
+  ], 6);
+  const url = new URL(urls[0]!, "http://test.invalid");
+  assert.equal(url.pathname, "/api/sessions/session-1/runs/run-1/streams/subagent-child-1/events");
+  assert.equal(url.searchParams.get("after"), "6");
+  assert.equal(page.cursor, 8);
+});
+
+test("a step emitted as it starts and again when it ends is one step, its last copy", async () => {
+  // The stream carries a snapshot when the tool starts and the finished one
+  // when it returns. Two rows for one tool call would read as two calls, and
+  // the running copy would still claim the work is unfinished.
+  const { page } = await readSteps([
+    stepRecord("s1", 1, { status: "running", toolName: "run_shell" }),
+    stepRecord("s2", 2, { toolName: "read_file" }),
+    stepRecord("s1", 3, { content: "exit 0", status: "completed", toolName: "run_shell" }),
+  ]);
+  assert.deepEqual(page.steps.map((step) => [step.id, step.status]), [["s1", "completed"], ["s2", undefined]]);
+});
+
+test("records on a child's stream that are not steps are ignored", async () => {
+  // The same stream carries the child's agent records; only steps are what the
+  // panel draws.
+  const { page } = await readSteps([
+    outputRecord({ evidence: { agentId: "subagent:child-1" }, type: "agent.record" } as unknown as RunStreamEvent, 1),
+    stepRecord("s1", 2),
+  ]);
+  assert.deepEqual(page.steps.map((step) => step.id), ["s1"]);
+  assert.equal(page.cursor, 2);
+});
+
+test("a child's stream with nothing new reports the cursor it was asked from", async () => {
+  const { page } = await readSteps([], 9);
+  assert.deepEqual(page, { cursor: 9, steps: [] });
 });
 
 test("a model check states the consent the service requires", async () => {
