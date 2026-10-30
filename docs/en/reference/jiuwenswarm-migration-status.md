@@ -3,7 +3,7 @@
 > **Archived migration snapshot.** Issue statuses, test counts, limits, and defaults below describe an earlier baseline and must not be used as current configuration guidance. All launchers now default to JiuwenSwarm; child delegation defaults to platform `task` with Swarm execution. Use [Agent backends](agent-backends.md) and [current orchestration](../developer-docs/subagent-orchestration.md) for current behavior.
 
 Where issue 84 (reuse the JiuwenSwarm backend) stands, what runs today, what does not, and how to start
-working on a sub-issue. To run it from source, see [Local mode](../getting-started/deployment.md#local-mode-source-checkout).
+working on a sub-issue. To run it from source, run `scripts/jiuwenswarm.sh setup` once, then `./scripts/start-stack.sh --mode local`.
 
 ## What this baseline is
 
@@ -115,7 +115,7 @@ JiuwenSwarm has a context engine of its own (it compresses at 80% of the model's
 
 ## Start working on a sub-issue
 
-1. Start the stack: `scripts/jiuwenswarm.sh setup` once, then `./scripts/start-stack.sh --mode local` (check with `GET /agent/info`); see [Local mode](../getting-started/deployment.md#local-mode-source-checkout).
+1. Start the stack: `scripts/jiuwenswarm.sh setup` once, then `./scripts/start-stack.sh --mode local` (check with `GET /agent/info`).
 2. Find your routes in `test/contract/routes.json` (`node test/contract/run.mjs --coverage` lists the rows without a case).
 3. Add a case under `test/contract/cases/`, record it on a **fresh data directory** against the built-in loop, compare it against the adapter + JiuwenSwarm stack. Rules, the SSE step form and normalization: [`test/contract/README.md`](../../../test/contract/README.md). Baselines are read-only for agents; a change needs human review.
 4. For behaviour, use the run-event cases (`l2-runs.json`); the stub model is `test/contract/stub-model.mjs`.

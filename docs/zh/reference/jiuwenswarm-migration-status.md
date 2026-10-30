@@ -2,7 +2,7 @@
 
 > **归档迁移快照。** 下文的 issue 状态、测试数量、限制和默认值记录的是旧版基线，不能用于当前配置。所有启动器现在默认使用 JiuwenSwarm；子任务默认由平台 `task` 分发并由 Swarm 执行。当前行为请看 [Agent 后端](agent-backends.md)和[子代理编排](../developer-docs/subagent-orchestration.md)。
 
-issue 84（复用 JiuwenSwarm 后端）做到哪一步、现在能跑什么、什么还没做，以及如何开始做某个子 issue。源码启动方法见[本地模式](../getting-started/deployment.md#本地模式源码检出)。
+issue 84（复用 JiuwenSwarm 后端）做到哪一步、现在能跑什么、什么还没做，以及如何开始做某个子 issue。源码启动方法：先执行一次 `scripts/jiuwenswarm.sh setup`，再运行 `./scripts/start-stack.sh --mode local`。
 
 ## 这个基线是什么
 
@@ -107,7 +107,7 @@ JiuwenSwarm 自己有一套上下文引擎（占用到模型窗口的 80% 时压
 
 ## 开始做某个子 issue
 
-1. 启动整套栈：先执行一次 `scripts/jiuwenswarm.sh setup`，再 `./scripts/start-stack.sh --mode local`（用 `GET /agent/info` 确认）；见[本地模式](../getting-started/deployment.md#本地模式源码检出)。
+1. 启动整套栈：先执行一次 `scripts/jiuwenswarm.sh setup`，再 `./scripts/start-stack.sh --mode local`（用 `GET /agent/info` 确认）。
 2. 在 `test/contract/routes.json` 里找到你的路由（`node test/contract/run.mjs --coverage` 会列出没有用例的行）。
 3. 在 `test/contract/cases/` 下加用例，在**全新数据目录**上对内置循环录制，再对“适配器 + JiuwenSwarm”栈比对。规则、SSE 步骤写法和归一化见 [`test/contract/README.md`](../../../test/contract/README.md)。基线对智能体只读，改动需要人工评审。
 4. 行为类用 run 事件用例（`l2-runs.json`）；脚本化模型是 `test/contract/stub-model.mjs`。
