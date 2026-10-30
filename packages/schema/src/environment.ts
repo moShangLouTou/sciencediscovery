@@ -91,6 +91,7 @@ export interface KernelSession {
 }
 
 export interface ScientificExecutionRequest {
+  hostAuthorization?: HostExecutionAuthorization;
   /** Trusted Specialist binding: declare_artifact is the only file tracking boundary. */
   explicitHandoff?: boolean;
   /** Stable Agent identity within the Session; assigned by the trusted API binding. */
@@ -240,7 +241,15 @@ export interface DirectExecutionCapability {
   account: string;
 }
 
+/** Per-operation host consent, carried by the signed control-plane execution request. */
+export interface HostExecutionAuthorization extends DirectExecutionAuthorization {
+  codeHash: string;
+  language: ExecutionLanguage;
+  environment?: string;
+}
+
 export interface ShellExecutionRequest extends ShellRecoveryOptions {
+  hostAuthorization?: HostExecutionAuthorization;
   explicitHandoff?: boolean;
   directAuthorization?: DirectExecutionAuthorization;
   /** Stable Agent identity within the Session; assigned by the trusted API binding. */

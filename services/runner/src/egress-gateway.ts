@@ -571,9 +571,9 @@ export class EgressGatewayRegistry {
 
   /** Start (or reuse) a runner-owned loopback proxy for host-network sandboxes such as macOS Seatbelt. */
   async acquireTcp(access: SandboxNetworkAccess, proxy?: ResolvedProxy): Promise<EgressGateway> {
-    // [windows-desktop] mode "none" is a legitimate policy here — it
-    // starts a deny-all gateway so unsandboxed direct execution still gets
-    // proxy environment variables that fail closed (none means no network).
+    if (access.mode === "none") {
+      throw new Error("Only domain-allowlist or open policies need an egress gateway");
+    }
     let gateway = this.tcpGateways.get(access.revision);
     if (!gateway) {
       gateway = (async () => {

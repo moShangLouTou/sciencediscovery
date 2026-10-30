@@ -1947,86 +1947,145 @@ test("with SCIENCE_AGENT_JIUWENSWARM_SKILLS=ours nothing is installed and the sk
   }
 });
 
-test("with the desktop selection the run aligns JiuwenSwarm's switches: staged on, earlier ones off, builtin untouched", async () => {
-  const switchCalls: Array<{ name: string; enabled: boolean }> = [];
-  const adapter = await fakeAdapter(async ({ body, method, url }, response) => {
-    if (method === "GET" && url === "/agent/skills") {
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ skills: [
-        { name: "evolve-design", description: "staged but left off", enabled: false, source: "imported" },
-        { name: "old-skill", description: "an earlier run", enabled: true, source: "imported" },
-        { name: "xlsx", description: "JiuwenSwarm's own", enabled: false, source: "builtin" },
-      ] }));
+test("desktop concurrent runs keep independent skill catalogs and readers without global switches", async () => {
+  const replies: Record<string, { selected: any; excluded: any; resource: any }> = {};
+  let arrived = 0;
+  let release!: () => void;
+  const bothStarted = new Promise<void>((resolve) => { release = resolve; });
+  const adapter = await fakeAdapter(async ({ body, url }, response) => {
+    if (url !== "/agent/runs") {
+      response.writeHead(200);
+      response.end(JSON.stringify({ skills: {} }));
       return;
     }
-    if (body.skills) {
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ skills: { "evolve-design": { name: "evolve-design" }, "skill-creator": { name: "sciencediscovery-skill-creator" } } }));
-      return;
-    }
-    if (url.includes("/enabled")) {
-      switchCalls.push({ name: decodeURIComponent(url.split("/")[3]!), enabled: body.enabled });
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end("{}");
-      return;
-    }
+    if (++arrived === 2) release();
+    await bothStarted;
     response.writeHead(200);
+    let callIndex = 0;
+    const call = async (skillId: string, resource = false) => {
+      const name = resource ? "read_skill_resource" : "read_skill";
+      const args = { skillId, ...(resource ? { path: "references/method.md" } : {}) };
+      response.write(line({ event: { type: "tool.started", trace: { id: `${body.sessionId}-${++callIndex}`, name, args, status: "running" } } }));
+      return (await fetch(body.bridge.url, {
+        method: "POST", headers: { authorization: `Bearer ${body.bridge.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ name, arguments: args }),
+      })).json();
+    };
+    replies[body.sessionId] = {
+      selected: await call(body.sessionId === "a" ? "alpha" : "beta"),
+      excluded: await call(body.sessionId === "a" ? "beta" : "alpha"),
+      resource: await call(body.sessionId === "a" ? "alpha" : "beta", true),
+    };
     response.end(line({ done: { finalText: "ok" } }));
   });
   try {
-    const config = { ...jiuwenSwarmConfigFromEnv({ SCIENCE_AGENT_EXECUTOR: "jiuwenswarm", SCIENCE_AGENT_ADAPTER_URL: adapter.url, SCIENCE_AGENT_SKILL_SELECTION: "desktop" })! };
-    await createJiuwenSwarmAgentFactory(config)(skillOptions()).execute("go");
-    assert.deepEqual(switchCalls.sort((a, b) => a.name.localeCompare(b.name)), [
-      { name: "evolve-design", enabled: true },
-      { name: "old-skill", enabled: false },
-    ], "xlsx is builtin and never touched");
-  } finally {
-    await adapter.close();
-  }
+    const factory = createJiuwenSwarmAgentFactory({ adapterUrl: adapter.url, skillSelection: "desktop" });
+    const withResource = (id: string) => ({ ...skill(id),
+      resources: [{ path: "references/method.md", kind: "reference", hash: `reference-${id}`, size: 10 }],
+      readResource: () => ({ content: `${id} reference method` }),
+    });
+    await Promise.all([
+      factory(skillOptions({ sessionId: "a", skills: [withResource("alpha")] })).execute("go"),
+      factory(skillOptions({ sessionId: "b", skills: [withResource("beta")] })).execute("go"),
+    ]);
+    assert.equal(adapter.requests.length, 2, "desktop runs neither import skills nor read/write global switches");
+    for (const { body } of adapter.requests) {
+      const selected = body.sessionId === "a" ? "alpha" : "beta";
+      const excluded = body.sessionId === "a" ? "beta" : "alpha";
+      assert.match(body.systemPrompt, new RegExp(`<name>${selected}</name>`));
+      assert.doesNotMatch(body.systemPrompt, new RegExp(`<name>${excluded}</name>`));
+      assert.ok(body.hiddenJiuwenSwarmTools.includes("skill_tool"));
+      assert.ok(body.hiddenJiuwenSwarmTools.includes("skill_index"));
+      assert.equal(body.systemPromptMode, "replace", "the native prompt's global skill index is not advertised");
+      assert.equal(replies[body.sessionId]!.selected.isError, false);
+      assert.equal(replies[body.sessionId]!.excluded.isError, true);
+      assert.equal(replies[body.sessionId]!.resource.isError, false);
+      assert.match(replies[body.sessionId]!.resource.text, new RegExp(`${selected} reference method`));
+    }
+  } finally { await adapter.close(); }
 });
 
-test("with the desktop selection an empty staging switches everything we installed off", async () => {
-  const switchCalls: Array<{ name: string; enabled: boolean }> = [];
-  const adapter = await fakeAdapter(async ({ body, method, url }, response) => {
-    if (method === "GET" && url === "/agent/skills") {
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ skills: [
-        { name: "old-skill", description: "an earlier run", enabled: true, source: "imported" },
-        { name: "xlsx", description: "JiuwenSwarm's own", enabled: false, source: "builtin" },
-      ] }));
-      return;
-    }
-    if (url.includes("/enabled")) {
-      switchCalls.push({ name: decodeURIComponent(url.split("/")[3]!), enabled: body.enabled });
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end("{}");
+test("desktop empty selection exposes no skills and never toggles earlier imports", async () => {
+  const adapter = await fakeAdapter(async ({ url }, response) => {
+    response.writeHead(200);
+    response.end(url === "/agent/runs" ? line({ done: { finalText: "ok" } }) : JSON.stringify({ skills: [] }));
+  });
+  try {
+    await createJiuwenSwarmAgentFactory({ adapterUrl: adapter.url, skillSelection: "desktop" })(skillOptions({ skills: [] })).execute("go");
+    assert.equal(adapter.requests.length, 1);
+    const run = adapter.requests[0].body;
+    assert.ok(run.hiddenJiuwenSwarmTools.includes("skill_tool"));
+    assert.equal(run.tools.some((tool: { name: string }) => tool.name === "read_skill"), false);
+    assert.doesNotMatch(run.systemPrompt, /<available_skills>/);
+    assert.match(run.systemPrompt, /no Skills are selected/);
+    assert.equal(run.systemPromptMode, "replace");
+  } finally { await adapter.close(); }
+});
+
+test("desktop nested runs can read their own skills while the parent remains active", async () => {
+  let factory: ReturnType<typeof createJiuwenSwarmAgentFactory>;
+  const reads: any[] = [];
+  const adapter = await fakeAdapter(async ({ body, url }, response) => {
+    if (url !== "/agent/runs") {
+      response.writeHead(200);
+      response.end(JSON.stringify({ skills: [] }));
       return;
     }
     response.writeHead(200);
+    let callIndex = 0;
+    const read = async () => {
+      const args = { skillId: body.sessionId === "parent" ? "alpha" : "beta" };
+      response.write(line({ event: { type: "tool.started", trace: { id: `${body.sessionId}-${++callIndex}`,
+        name: "read_skill", args, status: "running" } } }));
+      return (await fetch(body.bridge.url, {
+        method: "POST", headers: { authorization: `Bearer ${body.bridge.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ name: "read_skill", arguments: args }),
+      })).json();
+    };
+    reads.push(await read());
+    if (body.sessionId === "parent") {
+      await factory(skillOptions({ sessionId: "child", skills: [skill("beta")] })).execute("nested");
+      reads.push(await read());
+    }
     response.end(line({ done: { finalText: "ok" } }));
   });
+  factory = createJiuwenSwarmAgentFactory({ adapterUrl: adapter.url, skillSelection: "desktop" });
   try {
-    const config = { ...jiuwenSwarmConfigFromEnv({ SCIENCE_AGENT_EXECUTOR: "jiuwenswarm", SCIENCE_AGENT_ADAPTER_URL: adapter.url, SCIENCE_AGENT_SKILL_SELECTION: "desktop" })! };
-    await createJiuwenSwarmAgentFactory(config)(skillOptions({ skills: [] })).execute("go");
-    assert.deepEqual(switchCalls, [{ name: "old-skill", enabled: false }]);
-    assert.equal(adapter.requests.some((request) => request.body?.skills), false, "nothing is imported from an empty staging");
-  } finally {
-    await adapter.close();
-  }
+    await factory(skillOptions({ sessionId: "parent", skills: [skill("alpha")] })).execute("go");
+    assert.equal(adapter.requests.length, 2, "no global skill operation before either nested run");
+    assert.equal(reads.length, 3);
+    assert.ok(reads.every((reply) => reply.isError === false), JSON.stringify(reads));
+  } finally { await adapter.close(); }
 });
 
-test("with the desktop selection missing skill packages leaves existing switches untouched", async () => {
+test("desktop native delegation opt-in falls back to task so children inherit selected skills", async () => {
   const adapter = await fakeAdapter(async (_request, response) => {
     response.writeHead(200);
     response.end(line({ done: { finalText: "ok" } }));
   });
   try {
-    const config = { ...jiuwenSwarmConfigFromEnv({ SCIENCE_AGENT_EXECUTOR: "jiuwenswarm", SCIENCE_AGENT_ADAPTER_URL: adapter.url, SCIENCE_AGENT_SKILL_SELECTION: "desktop" })! };
-    await createJiuwenSwarmAgentFactory(config)(skillOptions({ skillPackagesRoot: undefined })).execute("go");
-    assert.equal(adapter.requests.some((request) => request.url.startsWith("/agent/skills")), false);
-  } finally {
-    await adapter.close();
-  }
+    await createJiuwenSwarmAgentFactory({ adapterUrl: adapter.url, skillSelection: "desktop", subagents: "jiuwenswarm" })(skillOptions({
+      extraTools: [{ label: "Task", name: "task", description: "Delegate a governed run.", parameters: Type.Object({}),
+        execute: async () => ({ content: [] }) }],
+    })).execute("go");
+    const body = adapter.requests[0].body;
+    assert.ok(body.tools.some((tool: { name: string }) => tool.name === "task"));
+    assert.ok(body.hiddenJiuwenSwarmTools.includes("subagent_spawn"));
+    assert.match(body.systemPrompt, /Delegation for this run uses only the platform task tool/);
+  } finally { await adapter.close(); }
+});
+
+test("desktop selected skills stay readable without an exported package root", async () => {
+  const adapter = await fakeAdapter(async (_request, response) => {
+    response.writeHead(200);
+    response.end(line({ done: { finalText: "ok" } }));
+  });
+  try {
+    await createJiuwenSwarmAgentFactory({ adapterUrl: adapter.url, skillSelection: "desktop" })(skillOptions({ skillPackagesRoot: undefined })).execute("go");
+    assert.equal(adapter.requests.length, 1);
+    assert.match(adapter.requests[0].body.systemPrompt, /<name>evolve-design<\/name>/);
+    assert.ok(adapter.requests[0].body.tools.some((tool: { name: string }) => tool.name === "read_skill"));
+  } finally { await adapter.close(); }
 });
 
 test("each tool carries what JiuwenSwarm's permission engine does before a call: ask for what executes, allow the rest", async () => {

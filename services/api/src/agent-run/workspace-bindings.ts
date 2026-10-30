@@ -200,6 +200,9 @@ export function createWorkspaceExecutionBindings(
     return result;
   };
   const prepareExecutionTarget = async (machine: string | undefined, signal?: AbortSignal, toolCallId?: string, summary = "Scientific execution") => {
+    // Validate selection before readiness so an unauthorized target keeps the
+    // Session's scope diagnostic. Resolve again after I/O to catch revocation.
+    resolveExecutionTarget(machine);
     const runner = await checkRunner(machine, signal, false);
     if (!runner.ready) {
       const operationId = randomUUID();
@@ -226,7 +229,7 @@ export function createWorkspaceExecutionBindings(
     }
     options.store.assertSessionWritable(options.sessionId);
     signal?.throwIfAborted();
-    return target;
+    return { ...target, capability: runner.capability };
   };
   const networkConsent = createSandboxNetworkConsent({ ...options,
     assertRunner: (runnerId) => { resolveExecutionTarget(runnerId); },
@@ -240,8 +243,8 @@ export function createWorkspaceExecutionBindings(
       environment?: { environmentId?: string; cwd?: string; networkAuthorizationId?: string } & import("@sciencediscovery/schema").ShellRecoveryOptions,
     ) => {
       options.store.assertSessionWritable(options.sessionId);
-      let target = resolveExecutionTarget(machine);
-      await options.permission.requirePrivilege({
+      const target = await prepareExecutionTarget(machine, signal, toolCallId, "Run shell: " + code);
+      if (target.capability?.sandbox !== "none") await options.permission.requirePrivilege({
         action: "code",
         executionId: options.executionId,
         resource: "workspace-code",
@@ -249,9 +252,11 @@ export function createWorkspaceExecutionBindings(
         ...(toolCallId ? { toolCallId } : {}),
         summary: `Run a shell script ${target.remoteHostAlias ? `on ${target.remoteHostAlias} ` : ""}${options.permissionScopeLabel}`,
       });
-      target = await prepareExecutionTarget(machine, signal, toolCallId, "Run shell: " + code);
-      const permissionEpoch = await networkConsent.consume(environment?.networkAuthorizationId, target.runnerId, signal);
+      const hostAuthorization = await authorizeHostExecution(target, code, "shell", environment?.cwd ?? "", environment?.environmentId, signal, toolCallId);
+      const permissionEpoch = hostAuthorization ? options.permission.getEpoch()
+        : await networkConsent.consume(environment?.networkAuthorizationId, target.runnerId, signal);
       return {
+        ...(hostAuthorization ? { hostAuthorization } : {}),
         agentId: options.agentId,
         code,
         ...(environment?.recoveryMetadataPath ? { recoveryMetadataPath: environment.recoveryMetadataPath } : {}),
@@ -333,6 +338,33 @@ export function createWorkspaceExecutionBindings(
     signal?.throwIfAborted();
     return { cwd: capability.cwd, workspaceRoot: capability.workspaceRoot, target: capability.target, account: capability.account,
       runnerId, ...(target.runnerWorkspaceKey ? { runnerWorkspaceKey: target.runnerWorkspaceKey } : {}) };
+  };
+  const authorizeHostExecution = async (
+    target: Awaited<ReturnType<typeof prepareExecutionTarget>>,
+    code: string,
+    language: "python" | "r" | "shell",
+    cwd: string,
+    environment: string | undefined,
+    signal?: AbortSignal,
+    toolCallId?: string,
+  ): Promise<import("@sciencediscovery/schema").HostExecutionAuthorization | undefined> => {
+    if (target.capability?.sandbox !== "none") return undefined;
+    const scope = await directScope(target.runnerId, cwd, signal);
+    const codeHash = createHash("sha256").update(code).digest("hex");
+    const resource = "host:" + createHash("sha256").update(JSON.stringify({ ...scope,
+      run: options.executionId, agent: options.agentId, session: options.sessionId,
+      language, codeHash, environment: environment ?? null, operation: randomUUID() })).digest("hex");
+    const approval = await options.permission.requirePrivilege({ action: "direct_code", executionId: options.executionId,
+      resource, signal, toolCallId,
+      summary: `DIRECT HOST EXECUTION: Runner ${scope.runnerId}, ${scope.target}, account ${scope.account}, workspace ${scope.workspaceRoot}, cwd ${scope.cwd || "."}. No sandbox filesystem, process or network isolation. Network mode is host; network restrictions and domain allowlists cannot be enforced. Host credentials may be accessible through the filesystem. Consent covers only this ${language} code and environment (${environment ?? "default"}) during this run. Code:\n${code}` });
+    signal?.throwIfAborted();
+    if (approval.action !== "direct_code" || approval.outcome !== "allowed" || approval.resource !== resource) {
+      throw new Error("Host execution authorization scope mismatch");
+    }
+    const current = await directScope(target.runnerId, cwd, signal);
+    if (JSON.stringify(current) !== JSON.stringify(scope)) throw new Error("Host target or workspace changed during consent; request new consent");
+    return { ...scope, authorizationId: approval.id, runId: options.executionId, agentId: options.agentId,
+      language, codeHash, ...(environment !== undefined ? { environment } : {}) };
   };
   const common: ExecutionBindings = {
     sandboxNetwork: { request: networkConsent.request },
@@ -559,8 +591,8 @@ export function createWorkspaceExecutionBindings(
     } } : {}),
     executePython: async (code: string, signal?: AbortSignal, toolCallId?: string, machine?: string) => {
       options.store.assertSessionWritable(options.sessionId);
-      let target = resolveExecutionTarget(machine);
-      await options.permission.requirePrivilege({
+      const target = await prepareExecutionTarget(machine, signal, toolCallId, "Run Python: " + code);
+      if (target.capability?.sandbox !== "none") await options.permission.requirePrivilege({
         action: "code",
         executionId: options.executionId,
         resource: "workspace-code",
@@ -568,8 +600,9 @@ export function createWorkspaceExecutionBindings(
         ...(toolCallId ? { toolCallId } : {}),
         summary: `Run Python code ${target.remoteHostAlias ? `on ${target.remoteHostAlias} ` : ""}${options.permissionScopeLabel}`,
       });
-      target = await prepareExecutionTarget(machine, signal, toolCallId, "Run Python: " + code);
+      const hostAuthorization = await authorizeHostExecution(target, code, "python", "", undefined, signal, toolCallId);
       return options.provenanceRecorder.executePython({
+        ...(hostAuthorization ? { hostAuthorization } : {}),
         agentId: options.agentId,
         code,
         artifactPathPrefix: options.artifactPathPrefix,
@@ -722,8 +755,8 @@ export function createWorkspaceExecutionBindings(
         machine?: string,
       ) => {
         options.store.assertSessionWritable(options.sessionId);
-        let target = resolveExecutionTarget(machine);
-        await options.permission.requirePrivilege({
+        const target = await prepareExecutionTarget(machine, signal, toolCallId, "Run scientific code: " + code);
+        if (target.capability?.sandbox !== "none") await options.permission.requirePrivilege({
           action: "code",
           executionId: options.executionId,
           resource: "workspace-code",
@@ -731,8 +764,12 @@ export function createWorkspaceExecutionBindings(
           ...(toolCallId ? { toolCallId } : {}),
           summary: `Run ${language} code ${target.remoteHostAlias ? `on ${target.remoteHostAlias} ` : ""}${options.permissionScopeLabel}`,
         });
-        target = await prepareExecutionTarget(machine, signal, toolCallId, "Run scientific code: " + code);
+        if (target.capability?.sandbox === "none" && (language !== "python" || kernelMode === "persistent")) {
+          throw new Error("Host execution supports ephemeral Python only; select a sandboxed Runner for R or persistent kernels");
+        }
+        const hostAuthorization = await authorizeHostExecution(target, code, language, "", environmentRevisionId, signal, toolCallId);
         return options.provenanceRecorder.executeScientific({
+          ...(hostAuthorization ? { hostAuthorization } : {}),
           agentId: options.agentId,
           code,
           artifactPathPrefix: options.artifactPathPrefix,

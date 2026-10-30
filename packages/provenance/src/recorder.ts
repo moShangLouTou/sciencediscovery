@@ -172,6 +172,7 @@ async function runnerSandboxKind(runnerClient: RunnerClient): Promise<SandboxKin
 }
 
 export interface RecordExecutionOptions {
+  hostAuthorization?: import("@sciencediscovery/schema").HostExecutionAuthorization;
   /** Specialist outputs enter the platform only through declare_artifact. */
   explicitHandoff?: boolean;
   agentId: string;
@@ -864,6 +865,7 @@ export class ProvenanceRecorder {
       result = await (options.dispatch ?? options.runnerClient.executeShell.bind(options.runnerClient))({
         agentId: options.agentId,
         ...(options.directAuthorization ? { directAuthorization: options.directAuthorization } : {}),
+        ...(options.hostAuthorization ? { hostAuthorization: options.hostAuthorization } : {}),
         code: options.code,
         ...(options.recoveryMetadataPath ? { recoveryMetadataPath: options.recoveryMetadataPath } : {}),
         ...(options.recoveryContext ? { recoveryContext: options.recoveryContext } : {}),
@@ -902,14 +904,14 @@ export class ProvenanceRecorder {
         kernelMode: options.kernelMode ?? "ephemeral",
         language: "shell",
         modifiedFiles: [],
-        networkAccessRevision: epochSandboxNetworkAccess(options.permissionEpoch).revision,
-        networkPolicy: options.directAuthorization ? "host" : options.permissionEpoch.networkPolicy,
+        ...(!options.directAuthorization && !options.hostAuthorization ? { networkAccessRevision: epochSandboxNetworkAccess(options.permissionEpoch).revision } : {}),
+        networkPolicy: options.directAuthorization || options.hostAuthorization ? "host" : options.permissionEpoch.networkPolicy,
         permissionEpochId: options.permissionEpoch.id,
         ...(options.remoteHostAlias ? { remoteHostAlias: options.remoteHostAlias } : {}),
         ...(options.runnerId ? { runnerId: options.runnerId } : {}),
         runnerVersion: "unavailable",
         sandbox: options.directAuthorization ? "none" : sandbox,
-        ...(options.directAuthorization ? { directAuthorization: options.directAuthorization } : {}),
+        ...((options.directAuthorization ?? options.hostAuthorization) ? { directAuthorization: options.directAuthorization ?? options.hostAuthorization } : {}),
         sessionId: options.sessionId,
         startedAt: timestamp,
         // A dispatch that threw may still have run the command to completion;
@@ -967,15 +969,15 @@ export class ProvenanceRecorder {
       kernelMode: null,
       language: "shell",
       modifiedFiles: [],
-      networkAccessRevision: epochSandboxNetworkAccess(options.permissionEpoch).revision,
-      networkPolicy: options.directAuthorization ? "host" : options.permissionEpoch.networkPolicy,
+      ...(!options.directAuthorization && !options.hostAuthorization ? { networkAccessRevision: epochSandboxNetworkAccess(options.permissionEpoch).revision } : {}),
+      networkPolicy: options.directAuthorization || options.hostAuthorization ? "host" : options.permissionEpoch.networkPolicy,
       permissionEpochId: options.permissionEpoch.id,
       ...(options.remoteHostAlias ? { remoteHostAlias: options.remoteHostAlias } : {}),
       ...(options.runnerId ? { runnerId: options.runnerId } : {}),
       resultDigest,
       runnerVersion: "unavailable",
       sandbox: "unavailable",
-      ...(options.directAuthorization ? { directAuthorization: options.directAuthorization } : {}),
+      ...((options.directAuthorization ?? options.hostAuthorization) ? { directAuthorization: options.directAuthorization ?? options.hostAuthorization } : {}),
       sessionId: options.sessionId,
       // Before admission there is no start timestamp; a zero-duration audit is
       // anchored to the verified rejection/cancellation receipt instead.
@@ -1055,7 +1057,7 @@ export class ProvenanceRecorder {
       resultDigest,
       runnerVersion: result.runnerVersion,
       sandbox: result.sandbox,
-      ...(options.directAuthorization ? { directAuthorization: options.directAuthorization } : {}),
+      ...((options.directAuthorization ?? options.hostAuthorization) ? { directAuthorization: options.directAuthorization ?? options.hostAuthorization } : {}),
       sessionId: options.sessionId,
       startedAt: result.startedAt,
       status,
@@ -1228,6 +1230,7 @@ export class ProvenanceRecorder {
     try {
       result = await options.runnerClient.execute({
         agentId: options.agentId,
+        ...(options.hostAuthorization ? { hostAuthorization: options.hostAuthorization } : {}),
         code: options.code,
         environmentRevisionId: options.environmentRevisionId,
         ...(options.executionTimeoutMs !== undefined ? { executionTimeoutMs: options.executionTimeoutMs } : {}),
@@ -1263,13 +1266,14 @@ export class ProvenanceRecorder {
         kernelMode,
         language,
         modifiedFiles: [],
-        networkAccessRevision: epochSandboxNetworkAccess(options.permissionEpoch).revision,
-        networkPolicy: options.permissionEpoch.networkPolicy,
+        ...(!options.hostAuthorization ? { networkAccessRevision: epochSandboxNetworkAccess(options.permissionEpoch).revision } : {}),
+        networkPolicy: options.hostAuthorization ? "host" : options.permissionEpoch.networkPolicy,
         permissionEpochId: options.permissionEpoch.id,
         ...(options.remoteHostAlias ? { remoteHostAlias: options.remoteHostAlias } : {}),
         ...(options.runnerId ? { runnerId: options.runnerId } : {}),
         runnerVersion: "unavailable",
         sandbox,
+        ...(options.hostAuthorization ? { directAuthorization: options.hostAuthorization } : {}),
         sessionId: options.sessionId,
         startedAt: timestamp,
         // The Runner call failed, so the outcome was never observed: the
@@ -1327,6 +1331,7 @@ export class ProvenanceRecorder {
       ...(options.runnerId ? { runnerId: options.runnerId } : {}),
       runnerVersion: result.runnerVersion,
       sandbox: result.sandbox,
+      ...(result.directAuthorization ? { directAuthorization: result.directAuthorization } : {}),
       sessionId: options.sessionId,
       startedAt: result.startedAt,
       status: result.exitCode === 0 ? "succeeded" : "failed",

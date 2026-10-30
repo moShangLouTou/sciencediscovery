@@ -15,6 +15,7 @@
 import { createTest } from "../../../test/support/tagged/compat.mjs";
 const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:windows", "arch:amd64", "arch:arm64"] });
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { statSync } from "node:fs";
 import { copyFile, mkdir, mkdtemp, rm } from "node:fs/promises";
@@ -24,11 +25,31 @@ import type { TestContext } from "node:test";
 
 import type { PermissionEpoch } from "@sciencediscovery/schema";
 
-import { executePython, executeShell, spawnSandboxProcess, validatedWorkspace } from "./executor.js";
+import { directExecutionCapability, executePython, executeShell, spawnSandboxProcess, validatedWorkspace } from "./executor.js";
 import { EgressGatewayRegistry } from "./egress-gateway.js";
 import type { EnvironmentStore } from "./environment-store.js";
 import { condaActivationPaths } from "./platform/index.js";
 import { RunnerReadiness } from "./readiness.js";
+
+async function authorizedPython(...args: Parameters<typeof executePython>) {
+  const request = args[1];
+  const identity = await directExecutionCapability();
+  request.hostAuthorization = { authorizationId: "test-consent", runId: "test-run", agentId: request.agentId,
+    target: identity.target, account: identity.account, workspaceRoot: request.workspaceRoot, cwd: "",
+    codeHash: createHash("sha256").update(request.code).digest("hex"), language: "python",
+    ...(request.environmentRevisionId ? { environment: request.environmentRevisionId } : {}) };
+  return executePython(...args);
+}
+
+async function authorizedShell(...args: Parameters<typeof executeShell>) {
+  const request = args[1];
+  const identity = await directExecutionCapability();
+  request.hostAuthorization = { authorizationId: "test-consent", runId: "test-run", agentId: request.agentId,
+    target: identity.target, account: identity.account, workspaceRoot: request.workspaceRoot, cwd: request.cwd ?? "",
+    codeHash: createHash("sha256").update(request.code).digest("hex"), language: "shell",
+    ...(request.environmentId ? { environment: request.environmentId } : {}) };
+  return executeShell(...args);
+}
 
 function epoch(id = "epoch-test"): PermissionEpoch {
   return {
@@ -43,11 +64,7 @@ function epoch(id = "epoch-test"): PermissionEpoch {
   };
 }
 
-/**
- * the none-sandbox direct paths now fail closed even for the "none"
- * network policy (deny-all loopback gateway), so executions need a real
- * gateway registry in tests, exactly as the server always provides one.
- */
+/** The server supplies a gateway registry; authorized host execution does not use it. */
 function gatewaysFor(context: TestContext, dataDir: string): EgressGatewayRegistry {
   const gateways = new EgressGatewayRegistry(dataDir, () => undefined);
   context.after(() => gateways.close());
@@ -118,7 +135,7 @@ test("spawnSandboxProcess none branch runs the executable directly with the laun
 
 test("executeShell none fails closed without the scientific environment capability", async () => {
   await assert.rejects(
-    executeShell(
+    authorizedShell(
       { bwrapPath: "unused", dataDir: "unused", sandboxProvider: "none", execTimeoutMs: 1000, maxOutputBytes: 0, maxWorkspaceBytes: 0 },
       { agentId: "main", code: "echo hi", executionId: "shell-none", permissionEpoch: epoch(), workspaceRoot: "unused" },
     ),
@@ -138,7 +155,7 @@ test("executeShell none fails clearly when the environment lacks m2-bash", async
     }),
   } as unknown as EnvironmentStore;
   await assert.rejects(
-    executeShell(
+    authorizedShell(
       { bwrapPath: "unused", dataDir, sandboxProvider: "none", execTimeoutMs: 1000, maxOutputBytes: 0, maxWorkspaceBytes: 0 },
       { agentId: "main", code: "echo hi", executionId: "shell-none", permissionEpoch: epoch(), workspaceRoot },
       undefined, undefined, undefined, undefined, undefined, store,
@@ -187,7 +204,7 @@ test("executeShell none runs the agent's code through the environment's m2-bash"
       revision: { id: "rev-python" },
     }),
   } as unknown as EnvironmentStore;
-  const result = await executeShell(
+  const result = await authorizedShell(
     { bwrapPath: "unused", dataDir, sandboxProvider: "none", execTimeoutMs: 60_000, maxOutputBytes: 1_000_000, maxWorkspaceBytes: 0 },
     {
       agentId: "main",
@@ -226,7 +243,7 @@ test("executePython rejects R under the none provider", async (context) => {
     }),
   } as unknown as EnvironmentStore;
   await assert.rejects(
-    executePython(
+    authorizedPython(
       { bwrapPath: "unused", dataDir, sandboxProvider: "none", execTimeoutMs: 60_000, maxOutputBytes: 1_000_000, maxWorkspaceBytes: 0 },
       { agentId: "main", code: "print(1)", executionId: "r-none", language: "r", permissionEpoch: epoch(), workspaceRoot },
       undefined,
@@ -247,7 +264,7 @@ test("executePython none runs the interpreter directly with conda activation pat
   // directories land at the head of PATH, not that they exist.
   const prefix = resolve(dataDir, "managed-env");
   const store = pythonEnvironmentStore(python, prefix);
-  const result = await executePython(
+  const result = await authorizedPython(
     { bwrapPath: "unused", dataDir, sandboxProvider: "none", execTimeoutMs: 60_000, maxOutputBytes: 1_000_000, maxWorkspaceBytes: 0 },
     {
       agentId: "main",
@@ -276,7 +293,7 @@ test("executePython none runs the interpreter directly with conda activation pat
 });
 
 
-test("executePython none fails closed on network for the default none policy", async (context) => {
+test("authorized Python reports host networking without inheriting proxy credentials", async (context) => {
   const python = hostPython();
   if (!python) {
     context.skip("no host python on PATH");
@@ -285,9 +302,8 @@ test("executePython none fails closed on network for the default none policy", a
   const { dataDir, workspaceRoot } = await workspace(context);
   const prefix = resolve(dataDir, "managed-env");
   const store = pythonEnvironmentStore(python, prefix);
-  // 默认 epoch 的网络策略就是 none：无沙箱直跑必须拿到 deny-all 网关的代理
-  // 环境（而不是继承宿主机网络），且宿主代理槽位（含 NO_PROXY）不得残留。
-  const result = await executePython(
+  // Explicit consent allows host networking; no proxy restriction is advertised.
+  const result = await authorizedPython(
     { bwrapPath: "unused", dataDir, sandboxProvider: "none", execTimeoutMs: 60_000, maxOutputBytes: 1_000_000, maxWorkspaceBytes: 0 },
     {
       agentId: "main",
@@ -308,65 +324,22 @@ test("executePython none fails closed on network for the default none policy", a
     gatewaysFor(context, dataDir),
   );
   assert.equal(result.exitCode, 0, result.stderr);
-  const httpProxy = result.environmentVariables.HTTP_PROXY ?? "";
-  assert.match(httpProxy, /^http:\/\/127\.0\.0\.1:\d+$/, `HTTP_PROXY=${httpProxy}`);
-  assert.equal(result.environmentVariables.HTTPS_PROXY, httpProxy);
-  assert.equal(result.environmentVariables.ALL_PROXY, httpProxy);
-  assert.equal(result.environmentVariables.NO_PROXY, "127.0.0.1,localhost");
-  assert.ok(result.stdout.includes(`HTTP_PROXY=${httpProxy}`), result.stdout);
-  assert.ok(result.stdout.includes("NO_PROXY=127.0.0.1,localhost"), result.stdout);
+  for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"]) {
+    assert.equal(result.environmentVariables[key], undefined);
+  }
+  assert.equal(result.networkPolicy, "host");
+  assert.ok(result.directAuthorization);
+
 });
 
-test("executePython none blocks an outbound request through the deny-all gateway", async (context) => {
-  const python = hostPython();
-  if (!python) {
-    context.skip("no host python on PATH");
-    return;
-  }
+test("Python without host authorization is rejected before code can execute", async (context) => {
   const { dataDir, workspaceRoot } = await workspace(context);
-  const prefix = resolve(dataDir, "managed-env");
-  const store = pythonEnvironmentStore(python, prefix);
-  const denied: Array<{ host?: string; reason?: string }> = [];
-  const gateways = new EgressGatewayRegistry(dataDir, (event, detail) => {
-    if (event === "denied") denied.push(detail);
-  });
-  context.after(() => gateways.close());
-  const result = await executePython(
-    { bwrapPath: "unused", dataDir, sandboxProvider: "none", execTimeoutMs: 60_000, maxOutputBytes: 1_000_000, maxWorkspaceBytes: 0 },
-    {
-      agentId: "main",
-      code: [
-        "import urllib.error, urllib.request",
-        "try:",
-        "    urllib.request.urlopen('http://example.com/', timeout=15)",
-        "    print('REQUEST_UNEXPECTEDLY_SUCCEEDED')",
-        "except urllib.error.HTTPError as error:",
-        "    body = error.read().decode('utf-8', 'replace').strip()",
-        "    print(f'HTTP_STATUS={error.code}')",
-        "    print(f'DENY_REASON={body}')",
-        "except Exception as error:  # noqa: BLE001",
-        "    print(f'OTHER_ERROR={error!r}')",
-      ].join("\n"),
-      environmentRevisionId: "rev-python",
-      executionId: "python-none-deny",
-      language: "python",
-      permissionEpoch: epoch(),
-      workspaceRoot,
-    },
-    undefined,
-    store,
-    undefined,
-    gateways,
-  );
-  assert.equal(result.exitCode, 0, result.stderr);
-  assert.ok(result.stdout.includes("HTTP_STATUS=403"), result.stdout);
-  assert.ok(result.stdout.includes("sandbox network access is disabled"), result.stdout);
-  assert.ok(!result.stdout.includes("REQUEST_UNEXPECTEDLY_SUCCEEDED"), result.stdout);
-  // 留痕：deny 事件带主机与原因落到注册表日志。
-  assert.ok(
-    denied.some((entry) => entry.host === "example.com" && /disabled/.test(entry.reason ?? "")),
-    JSON.stringify(denied),
-  );
+  const python = hostPython();
+  assert.ok(python, "a host python is required for this test");
+  await assert.rejects(executePython(
+    { bwrapPath: "unused", dataDir, sandboxProvider: "none", pythonPath: python, execTimeoutMs: 1000, maxOutputBytes: 0, maxWorkspaceBytes: 0 },
+    { agentId: "main", code: "raise RuntimeError('must not execute')", executionId: "no-consent", permissionEpoch: epoch(), workspaceRoot },
+  ), /explicit host authorization/);
 });
 
 

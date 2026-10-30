@@ -46,6 +46,7 @@ description: Inspect an uploaded CSV for missing values and duplicate rows, and 
 
 - **JiuwenSwarm 后端**：在 Skills 的 JiuwenSwarm 视图检查运行端技能与开关。ScienceDiscovery 技能会在运行前导入；这里的开关作用于所有会话，不是单个 Specialist 的白名单。运行端不可达时先恢复连接。
 - 默认 JiuwenSwarm 提示词与工具模式下，Agent 通过 `skill_tool` 加载导入的技能；该工具失败时，可回退到产品的 `read_skill` 和 `read_skill_resource`。见 [Agent 后端](../reference/agent-backends.md)。
+- **设置了 `SCIENCE_AGENT_SKILL_SELECTION=desktop` 的 Windows 桌面端**：每次运行冻结 Project / Session 的生效技能选择，通过 `read_skill` 和 `read_skill_resource` 加载技能及配套文件，隐藏原生 `skill_tool`，并用产品提示词替代包含全局技能索引的原生提示词。桌面端运行不导入或修改 JiuwenSwarm 全局技能开关，因此并发会话和嵌套代理可以使用独立的技能选择。委派使用受管的 `task` 桥接，使子运行保持独立的技能选择。已有服务端部署继续保持上述 JiuwenSwarm 行为。
 - **支持 Project / Session 技能选择的后端**：`all` 模式允许已安装技能，`selected` 模式需要将新技能加入生效白名单。检查会话是否覆盖了 Project 设置。
 
 安装成功也不证明 Agent 已读取技能。新建测试会话，上传小 CSV，明确要求使用 `csv-quality-check` 完成核查；若输入框提供技能候选，可选择对应条目。检查执行记录和产物，而不只看回复中是否提到技能名称。

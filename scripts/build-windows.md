@@ -83,8 +83,17 @@ echo registry=https://registry.npmmirror.com >> .npmrc
 | `pnpm runner:binary` | SEA 单文件打包，Linux-only（`.mjs` 在非 Linux 平台自动跳过该步） |
 | `start-stack.sh --mode docker` | 暂无 Windows 等价物；请用 WSL 运行原 bash 脚本 |
 
-Windows 侧已知行为差异：runner 沙箱依赖（bubblewrap/seatbelt）不存在，runner 以
-`ready:false` 优雅降级启动（direct-execution provider 语义）；科学环境
-（micromamba）由后续运行时 PR 交付。
+Windows 侧已知行为差异：没有原生 bubblewrap/seatbelt 时，Runner 使用 `none`
+执行模式，仍可执行受管环境里的 Python 和 Bash。每次执行都需要明确的宿主执行授权，
+即使会话开启 Always Allow；拒绝授权不会派发代码。授权限定本次代码、机器、账号、
+工作目录和所选环境，执行审计记录 `networkPolicy: host`。代理变量不能强制限制
+直跑进程的网络，断网或域名白名单要求必须使用有沙箱的 Runner。
+
+直跑进程仅继承必要的系统环境变量，不继承 Runner token 或宿主 API key。该措施
+不提供文件系统隔离；宿主授权提示会说明这点。符号链接按宿主文件系统语义访问，
+不会交给 Python 执行 Bash 链接检查脚本。
+
+桌面技能选择按每个 run 独立暂存和读取，不修改 JiuwenSwarm 全局技能开关。
+桌面子代理通过受管 `task` 工具运行，以保留各自的技能选择和授权。
 
 Linux/macOS 侧回归说明：本 PR 未改动任何 bash 启动脚本，双平台启动链不回归。

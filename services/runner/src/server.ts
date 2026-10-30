@@ -1002,7 +1002,7 @@ export function createRunnerServer(
         if (!direct) execution.executionTimeoutMs = 0; // waiting deadlines are a client concern, not process lifetime
         execution.maxOutputBytes ??= config.maxOutputBytes;
         const accepted = managedExecutions.submit(execution, (signal, log, expectedEnvironmentRevisionId) => direct
-          ? executeDirectShell(executorConfig, execution, signal, log)
+          ? executeDirectShell(executorConfig, execution, signal, log, environmentStore)
           : execution.environmentId
           ? environmentStore?.withRuntime(execution.environmentId, (runtime) => {
               if (signal.aborted) throw new Error("Execution cancelled before environment admission");
@@ -1114,6 +1114,10 @@ async function sandboxNetworkCapability(
   sandbox: SandboxKind,
   gateways: Pick<EgressGatewayRegistry, "socketPath">,
 ): Promise<SandboxNetworkCapability> {
+  if (sandbox === "none") return {
+    available: false, modes: [],
+    unavailableReason: "Host execution has unrestricted network access; sandbox network policies require a sandboxed Runner",
+  };
   try {
     // Every egress-enabled execution needs this exact socket layout. Check it
     // before the interpreter probe so /health never advertises a mode whose
@@ -1126,10 +1130,7 @@ async function sandboxNetworkCapability(
       unavailableReason: error instanceof Error ? error.message : "The sandbox egress socket path is unavailable",
     };
   }
-  // [windows-desktop] "none" (Windows direct execution) filters through the
-  // same runner-owned TCP gateway as Seatbelt (env-injected proxy), so every
-  // mode stays available.
-  if (sandbox !== "bubblewrap") return { available: true, modes: ["none", "domain-allowlist", "open"] };
+  if (sandbox === "seatbelt") return { available: true, modes: ["none", "domain-allowlist", "open"] };
   try {
     await resolveEgressInterpreter();
     return { available: true, modes: ["none", "domain-allowlist", "open"] };
@@ -1260,7 +1261,8 @@ export async function startRunnerServer(config = loadRunnerConfig()): Promise<Se
     : `${config.maxOutputBytes} bytes (truncate)`;
   const sandboxNetwork = await sandboxNetworkCapability(sandbox, egressGateways);
   console.log(
-    `Sandbox: ${sandbox} (${RUNNER_VERSION}); sandbox network access: default none`
+    `Sandbox: ${sandbox} (${RUNNER_VERSION}); `
+    + (sandbox === "none" ? "network access: host (unrestricted, explicit consent required)" : "sandbox network access: default none")
     + `${sandboxNetwork.available ? ", domain-allowlist and open available" : ` (domain-allowlist unavailable: ${sandboxNetwork.unavailableReason})`}`
     + "; no CPU/memory quotas; "
     + `workspace quota: ${workspaceLabel}; output budget: ${outputLabel}; `

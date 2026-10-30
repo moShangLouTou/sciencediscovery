@@ -22,7 +22,7 @@ import { TOOL_SEARCH_NAME, TOOL_SEARCH_SPEC, requiredArgumentsOf, type AgentTool
 import { DurableContextStore } from "@sciencediscovery/context";
 
 import { startModelGateway, withoutWithheldNotice, type ModelGateway } from "./jiuwenswarm-model-gateway.js";
-import { importSkillsToJiuwenSwarm, reconcileJiuwenSwarmSkills, skillLoadedBy } from "./jiuwenswarm-skills.js";
+import { importSkillsToJiuwenSwarm, skillLoadedBy } from "./jiuwenswarm-skills.js";
 import { JiuwenSwarmTrajectory, stateProvider } from "./jiuwenswarm-trajectory.js";
 import { waitForRecording } from "./recording-wait.js";
 import { RunDeadlines } from "./run-deadlines.js";
@@ -89,11 +89,10 @@ export interface JiuwenSwarmAgentConfig {
    */
   skills?: "jiuwenswarm" | "ours";
   /**
-   * Whose switches decide which skills are on. `desktop` (SCIENCE_AGENT_SKILL_SELECTION=desktop, the desktop
-   * app): the UI's selection in project settings — each run stages just what it enabled, installs that in
-   * JiuwenSwarm and aligns its on/off switches to it (skills installed earlier but no longer selected are
-   * switched off; JiuwenSwarm's builtin skills are never touched). Unset (default, server deployments):
-   * every installed skill is staged for every run and JiuwenSwarm's own switches are the user's.
+   * `desktop` (SCIENCE_AGENT_SKILL_SELECTION=desktop): the Project/Session selection is staged per run and
+   * loaded with ScienceDiscovery's read_skill/read_skill_resource. JiuwenSwarm has global skill switches,
+   * so desktop runs must not import/toggle them or use its native skill loader: concurrent and nested
+   * runs can have different selections. Unset: server deployments keep JiuwenSwarm's global skill model.
    */
   skillSelection?: "desktop";
   /**
@@ -159,7 +158,12 @@ export const JIUWENSWARM_NATIVE_WEB_TOOLS: Record<string, readonly string[]> = {
 export const JIUWENSWARM_HOST_TOOLS = ["bash", "read_file", "write_file", "edit_file", "glob", "list_files", "grep", "read_pdf"] as const;
 
 /** What the model is told instead: JiuwenSwarm's own prompt still names those tools. */
-export const HOST_TOOLS_SECTION = "Commands, scripts and file writes run in the sandbox through run_shell; read workspace files with read_file and list_files. Use workspace-relative paths in run_shell (for example, report.md): the host working directory shown by JiuwenSwarm is not accessible at the same absolute path inside the sandbox. JiuwenSwarm's bash, write_file, edit_file, glob, grep and read_pdf are not available here. skill_index may show absolute host paths for Skills, but those paths are not workspace paths: never pass them to read_file or run_shell. Load an indexed Skill with skill_tool(skill_name=<name>, relative_file_path=\"SKILL.md\"), and use skill_tool for its referenced package files. If skill_tool fails, including a filesystem lock error, immediately load that Skill with read_skill(skillId=<ScienceDiscovery skill id>) instead; use read_skill_resource for its referenced package files. Do not try to recover a failed skill_tool call by reading its host path with run_shell.";
+const WORKSPACE_HOST_TOOLS_SECTION = "Commands, scripts and file writes run in the sandbox through run_shell; read workspace files with read_file and list_files. Use workspace-relative paths in run_shell (for example, report.md): the host working directory shown by JiuwenSwarm is not accessible at the same absolute path inside the sandbox. JiuwenSwarm's bash, write_file, edit_file, glob, grep and read_pdf are not available here.";
+
+export const HOST_TOOLS_SECTION = `${WORKSPACE_HOST_TOOLS_SECTION} skill_index may show absolute host paths for Skills, but those paths are not workspace paths: never pass them to read_file or run_shell. Load an indexed Skill with skill_tool(skill_name=<name>, relative_file_path="SKILL.md"), and use skill_tool for its referenced package files. If skill_tool fails, including a filesystem lock error, immediately load that Skill with read_skill(skillId=<ScienceDiscovery skill id>) instead; use read_skill_resource for its referenced package files. Do not try to recover a failed skill_tool call by reading its host path with run_shell.`;
+
+const RUN_SCOPED_SKILLS_SECTION = "Only this run's available_skills catalog is authoritative. Load a selected Skill with read_skill and its package files with read_skill_resource. JiuwenSwarm's native skill catalog and skill_tool are unavailable in this mode; ignore skill suggestions from its global prompt or earlier runs. When this run has no available_skills catalog, no Skills are selected.";
+const JIUWENSWARM_SKILL_TOOLS = ["skill_tool", "skill_index"];
 
 /**
  * ScienceDiscovery's tools JiuwenSwarm's permission engine asks the user about: those that needed approval before
@@ -367,8 +371,10 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
     // [windows-desktop] F6 (gap 1a, 0.B0 审查#5): on an unsandboxed provider those
     // native sub-agent tools are withheld entirely — a JiuwenSwarm-internal agent
     // would bypass ScienceDiscovery's approvals and audit. ScienceDiscovery's own
-    // `task` bridge stays available.
+    // `task` bridge stays available. Desktop selection also requires that bridge: native children do not
+    // inherit the parent's run-scoped skill catalog and would fall back to JiuwenSwarm's global switches.
     const jiuwenSwarmSubagents = allJiuwenSwarmTools && this.options.unsandboxedExecution !== true
+      && this.config.skillSelection !== "desktop"
       && (this.config.subagents ?? "task") === "jiuwenswarm" && tools.has("task");
     if (jiuwenSwarmSubagents) tools.delete("task");
     await this.installSkills(tools, allJiuwenSwarmTools);
@@ -469,22 +475,20 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
   private async installSkills(tools: Map<string, AgentTool>, allJiuwenSwarmTools: boolean): Promise<void> {
     const skills = this.options.skills ?? [];
     const root = this.options.skillPackagesRoot;
-    const wanted = (this.config.skills ?? "jiuwenswarm") === "jiuwenswarm" && allJiuwenSwarmTools
+    const wanted = !this.runScopedSkills() && allJiuwenSwarmTools
       && (this.config.prompt ?? "prepend") === "prepend";
     if (!wanted || (skills.length > 0 && (!root || !tools.has("read_skill")))) return;
     const imported = skills.length && root
       ? await importSkillsToJiuwenSwarm(this.config, skills, root, this.controller.signal)
       : new Map<string, string>();
-    // Desktop selection: align JiuwenSwarm's switches with what this run staged — also when that is nothing,
-    // so switching every skill off really turns them off there (a run with no staged skills installs none,
-    // and leftovers from earlier runs would otherwise stay on).
-    if (this.config.skillSelection === "desktop") {
-      await reconcileJiuwenSwarmSkills(this.config, new Set(imported.values()));
-    }
     for (const [id, name] of imported) {
       this.skillNames.set(id, name);
       this.skillIds.set(name, id);
     }
+  }
+
+  private runScopedSkills(): boolean {
+    return this.config.skillSelection === "desktop" || this.config.skills === "ours";
   }
 
   /** A tool's description as JiuwenSwarm's model reads it: skills it loads with skill_tool, under their names there. */
@@ -595,7 +599,10 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
     const runContract = this.options.runContract ? formatRunContract(this.options.runContract) : undefined;
     // Appended after JiuwenSwarm's own prompt, its todo section already says how to plan; only when its prompt is
     // replaced does the model need to be told about the todo tools here.
-    const keepJiuwenSwarmPrompt = (this.config.prompt ?? "prepend") === "prepend";
+    // JiuwenSwarm's prompt includes its global skill index. Desktop runs use the complete product prompt
+    // so a stale index from another Session is never advertised, even when every selected skill is off.
+    const keepJiuwenSwarmPrompt = this.config.skillSelection !== "desktop"
+      && (this.config.prompt ?? "prepend") === "prepend";
     const allJiuwenSwarmTools = (this.config.tools ?? "jiuwenswarm") === "jiuwenswarm";
     // With JiuwenSwarm's tools the model is no longer limited to the ones registered here, and the rules about
     // web content name JiuwenSwarm's web tools.
@@ -603,7 +610,9 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
       ? Object.entries(JIUWENSWARM_WEB_TOOLS).reduce((text, [mine, theirs]) => text.replaceAll(mine, theirs),
         composed.replace("Use only the registered workspace tools. ", ""))
       : composed;
-    const withHostRule = allJiuwenSwarmTools ? `${ours}\n\n${HOST_TOOLS_SECTION}` : ours;
+    const hostRule = this.runScopedSkills()
+      ? `${WORKSPACE_HOST_TOOLS_SECTION} ${RUN_SCOPED_SKILLS_SECTION}` : HOST_TOOLS_SECTION;
+    const withHostRule = allJiuwenSwarmTools ? `${ours}\n\n${hostRule}` : ours;
     const replacementSections = keepJiuwenSwarmPrompt ? [] : [
       ...(jiuwenSwarmPlans ? [TODO_PLANNING_SECTION] : []),
       ...(jiuwenSwarmSubagents ? [SUBAGENT_DELEGATION_SECTION] : []),
@@ -637,6 +646,7 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
         hiddenJiuwenSwarmTools: [
           ...(allJiuwenSwarmTools ? JIUWENSWARM_HOST_TOOLS : []),
           ...hiddenWebTools,
+          ...(this.runScopedSkills() ? JIUWENSWARM_SKILL_TOOLS : []),
           ...(!jiuwenSwarmPlans ? JIUWENSWARM_TODO_TOOLS : []),
           ...(!jiuwenSwarmSubagents ? JIUWENSWARM_SUBAGENT_LIFECYCLE_TOOLS : []),
         ],

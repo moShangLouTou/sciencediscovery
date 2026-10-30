@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { hostname, userInfo } from "node:os";
 import { constants } from "node:fs/promises";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -63,6 +63,8 @@ import { buildSeatbeltProfile, canonicalPath, seatbeltPwdShim, seatbeltWorkspace
 // win32: taskkill /T /F). See #482.
 import { condaActivationPaths, environmentShellPath, terminateTree } from "./platform/index.js";
 import { RunnerSkillPackages } from "./skill-packages.js";
+
+import { directHostEnvironment } from "./direct-environment.js";
 
 import { RUNNER_VERSION } from "./version.js";
 export { RUNNER_VERSION } from "./version.js";
@@ -743,18 +745,14 @@ export async function prepareSandboxEgress(
    */
   proxy?: ResolvedProxy,
 ): Promise<SandboxEgress | undefined> {
-  if (access.mode === "none" && sandbox === "bubblewrap") return undefined;
+  if (sandbox === "none") {
+    throw new Error("Sandbox network policy cannot be enforced without a sandbox; explicit host execution authorization is required");
+  }
+  if (access.mode === "none") return undefined;
   if (!gateways) {
     throw new EgressBridgeUnavailableError("this runner was started without an egress gateway registry");
   }
-  if (sandbox !== "bubblewrap") {
-    // [windows-desktop] "none" (Windows direct execution) filters egress
-    // the same way Seatbelt does — a runner-owned loopback TCP gateway plus
-    // proxy environment variables; there are no namespace binds to set up.
-    // [windows-desktop] with an unsandboxed launch there is no namespace
-    // isolation, so the "none" policy must still fail closed: acquire the
-    // deny-all gateway instead of returning no egress, otherwise the child
-    // would inherit unrestricted host network — the opposite of the policy.
+  if (sandbox === "seatbelt") {
     const gateway = await gateways.acquireTcp(access, proxy);
     return {
       bindArgs: [],
@@ -999,48 +997,23 @@ export interface PreparedSandboxOptions {
 
 /**
  * [windows-desktop] direct (unsandboxed) launch. The child inherits the
- * host environment — Windows processes need SystemRoot & co. — with the conda
+ * runtime variables — Windows processes need SystemRoot & co. — with the conda
  * activation paths prepended to PATH (: win-64 interpreters
  * delay-load DLLs from Library\bin) and the operator's own Python overrides
  * stripped so they cannot leak into the managed environment.
  */
 function buildDirectLaunch(options: {
   chdir: string;
-  egress?: SandboxEgress;
   envProfile?: SessionEnvProfile;
   executable: string;
   language: "python" | "r" | "shell";
   pathEnv: string;
   workspaceRoot: string;
 }): SandboxLaunch {
-  const env: Record<string, string> = {};
-  for (const [name, value] of Object.entries(process.env)) {
-    if (value !== undefined) env[name] = value;
-  }
-  // Windows environment variables are case-insensitive ("Path" vs "PATH").
-  const strip = (target: string) => {
-    for (const name of Object.keys(env)) {
-      if (name.toUpperCase() === target) delete env[name];
-    }
-  };
-  strip("PATH");
-  strip("PYTHONHOME");
-  strip("PYTHONPATH");
-  strip("PYTHONUSERBASE");
-  // [windows-desktop] the host's proxy slots must never leak into a
-  // direct launch. A host NO_PROXY="*" (or an inherited corporate proxy)
-  // would silently bypass the egress gateway the policy selected, so every
-  // proxy slot is stripped and, when a policy is in force, rebuilt from the
-  // egress environment alone. Loopback stays direct for local services.
-  strip("HTTP_PROXY");
-  strip("HTTPS_PROXY");
-  strip("ALL_PROXY");
-  strip("NO_PROXY");
+  const env = directHostEnvironment();
   env.PATH = options.pathEnv;
   env.HOME = options.workspaceRoot;
   if (options.language === "python") env.PYTHONNOUSERSITE = "1";
-  Object.assign(env, options.egress?.env ?? {});
-  if (options.egress) env.NO_PROXY = "127.0.0.1,localhost";
   for (const [name, value] of Object.entries(options.envProfile?.variables ?? {})) {
     if (profileKeyAllowed(name)) env[name] = value;
   }
@@ -1079,6 +1052,9 @@ export async function assertSandboxWorkspaceLinks(
   readOnlyWorkspaceRoot?: string,
   signal?: AbortSignal,
 ): Promise<void> {
+  // Host execution has no namespace mapping. Links retain host filesystem
+  // semantics, already disclosed by the explicit host authorization.
+  if (launch.sandbox === "none") return;
   const links: Buffer[] = [];
   const writablePath = workspaceBindArguments(workspaceRoot, readOnlyWorkspaceRoot).chdir;
   const slash = Buffer.from("/");
@@ -1261,6 +1237,7 @@ export async function executePython(
     // execution; fail clearly instead of half-launching R.
     throw new Error("R execution requires a sandboxed runner; the direct-execution provider (Windows) supports Python only");
   }
+  if (sandbox === "none") await assertHostAuthorization(config, request, workspaceRoot, "python", request.environmentRevisionId);
   // Host interpreter masks are bwrap bind arguments; Seatbelt and direct
   // execution never consume them, and /usr/bin does not exist on Windows.
   const hostInterpreterMasks = runtime && sandbox === "bubblewrap" ? await hostInterpreterMaskArguments() : [];
@@ -1272,11 +1249,11 @@ export async function executePython(
   const hostPython = !runtime && language === "python" ? await nativePythonPath(config, sandbox) : undefined;
   const npu = await resolveExecutionNpu(config, request.npuDevices,
     async () => await sandboxLaunchProfile(config.bwrapPath));
-  const egress = await prepareSandboxEgress(config.dataDir, networkAccess, gateways, sandbox, request.sandboxEgressProxy);
+  const egress = sandbox === "none" ? undefined
+    : await prepareSandboxEgress(config.dataDir, networkAccess, gateways, sandbox, request.sandboxEgressProxy);
   const launch = sandbox === "none"
     ? buildDirectLaunch({
         chdir: workspaceRoot,
-        egress,
         envProfile,
         executable: runtime ? runtime.interpreterPath : hostPython!,
         language,
@@ -1369,8 +1346,8 @@ export async function executePython(
     kernelMode,
     language,
     networkDeniedHosts: await gateways?.deniedHosts(networkAccess.revision),
-    networkAccessRevision: baseNetworkAccess.revision,
-    networkPolicy: networkAccess.mode,
+    ...(sandbox === "none" ? { directAuthorization: request.hostAuthorization } : { networkAccessRevision: baseNetworkAccess.revision }),
+    networkPolicy: sandbox === "none" ? "host" : networkAccess.mode,
     runnerVersion: RUNNER_VERSION,
     sandbox,
     startedAt,
@@ -1530,15 +1507,17 @@ const directTargetIdentity = `${hostname()}:${randomUUID()}`;
 
 /** Probe the host shell independently of sandbox readiness; no command is run. */
 export async function directExecutionCapability(): Promise<import("@sciencediscovery/schema").DirectExecutionCapability> {
-  let available = process.platform === "linux" || process.platform === "darwin";
-  try { await access("/bin/bash", constants.X_OK); } catch { available = false; }
+  let available = process.platform === "win32" || process.platform === "linux" || process.platform === "darwin";
+  if (process.platform !== "win32") {
+    try { await access("/bin/bash", constants.X_OK); } catch { available = false; }
+  }
   const user = userInfo();
   return { available, target: directTargetIdentity, account: `${user.username}:${user.uid}:${user.gid}` };
 }
 
 /** Validate the consent workspace on the machine that will execute it. No code runs. */
-export async function directExecutionWorkspace(config: Pick<ExecutorConfig, "dataDir">, root: string, cwdValue: string) {
-  const workspaceRoot = await validatedWorkspace(config.dataDir, root);
+export async function directExecutionWorkspace(config: Pick<ExecutorConfig, "dataDir" | "extraWorkspaceRoots">, root: string, cwdValue: string) {
+  const workspaceRoot = await validatedWorkspace(config.dataDir, root, config.extraWorkspaceRoots);
   if (isAbsolute(cwdValue)) throw new Error("Direct cwd must be workspace-relative");
   const directory = await realpath(resolve(workspaceRoot, cwdValue));
   const cwd = relative(workspaceRoot, directory);
@@ -1548,10 +1527,33 @@ export async function directExecutionWorkspace(config: Pick<ExecutorConfig, "dat
   return { workspaceRoot, cwd };
 }
 
+/** The signed control-plane request carries consent for exactly this host operation. */
+async function assertHostAuthorization(
+  config: ExecutorConfig,
+  request: PythonExecutionRequest | ShellExecutionRequest,
+  workspaceRoot: string,
+  language: "python" | "shell",
+  environment?: string,
+): Promise<void> {
+  const authorization = request.hostAuthorization;
+  const capability = await directExecutionCapability();
+  const cwd = "cwd" in request ? request.cwd ?? "" : "";
+  const scope = await directExecutionWorkspace(config, workspaceRoot, cwd);
+  if (!authorization?.authorizationId || !authorization.runId
+    || authorization.target !== capability.target || authorization.account !== capability.account
+    || authorization.agentId !== request.agentId || authorization.workspaceRoot !== scope.workspaceRoot
+    || authorization.cwd !== scope.cwd || authorization.runnerWorkspaceKey !== request.runnerWorkspaceKey
+    || authorization.language !== language || authorization.environment !== environment
+    || authorization.codeHash !== createHash("sha256").update(request.code).digest("hex")) {
+    throw new Error("Unsandboxed execution requires explicit host authorization for this code, target, account, workspace and environment; network access is unrestricted (host)");
+  }
+}
+
 /** Only called through the separately authenticated direct-execution endpoint. */
 export async function executeDirectShell(
   config: ExecutorConfig, request: ShellExecutionRequest, signal: AbortSignal,
   onOutput?: (stream: "stdout" | "stderr", chunk: Buffer) => void,
+  environmentStore?: Pick<EnvironmentStore, "capability" | "resolveRuntime">,
 ): Promise<ShellExecutionResult> {
   signal.throwIfAborted();
   if (!request.code.trim() || !request.executionId?.trim()) throw new Error("Direct code and execution ID are required");
@@ -1565,6 +1567,13 @@ export async function executeDirectShell(
   }
   const { workspaceRoot, cwd: canonicalCwd } = await directExecutionWorkspace(config, request.workspaceRoot, authorization.cwd);
   if (authorization.workspaceRoot !== workspaceRoot || authorization.cwd !== canonicalCwd) throw new Error("Direct workspace scope changed");
+  if (process.platform === "win32") {
+    const result = await executeEnvironmentShell({ ...config, sandboxProvider: "none" }, {
+      ...request,
+      hostAuthorization: { ...authorization, language: "shell", codeHash: createHash("sha256").update(request.code).digest("hex") },
+    }, signal, undefined, undefined, undefined, onOutput, environmentStore);
+    return { ...result, directAuthorization: authorization };
+  }
   const cwd = resolve(workspaceRoot, canonicalCwd);
   const maxWorkspaceBytes = resolveQuotaBytes(request.maxWorkspaceBytes, config.maxWorkspaceBytes, "maxWorkspaceBytes");
   const maxOutputBytes = resolveQuotaBytes(request.maxOutputBytes, config.maxOutputBytes, "maxOutputBytes");
@@ -1639,7 +1648,6 @@ async function executeEnvironmentShell(
   await assertWorkspaceWithinQuota(workspaceRoot, maxWorkspaceBytes);
   const before = await workspaceSnapshot(workspaceRoot);
   const startedAt = new Date().toISOString();
-  const networkAccess = epochSandboxNetworkAccess(request.permissionEpoch);
   let chdir = workspaceRoot;
   if (request.cwd !== undefined) {
     if (isAbsolute(request.cwd)) throw new Error("cwd must be workspace-relative");
@@ -1651,10 +1659,9 @@ async function executeEnvironmentShell(
     if (!(await stat(directory)).isDirectory()) throw new Error("cwd must be a directory");
     chdir = directory;
   }
-  const egress = await prepareSandboxEgress(config.dataDir, networkAccess, gateways, "none", request.sandboxEgressProxy);
+  await assertHostAuthorization(config, request, workspaceRoot, "shell", request.environmentId);
   const launch = buildDirectLaunch({
     chdir,
-    egress,
     envProfile,
     executable: shellPath,
     language: "shell",
@@ -1698,8 +1705,8 @@ async function executeEnvironmentShell(
     kernelMode: "ephemeral",
     language: "shell",
     modifiedFiles,
-    networkAccessRevision: networkAccess.revision,
-    networkPolicy: networkAccess.mode,
+    directAuthorization: request.hostAuthorization,
+    networkPolicy: "host",
     runnerVersion: RUNNER_VERSION,
     sandbox: "none",
     startedAt,

@@ -707,7 +707,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
   const jiuwenSwarm = jiuwenSwarmConfigFromEnv();
   const webBackend = jiuwenSwarm ? "jiuwenswarm" as const : "native" as const;
   // Desktop (SCIENCE_AGENT_SKILL_SELECTION=desktop): the UI's selection in project settings decides which skills a
-  // run stages — and installs in JiuwenSwarm, whose on/off switches each run aligns with it. Server deployments
+  // run stages and reads without changing JiuwenSwarm's global switches. Server deployments
   // keep the JiuwenSwarm behavior: every installed skill everywhere, switched in JiuwenSwarm itself.
   if (jiuwenSwarm && jiuwenSwarm.skillSelection !== "desktop") store.useEverySkillEverywhere();
   // The UI's language as JiuwenSwarm's; remembered so that each page load does not rewrite JiuwenSwarm's config.
