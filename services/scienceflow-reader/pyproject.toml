@@ -1,0 +1,11 @@
+[project]
+name = "sciencediscovery-scienceflow-reader"
+version = "0.1.0"
+description = "Read-only snapshot reader for ScienceFlow managed-run records."
+requires-python = ">=3.10"
+dependencies = []
+
+# Pure library: no service entry point, no runtime dependencies. It is
+# intentionally NOT a member of the root uv workspace in this stage.
+[tool.uv]
+package = false
