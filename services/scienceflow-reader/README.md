@@ -100,8 +100,11 @@ passed".
 
 `candidateArtifact` is `null` (with a diagnostic) when:
 
-1. there is no `merge/best_stage_manifest.json` and no usable
-   `lhr_stage_performance.csv` row;
+1. there is no `merge/best_stage_manifest.json` and no
+   `lhr_stage_performance.csv` row that upstream classifies as
+   `valid_comparable` (validation failed, `selection_eligible`/`candidate_ready`
+   not true, `metric_validity=low`, or `submission_status=invalid_submission`
+   rows are never eligible);
 2. the manifest status is `no_valid_candidate`, `missing_artifact`, or
    `artifact_sha_mismatch` and the CSV has no valid candidate;
 3. the candidate file is missing, escapes the allowed roots, or its digest no

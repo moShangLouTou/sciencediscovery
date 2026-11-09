@@ -33,6 +33,9 @@ _CSV_COLUMNS = [
     "metric_validity",
     "selection_eligible",
     "candidate_ready",
+    "submission_status",
+    "evaluator_backend",
+    "evaluator_status",
 ]
 
 _SECRETS = ("SHOULD-NOT-LEAK", "TOKEN-SHOULD-NOT-LEAK", "DRAFT-SHOULD-NOT-LEAK")
@@ -89,7 +92,9 @@ def _write_control(run_dir, **record):
 
 def _csv_row(task_root, metric_value, metric_name="radii_sum", lower="false",
              artifact_rel="artifacts/best_solution.json", content=b'{"solution":[1,2,3]}',
-             sha_override=None, validation_ok="true"):
+             sha_override=None, validation_ok="true", selection_eligible="true",
+             candidate_ready="true", metric_validity="high", submission_status="ready",
+             evaluator_backend="local", evaluator_status="ok"):
     snapshot = os.path.join(task_root, "workers", "w00", "snapshots", "s1")
     artifact = os.path.join(snapshot, artifact_rel)
     sha = _write_bytes(artifact, content)
@@ -104,9 +109,12 @@ def _csv_row(task_root, metric_value, metric_name="radii_sum", lower="false",
         "snapshot_path": snapshot,
         "artifact_path": artifact_rel,
         "artifact_sha": sha_override if sha_override is not None else sha,
-        "metric_validity": "high",
-        "selection_eligible": "true",
-        "candidate_ready": "true",
+        "metric_validity": metric_validity,
+        "selection_eligible": selection_eligible,
+        "candidate_ready": candidate_ready,
+        "submission_status": submission_status,
+        "evaluator_backend": evaluator_backend,
+        "evaluator_status": evaluator_status,
     }
 
 
@@ -226,6 +234,95 @@ class SnapshotTest(unittest.TestCase):
         snapshot = read_run_snapshot(record, [self.task_root])
         self.assertIsNone(snapshot["tasks"][0]["candidateArtifact"])
         self.assertIn("candidate_file_missing", {d["code"] for d in snapshot["diagnostics"]})
+
+    # 4d. Rows the upstream validity rule rejects never produce a candidate,
+    # even when every referenced file exists.
+    def test_only_ineligible_candidates_yield_none(self):
+        rows = [
+            _csv_row(self.task_root, metric_value=50.0, validation_ok="false",
+                     artifact_rel="artifacts/r1.json"),
+            _csv_row(self.task_root, metric_value=60.0, selection_eligible="false",
+                     artifact_rel="artifacts/r2.json"),
+            _csv_row(self.task_root, metric_value=70.0, candidate_ready="false",
+                     artifact_rel="artifacts/r3.json"),
+            _csv_row(self.task_root, metric_value=80.0, metric_validity="low",
+                     artifact_rel="artifacts/r4.json"),
+        ]
+        for row in rows:
+            artifact = os.path.join(row["snapshot_path"], row["artifact_path"])
+            self.assertTrue(os.path.isfile(artifact))
+        _write_csv(self.task_root, rows)
+        record = _write_control(self.run_dir, task_roots=[self.task_root])
+
+        snapshot = read_run_snapshot(record, [self.task_root])
+        self.assertIsNone(snapshot["tasks"][0]["candidateArtifact"])
+        self.assertIn("no_eligible_candidate", {d["code"] for d in snapshot["diagnostics"]})
+
+    # 4e. A missing eligible file must not be replaced by an invalid candidate.
+    def test_ineligible_file_is_not_a_fallback(self):
+        eligible = _csv_row(self.task_root, metric_value=10.0,
+                            artifact_rel="artifacts/good.json")
+        ineligible = _csv_row(self.task_root, metric_value=999.0,
+                              selection_eligible="false",
+                              artifact_rel="artifacts/bad.json")
+        os.remove(os.path.join(eligible["snapshot_path"], eligible["artifact_path"]))
+        self.assertTrue(
+            os.path.isfile(os.path.join(ineligible["snapshot_path"], ineligible["artifact_path"]))
+        )
+        _write_csv(self.task_root, [eligible, ineligible])
+        record = _write_control(self.run_dir, task_roots=[self.task_root])
+
+        snapshot = read_run_snapshot(record, [self.task_root])
+        self.assertIsNone(snapshot["tasks"][0]["candidateArtifact"])
+        codes = {d["code"] for d in snapshot["diagnostics"]}
+        self.assertIn("candidate_file_missing", codes)
+        self.assertNotIn("no_eligible_candidate", codes)
+
+    # 4f. With several eligible rows, direction still picks the right one.
+    def test_multiple_eligible_candidates_follow_metric_direction(self):
+        root_max = os.path.join(self.base, "task-max")
+        root_min = os.path.join(self.base, "task-min")
+        for root in (root_max, root_min):
+            os.makedirs(root, exist_ok=True)
+        _write_csv(root_max, [
+            _csv_row(root_max, metric_value=10.0, lower="false",
+                     artifact_rel="artifacts/a.json"),
+            _csv_row(root_max, metric_value=20.0, lower="false",
+                     artifact_rel="artifacts/b.json"),
+        ])
+        _write_csv(root_min, [
+            _csv_row(root_min, metric_value=10.0, lower="true",
+                     artifact_rel="artifacts/a.json"),
+            _csv_row(root_min, metric_value=20.0, lower="true",
+                     artifact_rel="artifacts/b.json"),
+        ])
+        record = _write_control(self.run_dir, task_roots=[root_max, root_min])
+
+        snapshot = read_run_snapshot(record, [root_max, root_min])
+        by_root = {task["taskRoot"]: task for task in snapshot["tasks"]}
+        self.assertEqual(by_root[root_max]["candidateArtifact"]["metricValue"], 20.0)
+        self.assertEqual(by_root[root_min]["candidateArtifact"]["metricValue"], 10.0)
+
+    # 4g. An explicitly invalid high score cannot outrank an eligible candidate.
+    def test_ineligible_high_score_cannot_win(self):
+        eligible = _csv_row(self.task_root, metric_value=10.0,
+                            artifact_rel="artifacts/good.json")
+        ineligible = _csv_row(self.task_root, metric_value=999.0,
+                              metric_validity="low",
+                              artifact_rel="artifacts/tempting.json")
+        _write_csv(self.task_root, [eligible, ineligible])
+        record = _write_control(self.run_dir, task_roots=[self.task_root])
+
+        snapshot = read_run_snapshot(record, [self.task_root])
+        artifact = snapshot["tasks"][0]["candidateArtifact"]
+        self.assertIsNotNone(artifact)
+        self.assertEqual(artifact["metricValue"], 10.0)
+        self.assertEqual(
+            os.path.realpath(artifact["path"]),
+            os.path.realpath(
+                os.path.join(eligible["snapshot_path"], eligible["artifact_path"])
+            ),
+        )
 
     # 4b. Broken JSON in the manifest is reported, not treated as success.
     def test_broken_manifest_json(self):

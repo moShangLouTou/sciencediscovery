@@ -293,7 +293,11 @@ def _parse_stage_row(raw):
         "artifactPath": _clean(raw.get("artifact_path")),
         "artifactSha": _clean_lower(raw.get("artifact_sha")),
         "submissionSha": _clean_lower(raw.get("submission_sha")),
-        "metricValidity": _clean(raw.get("metric_validity")),
+        "metricValidity": _clean_lower(raw.get("metric_validity")),
+        "submissionStatus": _clean(raw.get("submission_status")),
+        "evaluatorBackend": _clean(raw.get("evaluator_backend")),
+        "evaluatorStatus": _clean_lower(raw.get("evaluator_status")),
+        "directionKnown": _direction_known_raw(raw.get("lower_is_better")),
     }
 
 
@@ -401,8 +405,12 @@ def _candidate_artifact(manifest, csv_rows, task_root_real, roots_real, diagnost
         if diagnostic is not None:
             diagnostics.append(diagnostic)
 
+    # Only rows the upstream validity rule classifies as ``valid_comparable``
+    # may be selected. An ineligible row is never a fallback.
+    eligible_rows = [row for row in csv_rows if _row_is_eligible(row)]
+
     first_diagnostic = None
-    for row in _ranked_rows(csv_rows):
+    for row in _ranked_rows(eligible_rows):
         candidate, diagnostic = _candidate_from_row(
             row, task_root_real, roots_real, task_root
         )
@@ -413,7 +421,15 @@ def _candidate_artifact(manifest, csv_rows, task_root_real, roots_real, diagnost
 
     if first_diagnostic is not None:
         diagnostics.append(first_diagnostic)
-    elif not manifest_present:
+    elif csv_rows and not eligible_rows:
+        diagnostics.append(
+            _diag(
+                "no_eligible_candidate",
+                "Stage-performance CSV has no valid_comparable candidate.",
+                task_root,
+            )
+        )
+    elif not csv_rows and not manifest_present:
         diagnostics.append(
             _diag(
                 "no_candidate_binding",
@@ -471,6 +487,8 @@ def _candidate_from_manifest(manifest, roots_real, task_root):
 
 
 def _candidate_from_row(row, task_root_real, roots_real, task_root):
+    if not _row_is_eligible(row):
+        return None, None
     rel = row["artifactPath"]
     if not rel:
         return None, _diag(
@@ -554,6 +572,47 @@ def _ranked_rows(rows):
         return (rank, metric if lower else -metric)
 
     return sorted(rows, key=key)
+
+
+def _row_validity(row):
+    """Mirror ScienceFlow ``score_summary._validity_from_row`` for a CSV row.
+
+    The recorded ``metric_validity`` column is the upstream judgment and is used
+    as-is instead of re-inferring it. Missing/empty booleans follow the upstream
+    defaults: ``selection_eligible`` and ``candidate_ready`` default to False,
+    so a row without an explicit ``True`` is not comparable.
+    """
+    validation_ok = row["validationOk"]
+    selection_eligible = row["selectionEligible"] is True
+    candidate_ready = row["candidateReady"] is True
+    submission_status = row["submissionStatus"] or ""
+    metric_validity = row["metricValidity"] or ""
+    evaluator_verified = (
+        bool(row["evaluatorBackend"])
+        and row["evaluatorStatus"] == "ok"
+        and validation_ok is True
+        and selection_eligible
+        and candidate_ready
+        and row["directionKnown"]
+        and submission_status != "invalid_submission"
+    )
+    if validation_ok is False:
+        return "validation_failed"
+    if submission_status == "invalid_submission":
+        return "produced_invalid"
+    if metric_validity == "low":
+        return "risk_flagged_metric"
+    if selection_eligible and candidate_ready and evaluator_verified:
+        return "valid_comparable"
+    if selection_eligible and candidate_ready and metric_validity == "high":
+        return "valid_comparable"
+    if candidate_ready:
+        return "observed_not_comparable"
+    return "observed_not_official"
+
+
+def _row_is_eligible(row):
+    return _row_validity(row) == "valid_comparable"
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +701,16 @@ def _to_bool(value):
         if text in ("false", "0", "no"):
             return False
     return None
+
+
+def _direction_known_raw(value):
+    """Mirror ``score_summary._direction_known`` on the raw CSV value."""
+    if isinstance(value, bool):
+        return True
+    if value is None:
+        return False
+    text = str(value).strip().lower()
+    return bool(text and text not in {"none", "null", "nan", "unknown"})
 
 
 def _clean(value):
