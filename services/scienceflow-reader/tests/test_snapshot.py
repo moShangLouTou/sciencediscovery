@@ -9,6 +9,7 @@ import csv
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -17,6 +18,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
 
 from snapshot import SCHEMA_VERSION, read_run_snapshot  # noqa: E402
+
+_SNAPSHOT_CLI = os.path.join(os.path.dirname(_HERE), "snapshot.py")
 
 _CSV_COLUMNS = [
     "metric_value",
@@ -455,6 +458,99 @@ class SnapshotTest(unittest.TestCase):
         invalid = read_run_snapshot(bad, [self.task_root])
         self.assertEqual(invalid["tasks"], [])
         self.assertIn("run_record_invalid_json", {d["code"] for d in invalid["diagnostics"]})
+
+    # ------------------------------------------------------------------
+    # CLI contract: stdout is one JSON object; exit codes are explicit.
+    # ------------------------------------------------------------------
+
+    def _run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, _SNAPSHOT_CLI, *args],
+            capture_output=True,
+            text=True,
+            cwd=self.base,
+        )
+
+    # 7a. A successful read exits 0 and stdout is exactly one JSON object.
+    def test_cli_success_exits_zero_with_json(self):
+        _write_manifest_success(self.task_root, metric_value=42.0)
+        record = _write_control(self.run_dir, task_roots=[self.task_root])
+
+        result = self._run_cli(record, self.task_root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["runId"], "run-001")
+        self.assertEqual(payload["tasks"][0]["candidateArtifact"]["metricValue"], 42.0)
+        self.assertEqual(
+            result.stdout,
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        )
+        self.assertNotIn("Traceback", result.stdout)
+
+    # 7b. A running task with no candidate is a normal (exit 0) result.
+    def test_cli_running_without_candidate_exits_zero(self):
+        record = _write_control(self.run_dir, task_roots=[self.task_root])
+
+        result = self._run_cli(record, self.task_root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["rawStatus"], "running")
+        self.assertIsNone(payload["tasks"][0]["candidateArtifact"])
+        self.assertIn("no_candidate_binding", {d["code"] for d in payload["diagnostics"]})
+
+    # 7c. Missing arguments exit 2 and still write a structured JSON object.
+    def test_cli_missing_arguments_exit_two(self):
+        result = self._run_cli()
+        self.assertEqual(result.returncode, 2)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["tasks"], [])
+        self.assertIn("invalid_arguments", {d["code"] for d in payload["diagnostics"]})
+
+    # 7d. A missing run record exits 2.
+    def test_cli_missing_record_exits_two(self):
+        missing = os.path.join(self.base, "runs", "nope", "control.json")
+        result = self._run_cli(missing, self.task_root)
+        self.assertEqual(result.returncode, 2)
+        payload = json.loads(result.stdout)
+        self.assertIn("run_record_missing", {d["code"] for d in payload["diagnostics"]})
+
+    # 7e. A corrupt run record exits 2.
+    def test_cli_broken_record_exits_two(self):
+        record = os.path.join(self.run_dir, "control.json")
+        _write_text(record, "{not json")
+        result = self._run_cli(record, self.task_root)
+        self.assertEqual(result.returncode, 2)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["tasks"], [])
+        self.assertIn("run_record_invalid_json", {d["code"] for d in payload["diagnostics"]})
+
+    # 7f. A structurally invalid record (no run_id) exits 2.
+    def test_cli_record_without_run_id_exits_two(self):
+        record = _write_control(self.run_dir, task_roots=[self.task_root], run_id=None)
+        result = self._run_cli(record, self.task_root)
+        self.assertEqual(result.returncode, 2)
+        payload = json.loads(result.stdout)
+        self.assertIn("run_record_missing_run_id", {d["code"] for d in payload["diagnostics"]})
+
+    # 7g. An unexpected read failure exits 1 with no traceback on either stream.
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() != 0,
+        "requires POSIX permissions and a non-root user",
+    )
+    def test_cli_unexpected_failure_exits_one(self):
+        artifact_path, _ = _write_manifest_success(self.task_root)
+        record = _write_control(self.run_dir, task_roots=[self.task_root])
+        os.chmod(artifact_path, 0)
+        try:
+            result = self._run_cli(record, self.task_root)
+        finally:
+            os.chmod(artifact_path, 0o600)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["tasks"], [])
+        self.assertIn("internal_error", {d["code"] for d in payload["diagnostics"]})
+        self.assertNotIn("Traceback", result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
 
 
 def _write_row_with_paths(row):

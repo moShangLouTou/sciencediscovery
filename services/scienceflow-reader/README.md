@@ -16,11 +16,30 @@ snapshot = read_run_snapshot(
 )
 ```
 
-Optional convenience CLI (direct invocation, still no server):
+Optional standalone CLI (direct invocation, still no server):
 
 ```sh
-python3 services/scienceflow-reader/snapshot.py <control.json> <task-root> [more roots...]
+python3 services/scienceflow-reader/snapshot.py \
+  /absolute/path/to/managed_runs/<run_id>/control.json \
+  /absolute/path/to/workspace/task-001 [more roots...]
 ```
+
+The CLI writes **exactly one JSON object** to stdout and nothing else (a usage
+line may go to stderr). The Python function interface is unchanged.
+
+Exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Read completed. Normal states such as a running task with no candidate are included; `diagnostics` may still be non-empty. |
+| `2` | Argument error, or the run record is missing, corrupt, oversized, or structurally invalid (for example no `run_id`). |
+| `1` | Any other read failure or an internal exception. |
+
+Even on failure, stdout is a snapshot-shaped JSON object whose `diagnostics`
+reuse the normal structure (`invalid_arguments`, `internal_error`, or the
+existing `run_record_*` codes). No traceback, usage text, or source-record
+contents are printed to stdout. Callers should branch on diagnostic codes, never
+on message text.
 
 ## Where the evidence actually comes from
 

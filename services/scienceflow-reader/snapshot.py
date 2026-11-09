@@ -44,6 +44,17 @@ _AGG_LHR_STATE_REL = "task_logs/lhr_state.json"
 
 _MISSING = object()
 
+#: Run-record diagnostics that make the CLI exit with the input-error code (2).
+#: The caller should classify failures by these codes, never by message text.
+_RECORD_ERROR_CODES = frozenset(
+    {
+        "run_record_missing",
+        "run_record_invalid_json",
+        "run_record_too_large",
+        "run_record_missing_run_id",
+    }
+)
+
 
 # ---------------------------------------------------------------------------
 # Public entry point
@@ -732,15 +743,58 @@ def _diag(code, message, task_root=None):
     return diagnostic
 
 
-if __name__ == "__main__":  # pragma: no cover - convenience only
+def _empty_failure_snapshot(code, message):
+    """A snapshot-shaped payload for a failure that occurred before/around reading."""
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "runId": None,
+        "rawStatus": None,
+        "phase": None,
+        "tasks": [],
+        "diagnostics": [{"code": code, "message": message}],
+    }
+
+
+if __name__ == "__main__":  # pragma: no cover - convenience CLI
     import sys
 
-    if len(sys.argv) < 3:
+    def _write(payload):
+        # stdout carries exactly one JSON object: no logs, prompts, or tracebacks.
+        json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    args = sys.argv[1:]
+    if len(args) < 2:
         print(
             "usage: python snapshot.py <run-record-or-dir> <allowed-task-root> [more roots...]",
             file=sys.stderr,
         )
+        _write(
+            _empty_failure_snapshot(
+                "invalid_arguments",
+                "Expected a run record path and at least one allowed task root.",
+            )
+        )
         raise SystemExit(2)
-    result = read_run_snapshot(sys.argv[1], sys.argv[2:])
-    json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
-    sys.stdout.write("\n")
+
+    try:
+        result = read_run_snapshot(args[0], args[1:])
+    except Exception as exc:  # noqa: BLE001 - the CLI must never emit a traceback
+        _write(
+            _empty_failure_snapshot(
+                "internal_error",
+                f"Unexpected {type(exc).__name__} while reading the run record.",
+            )
+        )
+        raise SystemExit(1)
+
+    _write(result)
+    codes = {
+        diagnostic.get("code")
+        for diagnostic in result.get("diagnostics", [])
+        if isinstance(diagnostic, dict)
+    }
+    if codes & _RECORD_ERROR_CODES:
+        raise SystemExit(2)
+    raise SystemExit(0)
