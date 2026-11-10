@@ -166,3 +166,235 @@ export interface ScienceFlowRunRegistrationDto {
 export interface ScienceFlowRunRegistrationInput {
   readonly runId: string;
 }
+
+/**
+ * Version of the immutable execution-plan contract.
+ *
+ * A plan freezes what an administrator's profile and the checked source files
+ * said at one moment. It is not a ResearchTaskSpec, not a registration, and not
+ * a ScienceFlow run: `planId`, `registrationId`, and `runId` are three different
+ * identities and are never interchangeable.
+ */
+export const SCIENCE_FLOW_EXECUTION_PLAN_DTO_VERSION = 1;
+/** Version of one static preflight result, bound to a plan contract digest. */
+export const SCIENCE_FLOW_PREFLIGHT_DTO_VERSION = 1;
+/** Default and maximum page sizes for listing plans. */
+export const SCIENCE_FLOW_EXECUTION_PLAN_LIST_DEFAULT_LIMIT = 100;
+export const SCIENCE_FLOW_EXECUTION_PLAN_LIST_MAX_LIMIT = 250;
+
+/** How one static check ended. Only `passed` and `unknown` keep a contract valid. */
+export const SCIENCE_FLOW_PLAN_CHECK_STATUSES = [
+  "passed",
+  "failed",
+  "unknown",
+  "unsupported",
+] as const;
+export type ScienceFlowPlanCheckStatus =
+  (typeof SCIENCE_FLOW_PLAN_CHECK_STATUSES)[number];
+
+/**
+ * Fixed diagnostic codes a plan check may carry.
+ *
+ * Codes describe a condition, not a sentence: the server supplies the fixed
+ * description. No code, description, or error ever carries a host path, raw
+ * YAML, an exception message, or a free-form engine diagnostic.
+ */
+export const SCIENCE_FLOW_PLAN_CHECK_CODES = [
+  "manifest_readable",
+  "manifest_encoding",
+  "manifest_size",
+  "manifest_yaml",
+  "manifest_duplicate_key",
+  "manifest_alias_limit",
+  "manifest_shape",
+  "manifest_key",
+  "manifest_multiple_tasks",
+  "manifest_max_concurrent",
+  "manifest_phase",
+  "manifest_type",
+  "manifest_resume",
+  "manifest_config_include",
+  "manifest_task_text",
+  "manifest_model_gateway",
+  "manifest_evaluator",
+  "manifest_budget",
+  "task_yaml_readable",
+  "task_yaml_encoding",
+  "task_yaml_size",
+  "task_yaml_yaml",
+  "task_yaml_duplicate_key",
+  "task_yaml_alias_limit",
+  "task_yaml_shape",
+  "task_yaml_key",
+  "shared_defaults",
+  "task_identity",
+  "task_metric",
+  "task_artifact",
+  "evaluator_entrypoint",
+  "evaluator_file",
+  "description_reference",
+  "description_file",
+  "path_allowed_roots",
+  "path_traversal",
+  "dataset_identity",
+  "execution_environment",
+  "pricing",
+  "model_gateway",
+  "scienceflow_revision",
+  "dependency_closure",
+  "contract_changed",
+] as const;
+export type ScienceFlowPlanCheckCode =
+  (typeof SCIENCE_FLOW_PLAN_CHECK_CODES)[number];
+
+/**
+ * Reasons execution cannot start. `canStart` is always false this round: a
+ * static contract being valid says nothing about a connected backend, a model
+ * gateway, enforced budgets, descendant-process cancellation, or a verified
+ * engine revision.
+ */
+export const SCIENCE_FLOW_EXECUTION_BLOCKER_CODES = [
+  "execution_backend_not_connected",
+  "model_gateway_not_configured",
+  "budget_enforcement_not_implemented",
+  "process_cancellation_not_implemented",
+  "scienceflow_revision_unverified",
+] as const;
+export type ScienceFlowExecutionBlockerCode =
+  (typeof SCIENCE_FLOW_EXECUTION_BLOCKER_CODES)[number];
+
+export interface ScienceFlowPlanCheckDto {
+  readonly code: ScienceFlowPlanCheckCode;
+  readonly status: ScienceFlowPlanCheckStatus;
+  /** Fixed server-side description; never source text or an exception. */
+  readonly description: string;
+}
+
+export interface ScienceFlowPlanBlockerDto {
+  readonly code: ScienceFlowExecutionBlockerCode;
+  readonly description: string;
+}
+
+/** The declared engine revision, kept apart from what was actually checked. */
+export interface ScienceFlowDeclaredRevisionDto {
+  readonly declaredRevision: string;
+  /** This round never inspects an installation, so it is always `unverified`. */
+  readonly verification: "unverified";
+}
+
+export interface ScienceFlowExecutionTaskDto {
+  readonly taskId: string;
+  readonly category: string | null;
+  readonly profile: string | null;
+}
+
+export interface ScienceFlowExecutionMetricDto {
+  readonly name: string;
+  readonly lowerIsBetter: boolean;
+  readonly type: string | null;
+  /** Null when the package did not state it; never inferred. */
+  readonly authoritative: boolean | null;
+}
+
+export interface ScienceFlowExecutionArtifactDto {
+  /** Package-relative; never an absolute host path. */
+  readonly path: string;
+  readonly kind: string | null;
+}
+
+export interface ScienceFlowExecutionEvaluatorDto {
+  /** The package-relative `path:function` reference, not imported or executed. */
+  readonly entrypoint: string;
+  readonly path: string;
+  readonly function: string;
+  readonly sha256: string;
+  readonly timeoutSec: number | null;
+}
+
+export interface ScienceFlowExecutionDescriptionDto {
+  readonly path: string;
+  readonly sha256: string;
+}
+
+export interface ScienceFlowExecutionBudgetDto {
+  /** Manifest-declared, never enforced by this round. */
+  readonly name: "wall_clock_budget_sec" | "time_limit";
+  readonly value: number;
+  readonly unit: "seconds";
+  readonly nature: "requested";
+}
+
+/** Capabilities this round cannot verify. Each stays explicit, never assumed. */
+export interface ScienceFlowExecutionUnknownsDto {
+  readonly dataset: "not-applicable" | "unknown";
+  readonly environment: "unknown";
+  readonly pricing: "unknown";
+  readonly modelGateway: "unknown";
+  readonly revision: "unverified";
+  readonly dependencyClosure: "incomplete";
+}
+
+/** The whitelisted, immutable content of one execution plan. */
+export interface ScienceFlowExecutionPlanContractDto {
+  readonly scienceflow: ScienceFlowDeclaredRevisionDto;
+  readonly task: ScienceFlowExecutionTaskDto;
+  readonly metric: ScienceFlowExecutionMetricDto;
+  readonly artifact: ScienceFlowExecutionArtifactDto;
+  readonly evaluator: ScienceFlowExecutionEvaluatorDto;
+  readonly description: ScienceFlowExecutionDescriptionDto;
+  readonly taskYamlSha256: string;
+  readonly manifestSha256: string;
+  /** Digest of the applied `_shared/task_defaults.yaml`; null when none applied. */
+  readonly sharedDefaultsSha256: string | null;
+  readonly budgets: readonly ScienceFlowExecutionBudgetDto[];
+  readonly unknowns: ScienceFlowExecutionUnknownsDto;
+}
+
+/** One immutable plan plus the most recent stored preflight result. */
+export interface ScienceFlowExecutionPlanDto {
+  readonly schemaVersion: typeof SCIENCE_FLOW_EXECUTION_PLAN_DTO_VERSION;
+  readonly planId: string;
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly profileId: string;
+  /** The client's idempotency identity, echoed back so retries are explicit. */
+  readonly requestId: string;
+  /** ISO-8601 creation time, written once and never updated. */
+  readonly createdAt: string;
+  /** SHA-256 over the canonical contract below. */
+  readonly contractDigest: string;
+  readonly contract: ScienceFlowExecutionPlanContractDto;
+  /** Static contract validity only; execution availability is reported apart. */
+  readonly execution: {
+    readonly canStart: false;
+    readonly blockers: readonly ScienceFlowPlanBlockerDto[];
+  };
+  readonly latestPreflight: ScienceFlowPreflightDto | null;
+}
+
+/**
+ * One completed static preflight. `outcome` reports contract validity only;
+ * `canStart` is always false and the blockers are fixed.
+ */
+export interface ScienceFlowPreflightDto {
+  readonly schemaVersion: typeof SCIENCE_FLOW_PREFLIGHT_DTO_VERSION;
+  readonly planId: string;
+  /** The frozen plan digest the check is bound to. */
+  readonly contractDigest: string;
+  /** Digest recomputed from the current profile and files; null if unreadable. */
+  readonly observedContractDigest: string | null;
+  readonly checkedAt: string;
+  readonly outcome: "passed" | "blocked";
+  readonly canStart: false;
+  readonly checks: readonly ScienceFlowPlanCheckDto[];
+  readonly blockers: readonly ScienceFlowPlanBlockerDto[];
+}
+
+/**
+ * The only body a plan create accepts. Paths, manifest text, scripts, model
+ * credentials, and budget overrides are not accepted fields.
+ */
+export interface ScienceFlowExecutionPlanInput {
+  readonly profileId: string;
+  readonly requestId: string;
+}
