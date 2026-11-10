@@ -412,6 +412,30 @@ YAML is parsed with the `core` schema, duplicate mapping keys are refused, and
 alias expansion is capped at 100 so one document cannot multiply itself.
 Structured files are capped at 256 KiB and the evaluator source at 2 MiB.
 
+**Workspace source.** The engine resolves one workspace per task from the first
+non-blank of the task's `workspace`, the task's `workspace_base`, then
+`defaults.workspace_base`. The static check applies the same precedence, and a
+manifest that supplies none of them is refused (`manifest_workspace` `failed`)
+rather than given a default directory. A blank value counts as absent. A
+non-string value is refused as `unsupported`: this check does not reproduce the
+engine's string coercion. The contract records only which key won
+(`workspace.source`); the value is never resolved, expanded, created, stored, or
+returned, so a relative or `~` path is not inspected here.
+
+```yaml
+max_concurrent: 1
+time_limit: 3600
+defaults:
+  phase: run
+  type: lnr
+  workspace_base: /srv/scienceflow/runs
+  evaluator:
+    enabled: true
+    backend: task_package
+tasks:
+  - exp_id: circle-packing
+```
+
 ### Create
 
 ```bash
@@ -484,6 +508,7 @@ POST .../scienceflow/plans/:planId/preflight
     "artifact": { "path": "artifacts/best.json", "kind": "json" },
     "evaluator": { "entrypoint": "evaluate.py:score", "path": "evaluate.py", "function": "score", "sha256": "…", "timeoutSec": 300 },
     "description": { "path": "description.md", "sha256": "…" },
+    "workspace": { "source": "defaults_workspace_base" },
     "taskYamlSha256": "…",
     "manifestSha256": "…",
     "sharedDefaultsSha256": null,
@@ -530,7 +555,7 @@ Six codes are diagnostics that appear only when their condition is detected:
 `manifest_shape`, `manifest_duplicate_key`, `manifest_alias_limit`, and the
 `task_yaml_*` equivalents. Their absence means that defect was not found, not
 that the file was left unchecked; every other code is reported with a status.
-A supported task package therefore answers with 37 of the 43 registered codes.
+A supported task package therefore answers with 38 of the 44 registered codes.
 
 A preflight adds `contract_changed`: `passed` when the re-read files produce a
 digest equal to the frozen one, `failed` otherwise — including when a file is
