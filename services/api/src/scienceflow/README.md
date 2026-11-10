@@ -43,6 +43,9 @@ Files:
 | `execution-plan-repository.ts` | Additive SQLite table, conditional preflight write, corruption detection |
 | `execution-plan.ts` | Plan create/list/get/preflight over identity, write gate, profile table |
 | `execution-plan-http.ts` | The four plan routes and their status mapping |
+| `execution-instance-store.ts` | Durable instance identity/state: atomic, versioned, strict reads |
+| `execution-instance-backend.ts` | Narrow Linux execution adapter: start, observe, stop, confirm |
+| `engine-revision.ts` | Trusted checkout revision and working-tree check, without running the engine |
 
 ## Enable and disable
 
@@ -624,6 +627,130 @@ either way. An I/O or storage failure is `500`, never a blocked check.
 7. Remove the profile from the admin file and restart → list/detail `200`,
    preflight `503`; unset the variable and restart → plans retained. Delete the
    Session (or its Project) → its plans are gone.
+
+## Execution adapter and engine revision check (round 9)
+
+Round 9 answers *who would start and cancel a run* without starting one. It adds
+an execution adapter and a source-revision check; **no route, command, or startup
+path constructs either**. `canStart` stays `false` and the same five blockers
+stay reported, so nothing here is an execution authorization and no version of
+this feature can start a research run.
+
+### Why a narrow adapter
+
+The Runner (`services/runner/src/executor.ts`, `execution-recovery.ts`,
+`platform/posix.ts`, `packages/executor`) was read first and remains the intended
+host for real execution. For this round it cannot carry the required lifecycle:
+its abort controllers are in-memory (a restart leaves non-terminal executions
+`unknown` with no handle), its cancellation terminates the direct child except
+for tracked bubblewrap groups, and its start path is bound to workspace
+admission, leases, bash code text, and CAS publication — none of which belongs in
+a control-plane capability query or in an instance that must be stoppable by a
+different process.
+
+`ExecutionInstanceBackend` is therefore a deliberately narrow adapter for
+explicitly configured Linux standalone execution. It is built by a trusted
+caller (`stateRoot` has no default), never resolves a path from a request, and
+exposes no HTTP interface that could start a command, script, or manifest.
+
+### Contract
+
+| Operation | Answer |
+| --- | --- |
+| `capabilities()` | Static capability statement (no discovery, no probing) |
+| `start(spec)` | `started` / `existing` / `conflict` / `failed` / `unsupported` |
+| `observe(id)` | `observed` (state, identity verdict, `processAlive`, `groupAlive`, member count) / `not-found` / `record-invalid` |
+| `requestStop(id, request)` | `stopped` / `already-terminal` / `refused` / `unverified` |
+| `confirmExit(id)` | Terminal **and** no live leader and no live member |
+
+- The launch specification is trusted server code: absolute `executable` and
+  `cwd`, an argv array (`shell: false`), a bounded environment allow-list, and
+  optional deadline/output limits. Argument, environment-name, and size bounds
+  are validated before anything is created; no client text is ever a command,
+  a shell line, or a path.
+- Identity is `executionId` + `attemptId` + `owner` + `createdAt` + the start
+  request id and a digest of the exact specification. It is deliberately
+  separate from `planId`, `runId`, and `registrationId`; none of those is an
+  execution handle, and the execution id is never passed to the engine.
+- The kernel identity is captured once at launch: pid, process-group id, session
+  id, `/proc/[pid]/stat` start time, `boot_id`, and effective uid. A process that
+  ends before it can be identified is reported as `unknown` /
+  `launch-unrecorded` — never as completed, and never as cancellable.
+- Records live in `<stateRoot>/<executionId>/instance.json`, written with an
+  atomic replace, a `schemaVersion`, and strict validation on read. A corrupt or
+  unknown-version record is reported (`record-invalid`), never repaired or
+  guessed around. Records never contain host paths, environment variables, or a
+  command line.
+- Only the recorded owner can request a stop.
+
+### States and outcomes
+
+`starting` → `running` → (`stop_requested` →) `stopped`, or `exited` when the
+launcher itself observed the end. `lost` means the process is verifiably gone but
+nobody saw it end, so **no exit code is claimed**. `unknown` means nothing about
+the end is known. A signal is not an outcome: exit confirmation requires a
+terminal state and no live session member.
+
+A launcher-observed exit with descendants still alive in the recorded session
+does **not** become `exited`: the exit facts are kept as data, the instance stays
+`running`, and an outcome is never claimed for a tree that is still alive.
+
+### Cancellation guarantee (limited, and stated as such)
+
+- TERM is sent to the verified process group when the recorded leader still
+  matches its start time and session; otherwise to each live session member by
+  exact pid, re-read immediately before every signal. No name-, port-, or
+  broad-pid-scan killing is performed.
+- After the grace period the same targets receive KILL and the result is
+  confirmed by scanning the recorded session, not by trusting the signal.
+- A child that calls `setsid()` leaves the session and is **out of reach**:
+  `capabilities().cancellation.escapedDescendant` is `unsupported`,
+  `guaranteesCompleteDescendantStop` is `false`, and a stop that cannot confirm
+  the whole tree answers `unverified` with a survivor count. This is why the
+  "descendant-process cancellation" blocker stays in place.
+- Refusals are distinct: `owner-mismatch`, `identity-mismatch` (the recorded pid
+  now belongs to another process), `not-permitted` (EPERM),
+  `identity-unverified`, `record-invalid`, `not-found`. A refused stop leaves no
+  trace that a stop was underway.
+
+### Restart semantics
+
+- Client rebuild and backend restart are supported: a new process re-observes
+  and stops from the durable record and the kernel identity — no `ChildProcess`
+  handle is needed. A rebuilt caller never invents an exit code for a process it
+  did not watch.
+- Automatic recovery or resume is unsupported. Nothing is restarted after a
+  terminal state, and a stop never becomes a restart.
+- A deadline is enforced only while the launching process is alive. A rebuilt
+  backend reports a recorded deadline as `overdue` but does not kill anything.
+
+### Engine source revision check
+
+`checkEngineRevision({ path, expectedRevision })` answers one question without
+running the engine: is the checkout this deployment would load still the
+expected commit, unmodified? A commit id alone cannot answer it, so the check
+reads the actual HEAD, the checkout root, and the working-tree status.
+
+- Results are `verified-clean`, `revision-mismatch`, `dirty` (a tracked file
+  changed, or an untracked runnable source/config file exists), `unsupported`
+  (not a Git checkout, or a subdirectory of one), and `unavailable` (Git missing,
+  timeout, output limit, unreadable). Reasons are static; no command output,
+  path, or repository content is returned or logged.
+- Git runs with an argv array, `shell: false`, a minimal environment, a timeout,
+  and bounded output. It never fetches, checks out, installs, or imports.
+- The path comes from a trusted caller only; there is no default, so the
+  untracked reference checkout in a developer worktree is never implied.
+- A source-checkout result is **not** a verification of an installed Python
+  environment. A wheel or source archive has no history, is `unsupported`, and
+  its version is never guessed. This check does not unblock the
+  `scienceflow_revision` blocker.
+
+### Round 9 non-goals
+
+No research-start route, no real `start_run`, no engine installation, no model,
+GPU, or evaluator execution, no `control.json` write, no budget enforcement, no
+event import, and no change to any existing plan, registration, or snapshot
+behavior.
 
 ## Known limits
 
