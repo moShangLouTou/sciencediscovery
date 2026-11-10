@@ -218,6 +218,7 @@ export const SCIENCE_FLOW_PLAN_CHECK_CODES = [
   "manifest_model_gateway",
   "manifest_evaluator",
   "manifest_budget",
+  "manifest_workspace",
   "task_yaml_readable",
   "task_yaml_encoding",
   "task_yaml_size",
@@ -316,6 +317,26 @@ export interface ScienceFlowExecutionDescriptionDto {
   readonly sha256: string;
 }
 
+/**
+ * Which manifest key supplies the task workspace.
+ *
+ * The engine resolves a workspace from the first non-blank of the task's
+ * `workspace`, the task's `workspace_base`, then `defaults.workspace_base`, and
+ * refuses a manifest that supplies none. This contract records only which one
+ * supplied it: the path is never read, expanded, created, stored, or returned.
+ */
+export const SCIENCE_FLOW_WORKSPACE_SOURCES = [
+  "task_workspace",
+  "task_workspace_base",
+  "defaults_workspace_base",
+] as const;
+export type ScienceFlowWorkspaceSource =
+  (typeof SCIENCE_FLOW_WORKSPACE_SOURCES)[number];
+
+export interface ScienceFlowExecutionWorkspaceDto {
+  readonly source: ScienceFlowWorkspaceSource;
+}
+
 export interface ScienceFlowExecutionBudgetDto {
   /** Manifest-declared, never enforced by this round. */
   readonly name: "wall_clock_budget_sec" | "time_limit";
@@ -342,6 +363,8 @@ export interface ScienceFlowExecutionPlanContractDto {
   readonly artifact: ScienceFlowExecutionArtifactDto;
   readonly evaluator: ScienceFlowExecutionEvaluatorDto;
   readonly description: ScienceFlowExecutionDescriptionDto;
+  /** Which key supplied the workspace; never the path. */
+  readonly workspace: ScienceFlowExecutionWorkspaceDto;
   readonly taskYamlSha256: string;
   readonly manifestSha256: string;
   /** Digest of the applied `_shared/task_defaults.yaml`; null when none applied. */

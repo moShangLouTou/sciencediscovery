@@ -48,6 +48,7 @@ const CONTRACT: ScienceFlowExecutionPlanContractDto = {
     timeoutSec: null,
   },
   description: { path: "description.md", sha256: "b".repeat(64) },
+  workspace: { source: "defaults_workspace_base" },
   taskYamlSha256: "c".repeat(64),
   manifestSha256: "d".repeat(64),
   sharedDefaultsSha256: null,

@@ -37,6 +37,7 @@ lnr:
 defaults:
   phase: run
   type: lnr
+  workspace_base: workspace-base
   evaluator:
     enabled: true
     backend: task_package
@@ -178,6 +179,9 @@ test("CRT-01 the supported subset builds a complete contract", async (context) =
     path: "description.md",
     sha256: contract.description.sha256,
   });
+  // The workspace source is the last non-blank key in the engine's precedence;
+  // the path itself never enters the contract.
+  assert.deepEqual(contract.workspace, { source: "defaults_workspace_base" });
   assert.match(contract.taskYamlSha256, /^[0-9a-f]{64}$/);
   assert.match(contract.manifestSha256, /^[0-9a-f]{64}$/);
   assert.match(contract.sharedDefaultsSha256 ?? "", /^[0-9a-f]{64}$/);
@@ -500,3 +504,108 @@ test("CRT-24 a rejected task package leaves skipped checks unknown", async (cont
     assertCheck(result, code, "unknown");
   }
 });
+
+/** Insert one task-level key directly after the task's `exp_id` line. */
+function withTaskKey(manifest: string, line: string): string {
+  return manifest.replace(
+    "  - exp_id: circle-packing\n",
+    `  - exp_id: circle-packing\n    ${line}\n`,
+  );
+}
+
+const WITHOUT_DEFAULTS_WORKSPACE = MANIFEST.replace("  workspace_base: workspace-base\n", "");
+
+test("CRT-25 a manifest that names no workspace at all is refused", async (context) => {
+  // The engine raises here instead of supplying a directory; the static check
+  // must refuse the same manifest rather than pass it with an implied default.
+  const test = await fixture(context, { manifest: WITHOUT_DEFAULTS_WORKSPACE });
+  const result = await build(test);
+  assert.equal(result.status, "rejected");
+  assertCheck(result, "manifest_workspace", "failed");
+});
+
+test("CRT-26 blank workspace values do not count as a workspace", async (context) => {
+  const cases = [
+    // Every level blank or empty: still nothing to resolve.
+    withTaskKey(
+      WITHOUT_DEFAULTS_WORKSPACE,
+      'workspace: ""',
+    ).replace("  type: lnr\n", '  type: lnr\n  workspace_base: "   "\n'),
+    // A task-level base line that only contains whitespace.
+    withTaskKey(WITHOUT_DEFAULTS_WORKSPACE, 'workspace_base: ""'),
+    // Null is not a declaration either.
+    withTaskKey(WITHOUT_DEFAULTS_WORKSPACE, "workspace: null"),
+  ];
+  for (const manifest of cases) {
+    const test = await fixture(context, { manifest });
+    const result = await build(test);
+    assert.equal(result.status, "rejected");
+    assertCheck(result, "manifest_workspace", "failed");
+  }
+});
+
+test("CRT-27 an explicit workspace passes and creates no directory", async (context) => {
+  const test = await fixture(context, { manifest: WITHOUT_DEFAULTS_WORKSPACE });
+  const workspace = join(test.root, "declared-workspace");
+  await test.write(
+    "manifest.yaml",
+    withTaskKey(WITHOUT_DEFAULTS_WORKSPACE, `workspace: ${JSON.stringify(workspace)}`),
+  );
+  const result = await build(test);
+  if (result.status !== "ok") assert.fail(`expected ok, got ${result.status}`);
+  assert.deepEqual(result.contract.workspace, { source: "task_workspace" });
+  // The check reads the declaration only: it never creates the directory and
+  // never puts the path into the contract or its checks.
+  assert.equal(existsSync(workspace), false);
+  assert.equal(JSON.stringify(result.contract).includes(workspace), false);
+  assert.equal(JSON.stringify(result.checks).includes(workspace), false);
+});
+
+test("CRT-28 an explicit workspace wins over both workspace bases", async (context) => {
+  const test = await fixture(context, {
+    manifest: withTaskKey(
+      withTaskKey(MANIFEST, "workspace_base: task-base"),
+      'workspace: "explicit-workspace"',
+    ),
+  });
+  const result = await build(test);
+  if (result.status !== "ok") assert.fail(`expected ok, got ${result.status}`);
+  assert.deepEqual(result.contract.workspace, { source: "task_workspace" });
+});
+
+test("CRT-29 a task workspace_base wins over the defaults", async (context) => {
+  const test = await fixture(context, {
+    manifest: withTaskKey(MANIFEST, "workspace_base: task-base"),
+  });
+  const result = await build(test);
+  if (result.status !== "ok") assert.fail(`expected ok, got ${result.status}`);
+  assert.deepEqual(result.contract.workspace, { source: "task_workspace_base" });
+});
+
+test("CRT-30 a blank explicit workspace falls back to the defaults base", async (context) => {
+  const test = await fixture(context, {
+    manifest: withTaskKey(MANIFEST, 'workspace: "   "'),
+  });
+  const result = await build(test);
+  if (result.status !== "ok") assert.fail(`expected ok, got ${result.status}`);
+  assert.deepEqual(result.contract.workspace, { source: "defaults_workspace_base" });
+});
+
+test("CRT-31 a non-string workspace form is unsupported, not coerced", async (context) => {
+  const cases = [
+    withTaskKey(WITHOUT_DEFAULTS_WORKSPACE, "workspace: 42"),
+    withTaskKey(WITHOUT_DEFAULTS_WORKSPACE, "workspace: true"),
+    withDefaultsWorkspace("42"),
+  ];
+  for (const manifest of cases) {
+    const test = await fixture(context, { manifest });
+    const result = await build(test);
+    assert.equal(result.status, "rejected");
+    assertCheck(result, "manifest_workspace", "unsupported");
+  }
+});
+
+/** Rewrite the defaults base value while keeping that key's position. */
+function withDefaultsWorkspace(value: string): string {
+  return MANIFEST.replace("  workspace_base: workspace-base\n", `  workspace_base: ${value}\n`);
+}

@@ -33,6 +33,7 @@ import {
   SCIENCE_FLOW_PLAN_CHECK_CODES,
   SCIENCE_FLOW_PLAN_CHECK_STATUSES,
   SCIENCE_FLOW_PREFLIGHT_DTO_VERSION,
+  SCIENCE_FLOW_WORKSPACE_SOURCES,
   type ScienceFlowExecutionBudgetDto,
   type ScienceFlowExecutionPlanContractDto,
   type ScienceFlowExecutionPlanDto,
@@ -508,6 +509,11 @@ function parseContract(value: unknown): ScienceFlowExecutionPlanContractDto {
     throw new ScienceFlowExecutionPlanCorruptError();
   }
 
+  const workspace = value.workspace;
+  if (!isRecord(workspace) || !isWorkspaceSource(workspace.source)) {
+    throw new ScienceFlowExecutionPlanCorruptError();
+  }
+
   const budgets = parseBudgets(value.budgets);
   const unknowns = value.unknowns;
   if (
@@ -549,6 +555,9 @@ function parseContract(value: unknown): ScienceFlowExecutionPlanContractDto {
     description: Object.freeze({
       path: description.path,
       sha256: description.sha256,
+    }),
+    workspace: Object.freeze({
+      source: workspace.source,
     }),
     taskYamlSha256: requireDigest(value.taskYamlSha256),
     manifestSha256: requireDigest(value.manifestSha256),
@@ -621,6 +630,16 @@ function isDigest(value: unknown): value is string {
 /** The declared engine revision is a full lowercase git commit id, not a digest. */
 function isDeclaredRevision(value: unknown): value is string {
   return typeof value === "string" && /^[0-9a-f]{40}$/.test(value);
+}
+
+/** The source is one of the keys the engine resolves a workspace from. */
+function isWorkspaceSource(
+  value: unknown,
+): value is ScienceFlowExecutionPlanContractDto["workspace"]["source"] {
+  return (
+    typeof value === "string" &&
+    (SCIENCE_FLOW_WORKSPACE_SOURCES as readonly string[]).includes(value)
+  );
 }
 
 function isNonBlankString(value: unknown): value is string {

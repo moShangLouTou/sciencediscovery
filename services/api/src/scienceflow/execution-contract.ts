@@ -45,6 +45,7 @@ import type {
   ScienceFlowPlanCheckCode,
   ScienceFlowPlanCheckDto,
   ScienceFlowPlanCheckStatus,
+  ScienceFlowWorkspaceSource,
 } from "@sciencediscovery/schema";
 import {
   SCIENCE_FLOW_EXECUTION_BLOCKER_CODES,
@@ -149,6 +150,7 @@ const CHECK_DESCRIPTIONS = {
     "The manifest does not configure a model gateway or credentials.",
   manifest_evaluator: "The manifest selects the task-package evaluator.",
   manifest_budget: "Every declared budget is a positive finite number.",
+  manifest_workspace: "The manifest names a non-empty task workspace source.",
   task_yaml_readable: "The task package task.yaml is readable.",
   task_yaml_encoding: "The task package task.yaml is valid UTF-8 text.",
   task_yaml_size: "The task package task.yaml is within the size limit.",
@@ -192,6 +194,12 @@ const CHECK_STATUS_DESCRIPTIONS: Partial<
   dataset_identity: {
     unknown:
       "The task package references an external dataset whose identity is not verified.",
+  },
+  manifest_workspace: {
+    failed:
+      "No non-blank `workspace` or `workspace_base` is declared for the task.",
+    unsupported:
+      "The declared workspace or workspace base is not a plain non-blank string.",
   },
   contract_changed: {
     failed: "The current profile or source files no longer match the frozen contract.",
@@ -442,6 +450,7 @@ const MANIFEST_TASK_KEYS = new Set([
   "num_drafts",
   "draft_parallel",
   "workspace",
+  "workspace_base",
 ]);
 
 const MANIFEST_LNR_KEYS = new Set([
@@ -481,6 +490,46 @@ function readBudget(value: unknown): BudgetValue {
   return { present: true, value, valid: true };
 }
 
+/** A declared workspace value: absent, a usable string, or a malformed form. */
+function readWorkspaceText(value: unknown): {
+  readonly text: string;
+  readonly valid: boolean;
+} {
+  if (value === undefined || value === null) return { text: "", valid: true };
+  if (typeof value !== "string") return { text: "", valid: false };
+  const text = value.trim();
+  // A control byte is not a path form the engine accepts, and it cannot be
+  // described honestly in a response, so it is refused rather than trimmed.
+  if (/[\u0000-\u001f\u007f]/.test(text)) return { text: "", valid: false };
+  return { text, valid: true };
+}
+
+type WorkspaceResolution =
+  | { readonly status: "ok"; readonly source: ScienceFlowWorkspaceSource }
+  | { readonly status: "missing" | "unsupported" };
+
+/**
+ * The engine's workspace precedence: the task's explicit `workspace`, then the
+ * task's `workspace_base`, then `defaults.workspace_base`, with a blank value
+ * counted as absent. Nothing is resolved, expanded, or created here; only the
+ * winning key is kept, so no host path enters the contract.
+ */
+function resolveWorkspaceSource(
+  task: Readonly<Record<string, unknown>>,
+  defaults: Readonly<Record<string, unknown>> | undefined,
+): WorkspaceResolution {
+  const explicit = readWorkspaceText(task.workspace);
+  const taskBase = readWorkspaceText(task.workspace_base);
+  const defaultBase = readWorkspaceText(defaults?.workspace_base);
+  if (!explicit.valid || !taskBase.valid || !defaultBase.valid) {
+    return { status: "unsupported" };
+  }
+  if (explicit.text) return { status: "ok", source: "task_workspace" };
+  if (taskBase.text) return { status: "ok", source: "task_workspace_base" };
+  if (defaultBase.text) return { status: "ok", source: "defaults_workspace_base" };
+  return { status: "missing" };
+}
+
 interface ManifestFacts {
   readonly expId: string;
   readonly rootTimeLimit?: number;
@@ -489,6 +538,8 @@ interface ManifestFacts {
   readonly defaultsWallClock?: number;
   readonly taskWallClock?: number;
   readonly inputDataDir: boolean;
+  /** Which key supplies the workspace; the path itself is never resolved. */
+  readonly workspaceSource: ScienceFlowWorkspaceSource;
 }
 
 /** Validate the supported manifest subset; returns facts or a rejected verdict. */
@@ -511,6 +562,9 @@ function evaluateManifest(
   ] as const) {
     checks.add(code);
   }
+  // The workspace source needs the task record; a manifest rejected before it
+  // is reached must report the check as unevaluated, not passed.
+  checks.add("manifest_workspace", "unknown");
 
   for (const key of Object.keys(manifest)) {
     if (MODEL_GATEWAY_KEYS.has(key)) {
@@ -596,11 +650,22 @@ function evaluateManifest(
   if (task.run_id !== undefined && typeof task.run_id !== "string") {
     checks.override("manifest_shape", "failed");
   }
-  for (const key of ["cpu_list", "gpu_list", "workspace"] as const) {
+  for (const key of ["cpu_list", "gpu_list"] as const) {
     const value = task[key];
     if (value !== undefined && value !== null && typeof value !== "string") {
       checks.override("manifest_shape", "failed");
     }
+  }
+  const workspace = resolveWorkspaceSource(
+    task,
+    defaults !== undefined && isRecord(defaults) ? defaults : undefined,
+  );
+  if (workspace.status === "ok") {
+    checks.override("manifest_workspace", "passed");
+  } else if (workspace.status === "missing") {
+    checks.override("manifest_workspace", "failed");
+  } else {
+    checks.override("manifest_workspace", "unsupported");
   }
   if (task.phase !== undefined && String(task.phase).trim().toLowerCase() !== "run") {
     checks.override("manifest_phase", "unsupported");
@@ -644,6 +709,10 @@ function evaluateManifest(
     checks.override("manifest_shape", "failed");
   }
 
+  // A manifest that names no workspace is what the engine refuses at run time;
+  // the static check must refuse it too rather than supplying a directory.
+  if (workspace.status !== "ok") return undefined;
+
   return {
     expId,
     ...(rootTime.value !== undefined ? { rootTimeLimit: rootTime.value } : {}),
@@ -654,6 +723,7 @@ function evaluateManifest(
       : {}),
     ...(taskLnr.wallClock !== undefined ? { taskWallClock: taskLnr.wallClock } : {}),
     inputDataDir,
+    workspaceSource: workspace.source,
   };
 }
 
@@ -692,14 +762,8 @@ function evaluateDefaults(
       }
     }
   }
-  if (defaults.workspace_base !== undefined) {
-    if (
-      typeof defaults.workspace_base !== "string" ||
-      defaults.workspace_base.trim().length === 0
-    ) {
-      checks.override("manifest_shape", "failed");
-    }
-  }
+  // `defaults.workspace_base` is judged with the task workspace source below:
+  // a blank value is absent there, not a shape error on its own.
   for (const key of ["num_drafts", "draft_parallel"] as const) {
     if (defaults[key] !== undefined && !isPositiveInteger(defaults[key])) {
       checks.override("manifest_shape", "failed");
@@ -1232,6 +1296,9 @@ function evaluateProfile(
     description: {
       path: taskFacts.descriptionPath,
       sha256: taskFacts.descriptionSha256,
+    },
+    workspace: {
+      source: manifestFacts.workspaceSource,
     },
     taskYamlSha256: taskFacts.taskYamlSha256,
     manifestSha256: manifestRead.sha256,
