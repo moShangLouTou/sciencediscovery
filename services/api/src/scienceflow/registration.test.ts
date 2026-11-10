@@ -42,6 +42,8 @@ interface HarnessOptions {
   readonly readerDisabled?: boolean;
   readonly binding?: ScienceFlowRunBinding | undefined;
   readonly storeError?: unknown;
+  /** Lets a test pause the binding lookup and change state while it waits. */
+  readonly awaitBinding?: Promise<void>;
 }
 
 interface Harness {
@@ -51,6 +53,9 @@ interface Harness {
   readonly listArgs: Array<{ limit: number; offset: number }>;
   writableCalls(): number;
   setBinding(binding: ScienceFlowRunBinding | undefined): void;
+  setSessionMissing(missing: boolean): void;
+  /** Applied from the next `requireWritable` call on. */
+  setWritableError(error: unknown): void;
 }
 
 function harness(options: HarnessOptions = {}): Harness {
@@ -61,6 +66,9 @@ function harness(options: HarnessOptions = {}): Harness {
   const listArgs: Array<{ limit: number; offset: number }> = [];
   let writableCalls = 0;
   let generated = 0;
+  let sessionMissing = options.sessionMissing ?? false;
+  let sessionProject = options.sessionProject ?? IDENTITY.projectId;
+  let writableError = options.writableError;
   let binding: ScienceFlowRunBinding | undefined =
     "binding" in options ? options.binding : defaultBinding();
 
@@ -104,20 +112,21 @@ function harness(options: HarnessOptions = {}): Harness {
       getProject: (projectId) =>
         options.projectMissing ? undefined : projectId === IDENTITY.projectId ? { id: projectId } : undefined,
       getSession: (sessionId) =>
-        options.sessionMissing
+        sessionMissing
           ? undefined
           : sessionId === IDENTITY.sessionId
-            ? { projectId: options.sessionProject ?? IDENTITY.projectId }
+            ? { projectId: sessionProject }
             : undefined,
     },
     requireWritable: () => {
       writableCalls++;
-      if (options.writableError !== undefined) throw options.writableError;
+      if (writableError !== undefined) throw writableError;
     },
     resolveBinding: options.readerDisabled
       ? undefined
       : async (query) => {
           bindingQueries.push(query);
+          if (options.awaitBinding !== undefined) await options.awaitBinding;
           return binding;
         },
     store: () => store,
@@ -134,7 +143,21 @@ function harness(options: HarnessOptions = {}): Harness {
     setBinding: (next) => {
       binding = next;
     },
+    setSessionMissing: (missing) => {
+      sessionMissing = missing;
+    },
+    setWritableError: (error) => {
+      writableError = error;
+    },
   };
+}
+
+function deferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((settle) => {
+    resolve = () => settle();
+  });
+  return { promise, resolve };
 }
 
 function defaultBinding(): ScienceFlowRunBinding {
@@ -341,4 +364,47 @@ test("REG-S10 a binding resolver that throws is an internal failure, not a succe
   const result = await service.create(IDENTITY, "run-1");
   assert.deepEqual(result, { status: "internal-error" });
   assert.ok(!JSON.stringify(result).includes("SYNTHETIC-SECRET"));
+});
+
+test("REG-S11 a Session deleted while the binding resolves is not registered", async () => {
+  const gate = deferred();
+  const h = harness({ awaitBinding: gate.promise });
+  const pending = h.service.create(IDENTITY, "run-1");
+  // The lookup started and is paused; the first write gate already passed.
+  assert.equal(h.bindingQueries.length, 1);
+  assert.equal(h.writableCalls(), 1);
+
+  // A concurrent delete removes the Session while the create waits.
+  h.setSessionMissing(true);
+  gate.resolve();
+  assert.deepEqual(await pending, { status: "not-found", resource: "session" });
+  assert.equal(h.drafts.length, 0);
+  // The post-lookup check returns first; no second gate call was needed.
+  assert.equal(h.writableCalls(), 1);
+});
+
+test("REG-S12 a released, unchanged lookup writes exactly one registration", async () => {
+  const gate = deferred();
+  const h = harness({ awaitBinding: gate.promise });
+  const pending = h.service.create(IDENTITY, "run-1");
+  gate.resolve();
+  assert.equal((await pending).status, "created");
+  assert.equal(h.drafts.length, 1);
+  // The write gate is checked before and again after the lookup.
+  assert.equal(h.writableCalls(), 2);
+});
+
+test("REG-S13 write permission withdrawn while the binding resolves is never bypassed", async () => {
+  const gate = deferred();
+  const h = harness({ awaitBinding: gate.promise });
+  const pending = h.service.create(IDENTITY, "run-1");
+  assert.equal(h.bindingQueries.length, 1);
+
+  const error = Object.assign(new Error("Session is archived and read-only"), { statusCode: 409 });
+  h.setWritableError(error);
+  gate.resolve();
+  // The same rejection the first gate produces, so the HTTP layer still maps
+  // it to its established 409 rather than a generic 500.
+  await assert.rejects(pending, (thrown) => thrown === error);
+  assert.equal(h.drafts.length, 0);
 });
