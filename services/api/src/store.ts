@@ -41,6 +41,7 @@ import type { ConnectorConfigurationRequest } from "@sciencediscovery/schema";
 import { ConfigurationRepository } from "./configuration/repository.js";
 import { ConfigurationCredentialBridge } from "./configuration/credential-bridge.js";
 import { ScienceFlowRegistrationRepository } from "./scienceflow/registration-repository.js";
+import { ScienceFlowExecutionPlanRepository } from "./scienceflow/execution-plan-repository.js";
 import { configurationDecisionReady } from "./configuration/interaction-wait.js";
 import { nativeConfigurationChoiceRecord, nativeRunOverlay } from "./configuration/native-choices.js";
 
@@ -635,6 +636,7 @@ export class SessionStore {
   private shellExecutionStore?: ShellExecutions;
   private transferStore?: WorkspaceTransfers;
   private scienceFlowRegistrationStore?: ScienceFlowRegistrationRepository;
+  private scienceFlowExecutionPlanStore?: ScienceFlowExecutionPlanRepository;
   private loaded = false;
   private saveQueue = Promise.resolve();
   /** Physical reclamation outlives the request that asked for it; deletes queue
@@ -699,6 +701,11 @@ export class SessionStore {
   get scienceFlowRegistrations(): ScienceFlowRegistrationRepository {
     if (!this.scienceFlowRegistrationStore) throw new Error("ScienceFlow registration storage is not initialized");
     return this.scienceFlowRegistrationStore;
+  }
+
+  get scienceFlowExecutionPlans(): ScienceFlowExecutionPlanRepository {
+    if (!this.scienceFlowExecutionPlanStore) throw new Error("ScienceFlow execution plan storage is not initialized");
+    return this.scienceFlowExecutionPlanStore;
   }
 
   get transfers(): WorkspaceTransfers {
@@ -859,6 +866,7 @@ export class SessionStore {
     this.transferStore = new WorkspaceTransfers(this.database, new VersionStore(this.dataDir));
     this.shellExecutionStore = new ShellExecutions(this.database, new VersionStore(this.dataDir), this.notificationStore);
     this.scienceFlowRegistrationStore = new ScienceFlowRegistrationRepository(this.database);
+    this.scienceFlowExecutionPlanStore = new ScienceFlowExecutionPlanRepository(this.database);
     this.secretKey = await this.loadOrCreateSecretKey();
     this.migrateRemoteHostTokens();
     const modelIdsWithSecrets = new Set((this.database.prepare("SELECT model_id FROM model_secrets").all() as Array<{ model_id: string }>).map((row) => row.model_id));
@@ -1582,6 +1590,7 @@ export class SessionStore {
     if (exists("configuration_credential_drafts")) new ConfigurationCredentialBridge(this.database, this.configurationSecretCipher()).clearSession(sessionId);
     if (exists("configuration_endpoint_consents")) this.database.prepare("DELETE FROM configuration_endpoint_consents WHERE session_id=?").run(sessionId);
     if (exists("science_flow_run_registrations")) this.scienceFlowRegistrationStore?.deleteSession(sessionId);
+    if (exists("science_flow_execution_plans")) this.scienceFlowExecutionPlanStore?.deleteSession(sessionId);
   }
 
 
@@ -6198,6 +6207,7 @@ export class SessionStore {
     // queryable orphan behind, even if a Session row drifted. Session-scoped
     // cleanup above already covers the normal path.
     this.scienceFlowRegistrationStore?.deleteProject(projectId);
+    this.scienceFlowExecutionPlanStore?.deleteProject(projectId);
     for (const session of sessions) {
       this.database?.prepare("DELETE FROM specialist_runtime_secrets WHERE session_id IN (?, ?, ?)").run(session.id, `claude-code:${session.id}`, `acp:${session.id}`);
       this.database?.prepare("DELETE FROM connector_configuration_requests WHERE session_id = ?").run(session.id);
