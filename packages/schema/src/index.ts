@@ -52,4 +52,5 @@ export * from "./scientific-artifact.js";
 export * from "./web.js";
 export * from "./proxy.js";
 export * from "./tool-graph-registry.js";
+export * from "./scienceflow.js";
 export * from "@sciencediscovery/external-urls";
