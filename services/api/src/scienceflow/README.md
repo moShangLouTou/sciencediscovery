@@ -225,8 +225,10 @@ The write is idempotent per business triple. The first success answers `201`
 and returns the record; a retry answers `200` with the same stored record and
 the original `registrationId`/`createdAt`. A retry re-runs every check above
 first, so a revoked write permission or withdrawn binding is never bypassed by
-an already-existing row. A storage failure surfaces as `500`, never as a
-success.
+an already-existing row. Because the binding lookup may wait, the Project,
+Session, and writability checks run again immediately before the insert: a
+Session deleted or made read-only while that lookup was in flight is never
+registered. A storage failure surfaces as `500`, never as a success.
 
 ### List and detail
 

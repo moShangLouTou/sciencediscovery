@@ -17,7 +17,10 @@
  *
  * Creating a registration checks the same trusted gates as any write: the
  * Project and Session exist and own each other, the Session is writable, and
- * the admin's current binding table still names this exact run. It never starts
+ * the admin's current binding table still names this exact run. Because the
+ * binding lookup is allowed to await, the ownership and write gate are checked
+ * again after it resolves and before the row is written: a Session deleted or
+ * made read-only during that window is never registered. It never starts
  * Python, never reads the run record, and never claims the engine is running.
  * The write gate stays outside this module's own try/catch so its existing
  * `SessionStoreHttpError` variants reach the HTTP layer's status mapping.
@@ -119,18 +122,28 @@ export function createScienceFlowRegistrationService(
       // its established 409 (and a missing one its 404), not become a 500.
       dependencies.requireWritable(query.sessionId);
       if (dependencies.resolveBinding === undefined) return { status: "disabled" };
+      let binding: ScienceFlowRunBinding | undefined;
       try {
-        const binding = await dependencies.resolveBinding({
+        binding = await dependencies.resolveBinding({
           projectId: query.projectId,
           sessionId: query.sessionId,
           runId,
         });
-        if (binding === undefined) return { status: "not-found", resource: "binding" };
-        if (!bindingMatches(binding, query.projectId, query.sessionId, runId)) {
-          return { status: "invalid", reason: "binding" };
-        }
-        // Retried identity checks above still ran, so a revoked write permission
-        // or binding is never bypassed by an already-existing row.
+      } catch (error) {
+        return mapFailure(error);
+      }
+      if (binding === undefined) return { status: "not-found", resource: "binding" };
+      if (!bindingMatches(binding, query.projectId, query.sessionId, runId)) {
+        return { status: "invalid", reason: "binding" };
+      }
+      // The resolver may have awaited, so the Project, Session, or write
+      // permission observed above can be gone by now. Re-check both before the
+      // write; the write gate stays outside the try/catch so a locked/archived
+      // Session keeps its established 409 (and a vanished one its 404).
+      const vanished = resolveMissing(dependencies.identities, query);
+      if (vanished) return vanished;
+      dependencies.requireWritable(query.sessionId);
+      try {
         const { created, record } = dependencies.store().create({
           registrationId: generateRegistrationId(),
           projectId: query.projectId,
