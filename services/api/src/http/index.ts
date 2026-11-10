@@ -344,6 +344,7 @@ import { handleConfigurationHttp } from "../configuration/http.js";
 import { prepareNativeConnectorActivation } from "../configuration/native-activation.js";
 import { digest as configurationDigest } from "../configuration/validation.js";
 import { handleScienceFlowRunSnapshotRequest } from "../scienceflow/http.js";
+import { handleScienceFlowRegistrationRequest } from "../scienceflow/registration-http.js";
 import {
   createPlatformServices,
   initializePlatformServices,
@@ -440,6 +441,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
     provenanceRecorder,
     remoteCompute,
     runnerClient,
+    scienceFlowRegistrations,
     scienceFlowRunSnapshot,
     skillCatalog,
     store,
@@ -1109,6 +1111,9 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       // Read-only ScienceFlow snapshot, behind the same Bearer gate as every
       // other /api/ route and never able to widen the trusted bindings.
       if (await handleScienceFlowRunSnapshotRequest(request, response, url, scienceFlowRunSnapshot)) return;
+      // Registrations of existing runs: metadata create/list/detail plus a
+      // snapshot read that reuses the run-snapshot route above.
+      if (await handleScienceFlowRegistrationRequest(request, response, url, scienceFlowRegistrations, scienceFlowRunSnapshot)) return;
       if (request.method === "GET" && url.pathname === "/api/error-diagnostics") {
         const ids = diagnosticIds(url.searchParams);
         if (!ids) { sendError(response, 400, "Invalid diagnostic correlation id"); return; }

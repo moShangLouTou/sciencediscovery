@@ -65,6 +65,10 @@ import {
   createScienceFlowRunSnapshotQuery,
   type ScienceFlowRunSnapshotService,
 } from "../scienceflow/run-snapshot.js";
+import {
+  createScienceFlowRegistrationService,
+  type ScienceFlowRegistrationService,
+} from "../scienceflow/registration.js";
 
 export interface ApiServerDependencies {
   /** Embedding/test seam: exercise governed Web tools without contacting a live search engine. */
@@ -550,6 +554,21 @@ export function createPlatformServices(
       }
     : { enabled: false };
 
+  // Registrations are control-plane metadata. The repository is read lazily
+  // because the SQLite database only opens when `initializePlatformServices`
+  // loads the store. Without a reader config `resolveBinding` is undefined, so
+  // create answers disabled while list/detail keep serving persisted metadata.
+  const scienceFlowRegistrations: ScienceFlowRegistrationService =
+    createScienceFlowRegistrationService({
+      identities: {
+        getProject: (projectId) => store.getProject(projectId),
+        getSession: (sessionId) => store.getSession(sessionId),
+      },
+      requireWritable: (sessionId) => store.assertSessionWritable(sessionId),
+      resolveBinding: scienceFlowReader?.bindingFor,
+      store: () => store.scienceFlowRegistrations,
+    });
+
   return {
     connectorPlugins,
     artifactManager,
@@ -589,6 +608,7 @@ export function createPlatformServices(
       },
     ),
     runnerClient,
+    scienceFlowRegistrations,
     scienceFlowRunSnapshot,
     skillCatalog,
     store,

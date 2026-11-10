@@ -99,7 +99,7 @@ export async function handleScienceFlowRunSnapshotRequest(
   return true;
 }
 
-function sendResult(
+export function sendResult(
   response: ServerResponse,
   runId: string,
   result: ScienceFlowRunSnapshotQueryResult,
@@ -203,7 +203,7 @@ function invalidRequest(response: ServerResponse, message: string): true {
  * A GET route has no body. `content-length: 0` is harmless; anything that
  * announces bytes or chunked transfer is refused.
  */
-function hasRequestBody(request: IncomingMessage): boolean {
+export function hasRequestBody(request: IncomingMessage): boolean {
   if (request.headers["transfer-encoding"] !== undefined) return true;
   const raw = request.headers["content-length"];
   if (raw === undefined) return false;
@@ -216,7 +216,7 @@ function hasRequestBody(request: IncomingMessage): boolean {
  * caller encoded a structure the route does not have; whitespace and NUL are
  * never valid ids.
  */
-function isUsableIdentity(value: string): boolean {
+export function isUsableIdentity(value: string): boolean {
   return (
     value.trim().length > 0 &&
     !value.includes("/") &&
