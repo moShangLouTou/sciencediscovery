@@ -832,6 +832,9 @@ importers:
       '@sciencediscovery/schema':
         specifier: workspace:*
         version: link:../../packages/schema
+      '@sciencediscovery/scienceflow-reader':
+        specifier: workspace:*
+        version: link:../../packages/scienceflow-reader
       '@sciencediscovery/skill':
         specifier: workspace:*
         version: link:../../packages/skill

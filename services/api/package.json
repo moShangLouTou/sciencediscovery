@@ -35,6 +35,7 @@
     "@sciencediscovery/runtime-core": "workspace:*",
     "@sciencediscovery/sandbox-capability": "workspace:*",
     "@sciencediscovery/schema": "workspace:*",
+    "@sciencediscovery/scienceflow-reader": "workspace:*",
     "@sciencediscovery/specialist": "workspace:*",
     "@sciencediscovery/tools": "workspace:*",
     "@sciencediscovery/workspace": "workspace:*",
