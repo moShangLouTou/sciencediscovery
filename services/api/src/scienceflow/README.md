@@ -1,9 +1,12 @@
-# ScienceFlow existing runs: snapshot and registration (read-only)
+# ScienceFlow control plane: snapshots, registrations, execution plans
 
-Two control-plane capabilities expose ScienceFlow managed runs that an
-administrator has explicitly bound to a ScienceDiscovery Project and Session.
-Neither one starts ScienceFlow, imports its Artifacts, executes research code,
-or claims a lifecycle the engine did not report.
+Three control-plane capabilities expose ScienceFlow managed runs that an
+administrator has explicitly bound to a ScienceDiscovery Project and Session,
+and freeze one static description of a task package. None of them starts
+ScienceFlow, imports its Artifacts, executes research code, or claims a
+lifecycle the engine did not report. An execution plan in particular is a
+**static, immutable contract**: it records what the selected files say, never
+that an execution can start.
 
 ```text
 GET  /api/projects/:projectId/sessions/:sessionId/scienceflow/runs/:runId/snapshot
@@ -11,6 +14,10 @@ POST /api/projects/:projectId/sessions/:sessionId/scienceflow/registrations
 GET  /api/projects/:projectId/sessions/:sessionId/scienceflow/registrations
 GET  /api/projects/:projectId/sessions/:sessionId/scienceflow/registrations/:registrationId
 GET  /api/projects/:projectId/sessions/:sessionId/scienceflow/registrations/:registrationId/snapshot
+POST /api/projects/:projectId/sessions/:sessionId/scienceflow/plans
+GET  /api/projects/:projectId/sessions/:sessionId/scienceflow/plans
+GET  /api/projects/:projectId/sessions/:sessionId/scienceflow/plans/:planId
+POST /api/projects/:projectId/sessions/:sessionId/scienceflow/plans/:planId/preflight
 ```
 
 All routes are mounted behind the existing `/api/` Bearer check and reuse the
@@ -31,6 +38,11 @@ Files:
 | `registration-repository.ts` | Additive SQLite table, typed reads, corruption detection |
 | `registration.ts` | Registration create/list/get over identity, write gate, binding |
 | `registration-http.ts` | The four registration routes and their status mapping |
+| `execution-config.ts` | Optional admin execution profiles; static load-time validation |
+| `execution-contract.ts` | Static contract extraction, checks, canonical digest, blockers |
+| `execution-plan-repository.ts` | Additive SQLite table, conditional preflight write, corruption detection |
+| `execution-plan.ts` | Plan create/list/get/preflight over identity, write gate, profile table |
+| `execution-plan-http.ts` | The four plan routes and their status mapping |
 
 ## Enable and disable
 
@@ -313,6 +325,280 @@ listable and readable, while create and snapshot answer `503`.
   field, blank `createdAt`, or a payload that disagrees with its columns) is
   reported as `500 SCIENCEFLOW_REGISTRATION_CORRUPT`. It is never skipped,
   repaired, or deleted to satisfy a read.
+
+## ScienceFlow execution plans (static contract)
+
+A **plan** freezes a whitelisted description of one administrator-selected task
+package for one Session: task identity, metric, artifact path, evaluator
+reference and digest, description digest, file digests, declared budgets, and
+the still-unknown capabilities. The frozen contract is immutable; later edits to
+the selected files never rewrite it. A **preflight** re-reads the same files and
+reports whether they still produce the frozen contract.
+
+Neither capability is an execution authorization. A valid contract means the
+files are internally consistent and use a supported form. It does **not** mean
+the run can start: `canStart` is always `false` and the same five blockers are
+always reported (no connected backend, no model gateway, no enforced budget, no
+descendant-process cancellation, unverified engine revision). Do not describe a
+static-valid plan as "startable".
+
+### Enable and disable
+
+The capability is **off by default**, independently of the reader
+configuration, and is read once at server construction:
+
+```bash
+export SCIENCE_AGENT_SCIENCEFLOW_EXECUTION_CONFIG_PATH=/etc/sciencediscovery/scienceflow-execution.json
+```
+
+- Unset or blank: off. Create and preflight answer `503
+  SCIENCEFLOW_EXECUTION_DISABLED`; list and detail keep reading persisted plans.
+- Relative values resolve against the repository root, never the process
+  working directory.
+- An invalid file stops the API at startup with a static error; no partial
+  profile table is served. Changing the file requires a restart.
+
+### Configuration file (version 1)
+
+```json
+{
+  "schemaVersion": 1,
+  "profiles": [
+    {
+      "profileId": "circle-packing-default",
+      "scienceFlowRevision": "0ef229de1ae126ea04387ce74ae94ffacc437df6",
+      "manifestPath": "/srv/scienceflow/manifests/circle-packing.yaml",
+      "taskPackageRoot": "/srv/scienceflow/tasks/opt_solver/circle-packing",
+      "allowedReadRoots": ["/srv/scienceflow"]
+    }
+  ]
+}
+```
+
+- File `≤ 1 MiB`; valid JSON object; `schemaVersion` must be `1`; unknown keys
+  are rejected at every level. A static error names only the level
+  (`profiles[0]`), never a configured key, value, or path.
+- `profileId` is an opaque non-empty key and must be unique; a repeated id
+  refuses the whole file rather than letting file order decide.
+- `scienceFlowRevision` is a 40-character lowercase hex commit id. It is
+  **declared**, not verified: this round never inspects an installation.
+- `manifestPath`, `taskPackageRoot`, and every `allowedReadRoots` entry must be
+  absolute with no NUL byte. Nothing is discovered through `PATH`, the current
+  directory, or a default directory.
+- The file is admin-trusted. A request carries only `profileId`; it can never
+  supply or widen a path, root, revision, evaluator, or budget.
+
+### Supported manifest subset
+
+The check reads exactly: the profile's manifest, the package's `task.yaml`, the
+sibling `_shared/task_defaults.yaml` when present (merged recursively, task leaf
+wins, digest recorded), the referenced artifact path, the description file, and
+the evaluator entrypoint file's bytes (hashed, never imported or executed).
+Nothing else is read.
+
+Supported form: a single task, `phase: run`, `type: lnr`, evaluator backend
+`task_package`, budgets as positive finite seconds. Everything outside it is
+reported as `unsupported` — never silently ignored:
+
+- multiple tasks, `max_concurrent > 1`;
+- `phase` other than `run` (including gate/wait phases), `type` other than
+  `lnr`;
+- an external `config` include, inline `task` text, resume settings;
+- any model-gateway or API-key setting;
+- an evaluator backend other than `task_package`;
+- a non-positive or non-finite budget.
+
+YAML is parsed with the `core` schema, duplicate mapping keys are refused, and
+alias expansion is capped at 100 so one document cannot multiply itself.
+Structured files are capped at 256 KiB and the evaluator source at 2 MiB.
+
+### Create
+
+```bash
+curl -sS -X POST \
+  -H "Authorization: Bearer ${SCIENCE_AGENT_AUTH_TOKEN:?export the token first}" \
+  -H "content-type: application/json" \
+  --data '{"profileId":"circle-packing-default","requestId":"plan-request-1"}' \
+  "http://127.0.0.1:4310/api/projects/PROJECT/sessions/SESSION/scienceflow/plans"
+```
+
+The body is exactly `{ "profileId", "requestId" }`; every other field is
+refused with `400`, so a caller cannot supply a path, manifest text, budget,
+credential, task override, or plan id. A create requires, in order:
+
+1. The Project exists and the Session exists inside it (`404` otherwise).
+2. The Session is writable (`409`/`404` from the existing gate).
+3. The current profile table names this exact `profileId` (`404` otherwise).
+4. No plan already holds this `(projectId, sessionId, requestId)`.
+5. The selected files produce a complete, supported contract (`422
+   SCIENCEFLOW_PLAN_CONTRACT_INVALID` with `details.checks`, nothing written).
+
+`(projectId, sessionId, requestId)` is the idempotency identity and the only
+one: a retry returns the stored plan without re-reading a single file and keeps
+its original `planId`, `createdAt`, and `contractDigest` (`200`); a first
+success is `201`. Reusing the identity with a **different** `profileId` is `409
+SCIENCEFLOW_PLAN_CONFLICT` — two profiles never merge into one plan. Because the
+file reads may await, Project/Session ownership, writability, and the profile are
+checked again immediately before the insert.
+
+There is no update or delete route. A plan is frozen: source files changing
+later never rewrite it, and only Session/Project deletion removes it.
+
+### List, detail, preflight
+
+```text
+GET  .../scienceflow/plans[?limit=N&offset=M]
+GET  .../scienceflow/plans/:planId
+POST .../scienceflow/plans/:planId/preflight
+```
+
+- List is a plain JSON array (no envelope) of that Session's plans, ordered
+  `createdAt` then `planId` ascending. `limit` defaults to `100` and is clamped
+  to `1..250`; `offset` defaults to `0` and is clamped at `0`. Only
+  `limit`/`offset` are accepted; any other parameter is `400`.
+- List and detail read persisted metadata only: they never check writability or
+  read source files, so a read-only Session still lists what it froze.
+- Preflight takes no body and is a write (it persists a result), so it requires
+  the Session to be writable. It re-reads the plan's **stored** `profileId` from
+  the current configuration; if that profile was withdrawn it answers `503
+  SCIENCEFLOW_EXECUTION_DISABLED` and persists nothing — there is no fallback to
+  another profile or an old path.
+- A preflight is conditional on the revision it read. If a concurrent check
+  persisted first, the losing writer returns the persisted winner rather than a
+  discarded result. `latestPreflight` on the plan is always that winner.
+
+```json
+{
+  "schemaVersion": 1,
+  "planId": "9f0c…",
+  "projectId": "project-1",
+  "sessionId": "session-1",
+  "profileId": "circle-packing-default",
+  "requestId": "plan-request-1",
+  "createdAt": "2026-11-10T10:15:00.000Z",
+  "contractDigest": "3d1a…",
+  "contract": {
+    "scienceflow": { "declaredRevision": "0ef229…", "verification": "unverified" },
+    "task": { "taskId": "circle-packing", "category": "opt_solver", "profile": null },
+    "metric": { "name": "min_distance", "lowerIsBetter": false, "type": "continuous", "authoritative": null },
+    "artifact": { "path": "artifacts/best.json", "kind": "json" },
+    "evaluator": { "entrypoint": "evaluate.py:score", "path": "evaluate.py", "function": "score", "sha256": "…", "timeoutSec": 300 },
+    "description": { "path": "description.md", "sha256": "…" },
+    "taskYamlSha256": "…",
+    "manifestSha256": "…",
+    "sharedDefaultsSha256": null,
+    "budgets": [{ "name": "time_limit", "value": 600, "unit": "seconds", "nature": "requested" }],
+    "unknowns": {
+      "dataset": "not-applicable",
+      "environment": "unknown",
+      "pricing": "unknown",
+      "modelGateway": "unknown",
+      "revision": "unverified",
+      "dependencyClosure": "incomplete"
+    }
+  },
+  "execution": { "canStart": false, "blockers": [] },
+  "latestPreflight": null
+}
+```
+
+`contractDigest` is SHA-256 over a canonical (recursively key-sorted) encoding of
+`contract`, recomputed on every read; a row whose payload disagrees with its
+digest is `500 SCIENCEFLOW_PLAN_CORRUPT`, never repaired. Paths are
+package-relative; no host path is stored or returned. `unknowns` and
+`blockers` are the server's fixed statements about what this round did not
+verify. `budgets` are what the files requested — `nature: "requested"` says they
+are not enforced.
+
+### Check semantics
+
+Each check carries a closed `code`, one of `passed | failed | unknown |
+unsupported`, and a fixed server-side `description`. No check, description, or
+error body ever carries raw YAML, a host path, a stack trace, or free-form
+engine text.
+
+- `failed`: the file is missing, unreadable, malformed, or contradicts its own
+  identity (e.g. artifact path traversal, task id mismatch). The contract is
+  rejected.
+- `unsupported`: the form is outside the subset above. Rejected for the same
+  reason: an unsupported form is not silently approximated.
+- `unknown`: a capability neither supported nor contradicted; it appears only in
+  the contract's `unknowns`, never as a start permission.
+- `passed`: checked and consistent.
+
+Six codes are diagnostics that appear only when their condition is detected:
+`manifest_shape`, `manifest_duplicate_key`, `manifest_alias_limit`, and the
+`task_yaml_*` equivalents. Their absence means that defect was not found, not
+that the file was left unchecked; every other code is reported with a status.
+A supported task package therefore answers with 37 of the 43 registered codes.
+
+A preflight adds `contract_changed`: `passed` when the re-read files produce a
+digest equal to the frozen one, `failed` otherwise — including when a file is
+now unreadable (`observedContractDigest: null`). Its `outcome` is `blocked` if
+any check failed or is unsupported, else `passed`. `canStart` stays `false`
+either way. An I/O or storage failure is `500`, never a blocked check.
+
+### Plan statuses
+
+| Status | `code` | Meaning |
+| --- | --- | --- |
+| `200` | — | List, detail, retry (existing plan), or a completed preflight |
+| `201` | — | A new plan was frozen |
+| `400` | `SCIENCEFLOW_INVALID_REQUEST` | Malformed identity, unsupported query/body, excess field, or invalid pagination |
+| `404` | `SCIENCEFLOW_PLAN_NOT_FOUND` | Missing Project/Session/plan, Session in another Project, or unknown profile on create |
+| `405` | `SCIENCEFLOW_METHOD_NOT_ALLOWED` | Method not served by this route (`Allow` names the accepted ones) |
+| `409` | `SCIENCEFLOW_PLAN_CONFLICT` | Same request id, different profile |
+| `409` | existing Session code | Session locked or archived on create/preflight |
+| `422` | `SCIENCEFLOW_PLAN_CONTRACT_INVALID` | Selected files are missing, malformed, or unsupported; `details.checks` |
+| `500` | `SCIENCEFLOW_PLAN_CORRUPT` | A stored row violates the plan contract |
+| `500` | `SCIENCEFLOW_INTERNAL_ERROR` | Unexpected server failure |
+| `503` | `SCIENCEFLOW_EXECUTION_DISABLED` | No config file, or the plan's profile was withdrawn |
+
+### Storage and lifecycle
+
+- The table `science_flow_execution_plans` lives in the existing
+  `catalog.sqlite` and is created with `CREATE TABLE IF NOT EXISTS`; an older
+  data directory upgrades in place. Plans and their latest preflight survive an
+  API restart.
+- Only `{code, status}` pairs are stored for preflight checks; descriptions are
+  rebuilt from the fixed table on read, so no free text is persisted. A stored
+  payload that fails validation (bad JSON, digest mismatch, unknown
+  code/status, plan or contract mismatch, `outcome` contradicting its checks) is
+  `500 SCIENCEFLOW_PLAN_CORRUPT`.
+- Deleting a Session removes its plans; deleting a Project removes every plan
+  below it.
+- Disabling the feature keeps existing rows listable and readable. Withdrawing a
+  profile keeps its plans readable but makes their preflight `503`.
+
+### Known plan limits
+
+- No execution, start/stop/resume, event import, artifact import, scheduling,
+  budget enforcement, cancellation, or engine-state mirroring.
+- One contract per plan; no update route, no re-freeze, no comparison UI.
+- Environment, pricing, model gateway, dependency closure, and the installed
+  revision stay explicitly unknown; dataset identity is `not-applicable`
+  unless a supported dataset reference exists.
+- Evaluator bytes are hashed only; the code is never imported, executed, or
+  syntax-checked.
+
+### Plan verification checklist (liyuan)
+
+1. Default off: unset the variable, start the API, create/preflight → `503
+   SCIENCEFLOW_EXECUTION_DISABLED`; list/detail still `200`.
+2. `POST` with `{"profileId","requestId"}` against a supported package → `201`;
+   repeat → `200` with the same `planId`; the list still has one entry.
+3. Same `requestId`, other `profileId` → `409 SCIENCEFLOW_PLAN_CONFLICT`.
+4. Extra field (path, manifest, budget, credential) → `400`; another Session's
+   identity → `404`.
+5. `POST .../preflight` → `200` with `outcome: "passed"`, `canStart: false`, and
+   the five blockers; edit a selected file, preflight again → `outcome:
+   "blocked"` with `contract_changed: "failed"`, and the stored contract,
+   `planId`, and `contractDigest` unchanged.
+6. Unsupported form (config include, model gateway, multiple tasks, resume,
+   non-`lnr`) → `422` with the matching fixed codes and nothing written.
+7. Remove the profile from the admin file and restart → list/detail `200`,
+   preflight `503`; unset the variable and restart → plans retained. Delete the
+   Session (or its Project) → its plans are gone.
 
 ## Known limits
 

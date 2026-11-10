@@ -69,6 +69,11 @@ import {
   createScienceFlowRegistrationService,
   type ScienceFlowRegistrationService,
 } from "../scienceflow/registration.js";
+import {
+  createScienceFlowExecutionPlanService,
+  type ScienceFlowExecutionPlanService,
+} from "../scienceflow/execution-plan.js";
+import { createScienceFlowContractBuilder } from "../scienceflow/execution-contract.js";
 
 export interface ApiServerDependencies {
   /** Embedding/test seam: exercise governed Web tools without contacting a live search engine. */
@@ -569,6 +574,22 @@ export function createPlatformServices(
       store: () => store.scienceFlowRegistrations,
     });
 
+  // Execution plans are control-plane metadata too: the contract is frozen from
+  // administrator profiles and stored, but nothing is started. Without a
+  // profile config create and preflight answer disabled while list/detail keep
+  // serving persisted plans. The builder only reads bounded files.
+  const scienceFlowExecutionPlans: ScienceFlowExecutionPlanService =
+    createScienceFlowExecutionPlanService({
+      identities: {
+        getProject: (projectId) => store.getProject(projectId),
+        getSession: (sessionId) => store.getSession(sessionId),
+      },
+      requireWritable: (sessionId) => store.assertSessionWritable(sessionId),
+      profiles: config.scienceFlowExecution,
+      store: () => store.scienceFlowExecutionPlans,
+      buildContract: createScienceFlowContractBuilder(),
+    });
+
   return {
     connectorPlugins,
     artifactManager,
@@ -608,6 +629,7 @@ export function createPlatformServices(
       },
     ),
     runnerClient,
+    scienceFlowExecutionPlans,
     scienceFlowRegistrations,
     scienceFlowRunSnapshot,
     skillCatalog,

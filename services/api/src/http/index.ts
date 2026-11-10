@@ -345,6 +345,7 @@ import { prepareNativeConnectorActivation } from "../configuration/native-activa
 import { digest as configurationDigest } from "../configuration/validation.js";
 import { handleScienceFlowRunSnapshotRequest } from "../scienceflow/http.js";
 import { handleScienceFlowRegistrationRequest } from "../scienceflow/registration-http.js";
+import { handleScienceFlowExecutionPlanRequest } from "../scienceflow/execution-plan-http.js";
 import {
   createPlatformServices,
   initializePlatformServices,
@@ -441,6 +442,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
     provenanceRecorder,
     remoteCompute,
     runnerClient,
+    scienceFlowExecutionPlans,
     scienceFlowRegistrations,
     scienceFlowRunSnapshot,
     skillCatalog,
@@ -1114,6 +1116,9 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       // Registrations of existing runs: metadata create/list/detail plus a
       // snapshot read that reuses the run-snapshot route above.
       if (await handleScienceFlowRegistrationRequest(request, response, url, scienceFlowRegistrations, scienceFlowRunSnapshot)) return;
+      // Immutable execution plans: a frozen contract, a static preflight, and
+      // stored metadata. Nothing here starts ScienceFlow or authorizes a start.
+      if (await handleScienceFlowExecutionPlanRequest(request, response, url, scienceFlowExecutionPlans)) return;
       if (request.method === "GET" && url.pathname === "/api/error-diagnostics") {
         const ids = diagnosticIds(url.searchParams);
         if (!ids) { sendError(response, 400, "Invalid diagnostic correlation id"); return; }

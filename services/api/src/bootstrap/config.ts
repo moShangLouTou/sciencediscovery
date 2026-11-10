@@ -37,6 +37,10 @@ import {
   loadScienceFlowReaderConfig,
   type ScienceFlowReaderSettings,
 } from "../scienceflow/config.js";
+import {
+  loadScienceFlowExecutionConfig,
+  type ScienceFlowExecutionSettings,
+} from "../scienceflow/execution-config.js";
 
 export interface ServerConfig {
   authToken: string;
@@ -96,6 +100,12 @@ export interface ServerConfig {
    * route then answers 503 without reading anything.
    */
   scienceFlowReader?: ScienceFlowReaderSettings;
+  /**
+   * Admin-trusted execution profiles for the plan routes. Absent when
+   * `SCIENCE_AGENT_SCIENCEFLOW_EXECUTION_CONFIG_PATH` is unset; create and
+   * preflight then answer 503 while stored plans stay readable.
+   */
+  scienceFlowExecution?: ScienceFlowExecutionSettings;
   usageExchangeRates?: {
     enabled: boolean;
     sourceUrl: string;
@@ -230,6 +240,9 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
   // Loaded once at construction: an invalid file stops the server instead of
   // leaving a partially trusted binding table in service. Unset means off.
   const scienceFlowReader = loadScienceFlowReaderConfig(env, repositoryRoot);
+  // Independent of the reader: a server may serve plans, existing-run
+  // snapshots, both, or neither. Also loaded once, so a change needs a restart.
+  const scienceFlowExecution = loadScienceFlowExecutionConfig(env, repositoryRoot);
   return {
     authToken: authToken.token,
     authTokenSource: authToken.source,
@@ -256,6 +269,7 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
     runnerUrl: env.SCIENCE_AGENT_RUNNER_URL?.trim().replace(/\/$/, "") || "http://127.0.0.1:4311",
     sampleSession: parseBooleanFlag(env.SCIENCE_AGENT_SAMPLE_SESSION, true),
     ...(scienceFlowReader === undefined ? {} : { scienceFlowReader }),
+    ...(scienceFlowExecution === undefined ? {} : { scienceFlowExecution }),
     sshConfigPath: resolve(env.SCIENCE_AGENT_SSH_CONFIG_PATH?.trim() || resolve(homedir(), ".ssh/config")),
     staticDir: resolve(repositoryRoot, env.SCIENCE_AGENT_WEB_DIR?.trim() || "apps/web/dist"),
     workspaceUpload: {
