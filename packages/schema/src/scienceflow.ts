@@ -132,3 +132,37 @@ export interface ScienceFlowRunSnapshotDto {
   readonly tasks: readonly ScienceFlowTaskSnapshotDto[];
   readonly diagnostics: readonly ScienceFlowSnapshotDiagnosticDto[];
 }
+
+/**
+ * Version of the persisted, control-plane registration record.
+ *
+ * A registration says only that an existing, admin-bound run was attached to a
+ * Session. It carries no host path, no interpreter, no research outcome and no
+ * snapshot, and it is never used as engine lifecycle state.
+ */
+export const SCIENCE_FLOW_RUN_REGISTRATION_DTO_VERSION = 1;
+
+/**
+ * One existing ScienceFlow run registered against a Project/Session.
+ *
+ * `registrationId` is server-generated and immutable. `runId` is still the
+ * ScienceFlow managed-run id; the triple `(projectId, sessionId, runId)` is the
+ * unique identity a retry resolves to. `createdAt` is server-generated.
+ */
+export interface ScienceFlowRunRegistrationDto {
+  readonly schemaVersion: typeof SCIENCE_FLOW_RUN_REGISTRATION_DTO_VERSION;
+  readonly registrationId: string;
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly runId: string;
+  /** ISO-8601 creation time, written once and never updated. */
+  readonly createdAt: string;
+}
+
+/**
+ * The only body a registration create accepts. Everything else — paths,
+ * interpreter, roots, ids, timestamps, state — is rejected, never overridden.
+ */
+export interface ScienceFlowRunRegistrationInput {
+  readonly runId: string;
+}
