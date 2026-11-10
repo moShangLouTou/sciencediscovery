@@ -250,10 +250,15 @@ function rejectUnknownKeys(
   allowed: readonly string[],
   field: string,
 ): void {
-  const prefix = field ? `${field}.` : "";
   for (const key of Object.keys(value)) {
     if (!allowed.includes(key)) {
-      throw configError(`${prefix}${key} is not a supported key`);
+      // The key comes from the file, so the message names only the level: a
+      // typo stays locatable without echoing configured content.
+      throw configError(
+        field
+          ? `${field} has an unsupported key`
+          : "the file has an unsupported key",
+      );
     }
   }
 }

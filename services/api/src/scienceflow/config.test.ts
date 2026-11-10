@@ -212,12 +212,12 @@ test("rejects an unsupported schema version", () => {
 test("rejects every invalid entry instead of using the remaining bindings", () => {
   const cases: Array<{ readonly label: string; readonly value: unknown; readonly fragment: string }> = [
     { label: "top-level array", value: [], fragment: "must be a JSON object" },
-    { label: "unknown top-level key", value: config({ extra: true }), fragment: "extra is not a supported key" },
+    { label: "unknown top-level key", value: config({ extra: true }), fragment: "the file has an unsupported key" },
     { label: "missing reader", value: config({ reader: undefined }), fragment: "reader must be an object" },
     {
       label: "unknown reader key",
       value: config({ reader: { ...(config().reader as object), cwd: "/tmp" } }),
-      fragment: "reader.cwd is not a supported key",
+      fragment: "reader has an unsupported key",
     },
     {
       label: "relative interpreter",
@@ -278,7 +278,7 @@ test("rejects every invalid entry instead of using the remaining bindings", () =
     {
       label: "unknown binding key",
       value: config({ bindings: [binding({ timeoutMs: 10 })] }),
-      fragment: "bindings[0].timeoutMs is not a supported key",
+      fragment: "bindings[0] has an unsupported key",
     },
     {
       label: "duplicate identity",
@@ -292,6 +292,29 @@ test("rejects every invalid entry instead of using the remaining bindings", () =
       writeConfig(root, item.value);
       // The whole file is refused: one bad entry never leaves a partial table.
       assertConfigError(() => load(root), item.fragment);
+    }
+  });
+});
+
+test("names only the level of an unknown key, never the key itself", () => {
+  withRoot((root) => {
+    const cases: Array<{ readonly value: unknown; readonly fragment: string }> = [
+      { value: config({ [MARKER]: true }), fragment: "the file has an unsupported key" },
+      {
+        value: config({ reader: { ...(config().reader as object), [MARKER]: "/tmp" } }),
+        fragment: "reader has an unsupported key",
+      },
+      {
+        value: config({ bindings: [binding({ [MARKER]: true })] }),
+        fragment: "bindings[0] has an unsupported key",
+      },
+    ];
+    for (const item of cases) {
+      writeConfig(root, item.value);
+      const error = assertConfigError(() => load(root), item.fragment);
+      // A key name is file content like any other: it must not be echoed.
+      assert.ok(!error.message.includes(MARKER), error.message);
+      assert.ok(!error.message.includes(root));
     }
   });
 });

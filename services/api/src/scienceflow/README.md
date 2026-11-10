@@ -69,7 +69,8 @@ Rules enforced at load time:
 - `bindings` is a non-empty array; ids are non-empty strings; every identity
   `(projectId, sessionId, runId)` appears at most once.
 - Unknown keys are rejected at every level. One bad entry refuses the whole
-  file; the remaining entries are never used.
+  file; the remaining entries are never used. The static error names only the
+  level (the file, `reader`, `bindings[i]`), never the key or any value.
 
 The file is admin-trusted configuration. It must live outside the research
 workspace; requests, uploads, and engine records cannot supply or override any
