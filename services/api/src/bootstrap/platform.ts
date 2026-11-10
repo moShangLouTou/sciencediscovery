@@ -61,6 +61,10 @@ import { SessionStore } from "../store.js";
 import { NativeWebProviderClient, WebBroker } from "@sciencediscovery/data-source";
 import { nativeConfigurationChoiceRecord } from "../configuration/native-choices.js";
 import type { ServerConfig } from "./config.js";
+import {
+  createScienceFlowRunSnapshotQuery,
+  type ScienceFlowRunSnapshotService,
+} from "../scienceflow/run-snapshot.js";
 
 export interface ApiServerDependencies {
   /** Embedding/test seam: exercise governed Web tools without contacting a live search engine. */
@@ -528,6 +532,24 @@ export function createPlatformServices(
     },
   });
 
+  const scienceFlowReader = config.scienceFlowReader;
+  // Read-only ScienceFlow access is off unless an administrator supplied a
+  // trusted binding table. Constructing the query touches no file and starts
+  // no process; a request still re-reads the Session and binding each time.
+  const scienceFlowRunSnapshot: ScienceFlowRunSnapshotService = scienceFlowReader
+    ? {
+        enabled: true,
+        query: createScienceFlowRunSnapshotQuery({
+          identities: {
+            getProject: (projectId) => store.getProject(projectId),
+            getSession: (sessionId) => store.getSession(sessionId),
+          },
+          resolveBinding: scienceFlowReader.bindingFor,
+          readerConfig: scienceFlowReader.reader,
+        }),
+      }
+    : { enabled: false };
+
   return {
     connectorPlugins,
     artifactManager,
@@ -567,6 +589,7 @@ export function createPlatformServices(
       },
     ),
     runnerClient,
+    scienceFlowRunSnapshot,
     skillCatalog,
     store,
     webBroker,

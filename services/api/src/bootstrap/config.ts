@@ -33,6 +33,10 @@ import {
   DEFAULT_WORKSPACE_UPLOAD_MAX_REQUEST_BYTES,
   type WorkspaceUploadLimits,
 } from "../workspace-upload.js";
+import {
+  loadScienceFlowReaderConfig,
+  type ScienceFlowReaderSettings,
+} from "../scienceflow/config.js";
 
 export interface ServerConfig {
   authToken: string;
@@ -86,6 +90,12 @@ export interface ServerConfig {
    * what a config built by hand — every test config — wants.
    */
   sampleSession?: boolean;
+  /**
+   * Admin-trusted binding table for the read-only ScienceFlow snapshot route.
+   * Absent when `SCIENCE_AGENT_SCIENCEFLOW_READER_CONFIG_PATH` is unset; the
+   * route then answers 503 without reading anything.
+   */
+  scienceFlowReader?: ScienceFlowReaderSettings;
   usageExchangeRates?: {
     enabled: boolean;
     sourceUrl: string;
@@ -217,6 +227,9 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
   // installation generated on its first start", never a value an attacker could
   // guess from the source tree.
   const authToken = resolveBootstrapToken(dataDir, AUTH_TOKEN_FILE, env.SCIENCE_AGENT_AUTH_TOKEN);
+  // Loaded once at construction: an invalid file stops the server instead of
+  // leaving a partially trusted binding table in service. Unset means off.
+  const scienceFlowReader = loadScienceFlowReaderConfig(env, repositoryRoot);
   return {
     authToken: authToken.token,
     authTokenSource: authToken.source,
@@ -242,6 +255,7 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
     runnerToken: env.SCIENCE_AGENT_RUNNER_TOKEN?.trim() || "sciencediscovery-runner-local",
     runnerUrl: env.SCIENCE_AGENT_RUNNER_URL?.trim().replace(/\/$/, "") || "http://127.0.0.1:4311",
     sampleSession: parseBooleanFlag(env.SCIENCE_AGENT_SAMPLE_SESSION, true),
+    ...(scienceFlowReader === undefined ? {} : { scienceFlowReader }),
     sshConfigPath: resolve(env.SCIENCE_AGENT_SSH_CONFIG_PATH?.trim() || resolve(homedir(), ".ssh/config")),
     staticDir: resolve(repositoryRoot, env.SCIENCE_AGENT_WEB_DIR?.trim() || "apps/web/dist"),
     workspaceUpload: {

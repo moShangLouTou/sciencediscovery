@@ -329,6 +329,29 @@ test("keeps a reader failure a failure even when its JSON is valid", async () =>
   assert.deepEqual(mismatched, { status: "run-mismatch" });
 });
 
+test("keeps a failure without a run identity a failure with its diagnostics", async () => {
+  const diagnostics = [
+    { code: "run_record_invalid_json", message: "Run record is not valid JSON." },
+  ];
+  const result = await queryWith({
+    readSnapshot: recordingReader(
+      {
+        status: "reader-failed",
+        exitCode: 2,
+        signal: null,
+        snapshot: snapshot({ runId: null, diagnostics }),
+      },
+      [],
+    ),
+  })(QUERY);
+
+  assert.equal(result.status, "reader-failed");
+  if (result.status !== "reader-failed") return;
+  assert.equal(result.exitCode, 2);
+  assert.equal(result.snapshot.runId, null);
+  assert.deepEqual(result.snapshot.diagnostics, diagnostics);
+});
+
 test("maps every reader outcome one-to-one and keeps protocol errors distinct", async () => {
   const mappings: Array<{
     readonly label: string;

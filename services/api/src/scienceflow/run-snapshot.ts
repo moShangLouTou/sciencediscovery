@@ -17,9 +17,9 @@
  *
  * A request carries business identity only. Host paths, the interpreter, and
  * the deadline come from trusted server-side dependencies, so a request can
- * never point the reader at an arbitrary directory. The module is not wired
- * into the HTTP entry point: a future route must call it after the existing
- * authentication and must project the snapshot through a field allow-list.
+ * never point the reader at an arbitrary directory. The HTTP route calls this
+ * module after the existing authentication and projects its snapshot through
+ * the field allow-list in `dto.ts`.
  */
 import {
   readScienceFlowRunSnapshot,
@@ -102,7 +102,8 @@ export type ScienceFlowRunSnapshotQueryResult =
     }
   /** The reader read a different run than the binding names. */
   | { readonly status: "run-mismatch" }
-  /** The reader exited non-zero but printed a valid snapshot for the same run. */
+  /** The reader exited non-zero; if the payload names a run, it is this one.
+   *  A missing/corrupt record yields `runId: null`, which stays a failure. */
   | {
       readonly status: "reader-failed";
       readonly exitCode: number | null;
@@ -127,6 +128,20 @@ export type ScienceFlowRunSnapshotQueryResult =
     }
   /** A trusted dependency threw; details stay server-side. */
   | { readonly status: "internal-error" };
+
+/**
+ * What the composition root hands the HTTP layer. `enabled: false` means the
+ * administrator never configured a binding table: the route answers 503 and
+ * performs no read, spawn, or lookup.
+ */
+export type ScienceFlowRunSnapshotService =
+  | { readonly enabled: false }
+  | {
+      readonly enabled: true;
+      readonly query: (
+        query: ScienceFlowRunQuery,
+      ) => Promise<ScienceFlowRunSnapshotQueryResult>;
+    };
 
 /**
  * Build a query function from trusted dependencies. Every call re-reads the
@@ -194,15 +209,21 @@ function projectOutcome(
         : { status: "run-mismatch" };
     case "reader-failed":
       // A non-zero exit stays a failure even when the payload is valid JSON.
-      // Only a snapshot that names the requested run may travel with it.
-      return outcome.snapshot.runId === runId
-        ? {
-            status: "reader-failed",
-            exitCode: outcome.exitCode,
-            signal: outcome.signal,
-            snapshot: outcome.snapshot,
-          }
-        : { status: "run-mismatch" };
+      // A failed read may carry no run identity at all (a missing or corrupt
+      // record): keep the failure and its structured diagnostics, but never
+      // invent a run id. A different non-empty run is refused outright.
+      if (
+        outcome.snapshot.runId === null ||
+        outcome.snapshot.runId === runId
+      ) {
+        return {
+          status: "reader-failed",
+          exitCode: outcome.exitCode,
+          signal: outcome.signal,
+          snapshot: outcome.snapshot,
+        };
+      }
+      return { status: "run-mismatch" };
     case "spawn-failed":
       return { status: "spawn-failed", code: outcome.code };
     case "timeout":
