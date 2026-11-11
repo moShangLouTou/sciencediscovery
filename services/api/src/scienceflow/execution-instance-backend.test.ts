@@ -553,6 +553,169 @@ test("stop refuses a rebuilt identity that points at another process", async (t)
   assert.equal(observation.instance.stopRequestedAt, null);
 });
 
+test("stop refuses a record from another host boot and leaves the process alone", async (t) => {
+  const context = await scratch("round9-reboot");
+  t.after(() => context.cleanup());
+  const bystander = spawn(
+    "/bin/sh",
+    ["-c", "trap '' TERM; while :; do sleep 0.2; done"],
+    { detached: true, stdio: "ignore" },
+  );
+  context.bystanders.push(bystander);
+  const pid = bystander.pid;
+  assert.ok(pid && pid > 1);
+  if (pid === undefined) return;
+  const identity = await identityOf(pid);
+  const store = new ExecutionInstanceStore(context.stateRoot);
+  const executionId = `exec-${randomUUID()}`;
+  await store.createDirectory(executionId);
+  await store.write(
+    record({
+      executionId,
+      process: {
+        ...identity,
+        // On a fresh boot the same pid and start time can occur again, so only
+        // the boot identity shows that this record is from an earlier boot.
+        bootId: "11111111-2222-3333-4444-555555555555",
+      },
+    }),
+  );
+  const client = backend(context);
+  const refused = await client.requestStop(executionId, {
+    requestId: "stop-previous-boot",
+    owner: "owner-round9",
+  });
+  assert.deepEqual(refused, { status: "refused", reason: "boot-mismatch" });
+  // The process the stale record happens to name is untouched, including after
+  // the TERM/KILL grace windows a wrong implementation would have spent on it.
+  assert.equal(isAlive(pid), true);
+  await new Promise((done) => setTimeout(done, 1_200));
+  assert.equal(isAlive(pid), true);
+  const after = await store.read(executionId);
+  assert.equal(after.status, "ok");
+  if (after.status !== "ok") return;
+  assert.equal(after.record.state, "running");
+  assert.equal(after.record.stop.requestId, null);
+  assert.equal(after.record.stop.termSignalSentAt, null);
+  assert.equal(after.record.stop.killSignalSentAt, null);
+  process.kill(pid, "SIGKILL");
+});
+
+/**
+ * A kernel root whose boot id is readable but whose /proc/<pid>/stat is not: a
+ * directory where the stat file would be gives EISDIR on read regardless of the
+ * test user, so the "cannot observe" path is exercised without relying on
+ * permission bits.
+ */
+async function unreadableProcRoot(
+  context: Scratch,
+  bootId: string,
+  pid: number,
+): Promise<string> {
+  const procRoot = join(context.root, "hostproc");
+  await mkdir(join(procRoot, "sys/kernel/random"), { recursive: true });
+  await writeFile(join(procRoot, "sys/kernel/random/boot_id"), `${bootId}\n`, "utf8");
+  await mkdir(join(procRoot, `${pid}`, "stat"), { recursive: true });
+  return procRoot;
+}
+
+test("an unreadable kernel view is not proof of absence", async (t) => {
+  const context = await scratch("round9-unobservable");
+  t.after(() => context.cleanup());
+  const bystander = spawn(
+    "/bin/sh",
+    ["-c", "trap '' TERM; while :; do sleep 0.2; done"],
+    { detached: true, stdio: "ignore" },
+  );
+  context.bystanders.push(bystander);
+  const pid = bystander.pid;
+  assert.ok(pid && pid > 1);
+  if (pid === undefined) return;
+  const identity = await identityOf(pid);
+  const bootId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const procRoot = await unreadableProcRoot(context, bootId, pid);
+  const store = new ExecutionInstanceStore(context.stateRoot);
+  const executionId = `exec-${randomUUID()}`;
+  await store.createDirectory(executionId);
+  await store.write(record({ executionId, process: { ...identity, bootId } }));
+  const client = new ExecutionInstanceBackend({
+    stateRoot: context.stateRoot,
+    termGraceMs: 400,
+    killGraceMs: 400,
+    pollIntervalMs: 25,
+    procRoot,
+  });
+  context.backends.push(client);
+
+  const observation = await client.observe(executionId);
+  assert.equal(observation.status, "observed");
+  if (observation.status !== "observed") return;
+  assert.equal(observation.identity, "unverified");
+  assert.equal(observation.processAlive, false);
+  assert.equal(observation.groupAlive, false);
+  assert.equal(observation.members, 0);
+  // An empty member list from an unreadable view is not "nothing is left".
+  assert.equal(observation.observationComplete, false);
+  assert.equal(observation.instance.state, "running");
+
+  const refused = await client.requestStop(executionId, {
+    requestId: "stop-unobservable",
+    owner: "owner-round9",
+  });
+  assert.deepEqual(refused, { status: "refused", reason: "identity-unverified" });
+  assert.equal(isAlive(pid), true);
+  const after = await store.read(executionId);
+  assert.equal(after.status, "ok");
+  if (after.status !== "ok") return;
+  assert.equal(after.record.state, "running");
+  assert.equal(after.record.stop.requestId, null);
+  process.kill(pid, "SIGKILL");
+});
+
+test("an exit is not confirmed while the kernel view is unreadable", async (t) => {
+  const context = await scratch("round9-unconfirmable");
+  t.after(() => context.cleanup());
+  const bystander = spawn(
+    "/bin/sh",
+    ["-c", "trap '' TERM; while :; do sleep 0.2; done"],
+    { detached: true, stdio: "ignore" },
+  );
+  context.bystanders.push(bystander);
+  const pid = bystander.pid;
+  assert.ok(pid && pid > 1);
+  if (pid === undefined) return;
+  const identity = await identityOf(pid);
+  const bootId = "cccccccc-dddd-eeee-ffff-000000000000";
+  const procRoot = await unreadableProcRoot(context, bootId, pid);
+  const store = new ExecutionInstanceStore(context.stateRoot);
+  const executionId = `exec-${randomUUID()}`;
+  await store.createDirectory(executionId);
+  await store.write(
+    record({
+      executionId,
+      state: "exited",
+      process: { ...identity, bootId },
+      exit: { code: 0, signal: null, endedAt: new Date().toISOString() },
+    }),
+  );
+  const client = new ExecutionInstanceBackend({
+    stateRoot: context.stateRoot,
+    termGraceMs: 400,
+    killGraceMs: 400,
+    pollIntervalMs: 25,
+    procRoot,
+  });
+  context.backends.push(client);
+
+  const confirmation = await client.confirmExit(executionId);
+  // A terminal record alone never confirms: absence of the process was not
+  // proven, so this stays unconfirmed rather than turning into confirmed=true.
+  assert.equal(confirmation.confirmed, false);
+  assert.equal(confirmation.instance.state, "exited");
+  assert.equal(isAlive(pid), true);
+  process.kill(pid, "SIGKILL");
+});
+
 test("stop and observe refuse a corrupt record without signaling", async (t) => {
   const context = await scratch("round9-corrupt");
   t.after(() => context.cleanup());

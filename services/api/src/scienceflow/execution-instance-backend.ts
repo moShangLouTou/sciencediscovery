@@ -171,6 +171,12 @@ export type ExecutionInstanceObservation =
       readonly groupAlive: boolean;
       /** How many such processes were seen; a count only, never PIDs. */
       readonly members: number;
+      /**
+       * False when the kernel view could not be read completely (or there is no
+       * recorded identity to observe). Absence of a member is then unproven, so
+       * nothing may be settled as gone and no exit may be confirmed.
+       */
+      readonly observationComplete: boolean;
     };
 
 export interface ExecutionStopRequest {
@@ -199,6 +205,8 @@ export type ExecutionStopResult =
         | "identity-unverified"
         /** The recorded PID now belongs to another process (reuse). */
         | "identity-mismatch"
+        /** The record was written under a different host boot. */
+        | "boot-mismatch"
         /** The signal was refused by the kernel (EPERM). */
         | "not-permitted";
     }
@@ -207,6 +215,8 @@ export type ExecutionStopResult =
       readonly status: "unverified";
       readonly instance: ExecutionInstanceSnapshot;
       readonly survivors: number;
+      /** False when the survivor count itself could not be read completely. */
+      readonly observationComplete: boolean;
     }
   | { readonly status: "unsupported"; readonly reason: "platform" };
 
@@ -221,12 +231,26 @@ export interface ExecutionInstanceBackendOptions {
   readonly termGraceMs?: number;
   readonly killGraceMs?: number;
   readonly pollIntervalMs?: number;
+  /**
+   * Kernel filesystem root, default `/proc`. Not a request field: only a
+   * trusted caller or a test sets it, so identity facts cannot be redirected by
+   * input. A test points it at a fixture tree to exercise an unreadable kernel
+   * view; production never passes it.
+   */
+  readonly procRoot?: string;
 }
 
 interface SessionMember {
   readonly pid: number;
   readonly processGroupId: number;
   readonly startTimeTicks: string;
+}
+
+/** A kernel session scan that also says whether absence was proven. */
+interface SessionScan {
+  readonly members: readonly SessionMember[];
+  /** False when the kernel view could not be read completely. */
+  readonly complete: boolean;
 }
 
 interface LaunchedInstance {
@@ -252,6 +276,8 @@ export class ExecutionInstanceBackend {
   private readonly termGraceMs: number;
   private readonly killGraceMs: number;
   private readonly pollIntervalMs: number;
+  /** Kernel filesystem root; `/proc` unless a test supplies a fixture. */
+  private readonly procRoot: string;
   /** Kernels handles only; the durable record is authoritative. */
   private readonly launched = new Map<string, LaunchedInstance>();
   /** Execution ids whose start() is still running in this process. */
@@ -271,6 +297,15 @@ export class ExecutionInstanceBackend {
       options.pollIntervalMs,
       DEFAULT_POLL_INTERVAL_MS,
     );
+    if (
+      options.procRoot !== undefined &&
+      (typeof options.procRoot !== "string" ||
+        !isAbsolute(options.procRoot) ||
+        options.procRoot.includes("\0"))
+    ) {
+      throw new TypeError("procRoot must be an absolute path");
+    }
+    this.procRoot = options.procRoot ?? "/proc";
   }
 
   capabilities(): ExecutionBackendCapabilities {
@@ -385,6 +420,8 @@ export class ExecutionInstanceBackend {
           processAlive: false,
           groupAlive: false,
           members: 0,
+          // Nothing can be observed here, so absence is never proven.
+          observationComplete: false,
         };
       }
       return await this.inspect(read.record);
@@ -402,14 +439,15 @@ export class ExecutionInstanceBackend {
             : "EXECUTION_INSTANCE_RECORD_INVALID",
       });
     }
-    const { instance, processAlive, groupAlive } = observation;
+    const { instance, processAlive, groupAlive, observationComplete } = observation;
     const terminal =
       instance.state === "stopped" ||
       instance.state === "exited" ||
       instance.state === "lost" ||
       instance.state === "unknown";
     return {
-      confirmed: terminal && !processAlive && !groupAlive,
+      // Unproven absence is not an exit: a terminal record alone never confirms.
+      confirmed: terminal && observationComplete && !processAlive && !groupAlive,
       instance,
     };
   }
@@ -459,12 +497,28 @@ export class ExecutionInstanceBackend {
       const identity = record.process;
       // Identity is established before the record is touched: a refused stop
       // must leave no trace that a stop was underway.
-      const leader = await readProcessStat(identity.pid);
+      //
+      // 1. The record must belong to this host boot. After a reboot the same pid
+      //    and starttime can occur again, so pid/starttime/session alone never
+      //    authorize a signal.
+      const bootId = await readBootId(this.procRoot);
+      if (bootId === null) {
+        return { status: "refused", reason: "identity-unverified" };
+      }
+      if (identity.bootId !== bootId) {
+        return { status: "refused", reason: "boot-mismatch" };
+      }
+      // 2. The kernel view must be readable: an unreadable /proc is not an
+      //    absent process, and nothing may be signaled or settled on a guess.
+      const leader = await readProcessStat(this.procRoot, identity.pid);
+      if (leader.status === "unobservable") {
+        return { status: "refused", reason: "identity-unverified" };
+      }
       const leaderVerified =
-        leader !== null &&
-        leader.startTimeTicks === identity.startTimeTicks &&
-        leader.sessionId === identity.sessionId;
-      if (leader !== null && !leaderVerified) {
+        leader.status === "ok" &&
+        leader.stat.startTimeTicks === identity.startTimeTicks &&
+        leader.stat.sessionId === identity.sessionId;
+      if (leader.status === "ok" && !leaderVerified) {
         // The PID was reused: the recorded process is gone, and signaling this
         // PID (or its group) would hit an unrelated process. Refuse rather than
         // declare an outcome for a process this instance no longer owns.
@@ -472,8 +526,11 @@ export class ExecutionInstanceBackend {
       }
       // A terminal state for the launched process does not mean the tree is
       // gone: descendants may still live in the recorded session.
-      const members = await sessionMembers(identity.sessionId);
-      if (members.length === 0) {
+      const initial = await sessionMembers(this.procRoot, identity.sessionId);
+      if (!initial.complete) {
+        return { status: "refused", reason: "identity-unverified" };
+      }
+      if (initial.members.length === 0) {
         return {
           status: "already-terminal",
           instance: executionInstanceSnapshot(
@@ -502,13 +559,20 @@ export class ExecutionInstanceBackend {
       }
 
       // First signal: verified group when its leader is still ours, otherwise
-      // exact PIDs whose kernel identity was just re-read.
-      const term = await this.signal(record, "SIGTERM");
+      // exact PIDs whose kernel identity was just re-read. The boot id verified
+      // above is passed along so the signal path cannot bypass it.
+      const term = await this.signal(record, "SIGTERM", bootId);
       if (term === "denied") return { status: "refused", reason: "not-permitted" };
+      if (term === "boot-mismatch") {
+        return { status: "refused", reason: "boot-mismatch" };
+      }
+      if (term === "unobservable") {
+        return { status: "refused", reason: "identity-unverified" };
+      }
       if (term === "sent") {
         await this.patchStop(executionId, { termSignalSentAt: now });
       }
-      if (await this.awaitGone(identity.sessionId, termGraceMs)) {
+      if ((await this.awaitGone(identity.sessionId, termGraceMs)) === "gone") {
         return {
           status: "stopped",
           instance: executionInstanceSnapshot(
@@ -516,13 +580,18 @@ export class ExecutionInstanceBackend {
           ),
         };
       }
-      const killed = await this.signal(record, "SIGKILL");
+      const killed = await this.signal(record, "SIGKILL", bootId);
+      if (killed === "boot-mismatch") {
+        return { status: "refused", reason: "boot-mismatch" };
+      }
+      // An unobservable kill attempt falls through: absence may still become
+      // provable by the poll below, and otherwise the result stays unverified.
       if (killed === "sent") {
         await this.patchStop(executionId, {
           killSignalSentAt: new Date().toISOString(),
         });
       }
-      if (killed !== "gone" && (await this.awaitGone(identity.sessionId, killGraceMs))) {
+      if (killed !== "gone" && (await this.awaitGone(identity.sessionId, killGraceMs)) === "gone") {
         return {
           status: "stopped",
           instance: executionInstanceSnapshot(
@@ -530,14 +599,17 @@ export class ExecutionInstanceBackend {
           ),
         };
       }
-      const survivors = (await sessionMembers(identity.sessionId)).length;
+      // Without a complete kernel view the survivor count is a lower bound, and
+      // the stop stays unverified rather than being called stopped.
+      const finalScan = await sessionMembers(this.procRoot, identity.sessionId);
       const latest = await this.store.read(executionId);
       return {
         status: "unverified",
         instance: executionInstanceSnapshot(
           latest.status === "ok" ? latest.record : record,
         ),
-        survivors,
+        survivors: finalScan.members.length,
+        observationComplete: finalScan.complete,
       };
     });
   }
@@ -654,7 +726,7 @@ export class ExecutionInstanceBackend {
     // between the two must find the handle and remove it itself.
     this.launched.set(executionId, launched);
 
-    const identity = captureIdentity(child.pid ?? 0);
+    const identity = captureIdentity(this.procRoot, child.pid ?? 0);
     const pid = child.pid ?? 0;
     if (identity === null) {
       stdout.end();
@@ -802,10 +874,12 @@ export class ExecutionInstanceBackend {
       };
       // The launched process ending does not mean the instance ended: a
       // descendant can outlive it inside the recorded session. The exit facts are
-      // kept as data, but no completion is claimed while a member still lives.
+      // kept as data, but no completion is claimed while a member still lives —
+      // and an unreadable kernel view proves nothing at all.
       const membersLeft =
-        record.process !== null &&
-        (await sessionMembers(record.process.sessionId)).length > 0;
+        record.process === null
+          ? false
+          : await this.sessionHasMembers(record.process.sessionId);
       if (record.state === "running" || record.state === "starting") {
         await this.store.write({
           ...record,
@@ -846,8 +920,9 @@ export class ExecutionInstanceBackend {
   private async inspect(
     record: ExecutionInstanceRecord,
   ): Promise<ExecutionInstanceObservation> {
-    const bootId = await readBootId();
+    const bootId = await readBootId(this.procRoot);
     if (bootId === null) {
+      // Without a boot identity no kernel fact here can be trusted.
       return {
         status: "observed",
         instance: executionInstanceSnapshot(record),
@@ -855,6 +930,7 @@ export class ExecutionInstanceBackend {
         processAlive: false,
         groupAlive: false,
         members: 0,
+        observationComplete: false,
       };
     }
     if (record.process === null) {
@@ -869,6 +945,8 @@ export class ExecutionInstanceBackend {
           processAlive: false,
           groupAlive: false,
           members: 0,
+          // No session was ever recorded, so descendants cannot be ruled out.
+          observationComplete: false,
         };
       }
       return {
@@ -878,10 +956,12 @@ export class ExecutionInstanceBackend {
         processAlive: false,
         groupAlive: false,
         members: 0,
+        observationComplete: false,
       };
     }
     if (record.process.bootId !== bootId) {
-      // The host rebooted; nothing from that boot can still be running.
+      // The recorded process belongs to an earlier boot; nothing from that boot
+      // can still be running, so absence is proven without reading a pid.
       const settled = await this.settleTerminal(record.executionId, "lost");
       return {
         status: "observed",
@@ -890,19 +970,37 @@ export class ExecutionInstanceBackend {
         processAlive: false,
         groupAlive: false,
         members: 0,
+        observationComplete: true,
       };
     }
-    const stat = await readProcessStat(record.process.pid);
+    const stat = await readProcessStat(this.procRoot, record.process.pid);
+    if (stat.status === "unobservable") {
+      return {
+        status: "observed",
+        instance: executionInstanceSnapshot(record),
+        identity: "unverified",
+        processAlive: false,
+        groupAlive: false,
+        members: 0,
+        observationComplete: false,
+      };
+    }
     const identity: ExecutionProcessIdentity =
-      stat === null
+      stat.status === "gone"
         ? "unverified"
-        : stat.startTimeTicks === record.process.startTimeTicks
+        : stat.stat.startTimeTicks === record.process.startTimeTicks
           ? "verified"
           : "mismatched";
-    const processAlive = identity === "verified" && stat?.state !== "Z";
-    const members = await sessionMembers(record.process.sessionId);
-    const groupAlive = members.length > 0;
-    if (!processAlive && !groupAlive && !isTerminal(record.state)) {
+    const processAlive =
+      identity === "verified" && stat.status === "ok" && stat.stat.state !== "Z";
+    const scan = await sessionMembers(this.procRoot, record.process.sessionId);
+    const groupAlive = scan.members.length > 0;
+    if (
+      !processAlive &&
+      !groupAlive &&
+      scan.complete &&
+      !isTerminal(record.state)
+    ) {
       // A launcher still holding the ChildProcess will record the real exit; a
       // rebuilt caller sees that nobody is left and must not claim an exit code.
       if (!this.launcherOwns(record.executionId)) {
@@ -917,6 +1015,7 @@ export class ExecutionInstanceBackend {
           processAlive: false,
           groupAlive: false,
           members: 0,
+          observationComplete: true,
         };
       }
     }
@@ -926,7 +1025,8 @@ export class ExecutionInstanceBackend {
       identity,
       processAlive,
       groupAlive,
-      members: members.length,
+      members: scan.members.length,
+      observationComplete: scan.complete,
     };
   }
 
@@ -972,35 +1072,46 @@ export class ExecutionInstanceBackend {
   }
 
   /**
-   * Signal only this instance. With a verified leader the whole process group
-   * is signaled; otherwise each live session member is re-read and signaled by
-   * exact PID, so a recycled group id is never hit.
+   * Signal only this instance. The boot identity is re-checked here so this
+   * path can never authorize a signal by itself, and an unreadable kernel view
+   * aborts the attempt instead of guessing at a target. With a verified leader
+   * the whole process group is signaled; otherwise each live session member is
+   * re-read and signaled by exact PID, so a recycled group id is never hit.
    */
   private async signal(
     record: ExecutionInstanceRecord,
     signal: NodeJS.Signals,
+    bootId: string,
   ): Promise<SignalOutcome> {
     const process = record.process;
     if (process === null) return "gone";
-    const leader = await readProcessStat(process.pid);
+    if (process.bootId !== bootId) return "boot-mismatch";
+    const leader = await readProcessStat(this.procRoot, process.pid);
+    if (leader.status === "unobservable") return "unobservable";
     if (
-      leader !== null &&
-      leader.startTimeTicks === process.startTimeTicks &&
-      leader.sessionId === process.sessionId &&
-      leader.processGroupId === process.processGroupId
+      leader.status === "ok" &&
+      leader.stat.startTimeTicks === process.startTimeTicks &&
+      leader.stat.sessionId === process.sessionId &&
+      leader.stat.processGroupId === process.processGroupId
     ) {
       return sendSignal(-process.processGroupId, signal);
     }
-    const members = await sessionMembers(process.sessionId);
+    const scan = await sessionMembers(this.procRoot, process.sessionId);
+    // Without a complete scan the target set is unknown; signal nothing.
+    if (!scan.complete) return "unobservable";
     let sent = false;
     let denied = false;
-    for (const member of members) {
+    for (const member of scan.members) {
       // Re-read immediately before the signal: never signal a reused PID.
-      const current = await readProcessStat(member.pid);
-      if (current === null || current.startTimeTicks !== member.startTimeTicks) {
-        continue;
+      const current = await readProcessStat(this.procRoot, member.pid);
+      if (current.status === "unobservable") {
+        // A refused outcome promises that no signal was sent. Once one has been
+        // sent, report it as sent and let the polling decide the outcome.
+        return sent ? "sent" : "unobservable";
       }
-      if (current.sessionId !== process.sessionId) continue;
+      if (current.status === "gone") continue;
+      if (current.stat.startTimeTicks !== member.startTimeTicks) continue;
+      if (current.stat.sessionId !== process.sessionId) continue;
       const outcome = sendSignal(member.pid, signal);
       if (outcome === "sent") sent = true;
       if (outcome === "denied") denied = true;
@@ -1012,13 +1123,22 @@ export class ExecutionInstanceBackend {
   private async awaitGone(
     sessionId: number,
     timeoutMs: number,
-  ): Promise<boolean> {
+  ): Promise<"gone" | "surviving" | "unobservable"> {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
-      if ((await sessionMembers(sessionId)).length === 0) return true;
-      if (Date.now() >= deadline) return false;
+      const scan = await sessionMembers(this.procRoot, sessionId);
+      if (scan.complete && scan.members.length === 0) return "gone";
+      if (Date.now() >= deadline) {
+        return scan.complete ? "surviving" : "unobservable";
+      }
       await delay(this.pollIntervalMs);
     }
+  }
+
+  /** True unless the kernel view was read completely and found empty. */
+  private async sessionHasMembers(sessionId: number): Promise<boolean> {
+    const scan = await sessionMembers(this.procRoot, sessionId);
+    return !scan.complete || scan.members.length > 0;
   }
 
   private serialized<T>(
@@ -1152,9 +1272,19 @@ function delay(ms: number): Promise<void> {
 }
 
 /** What a signal attempt established about the target set. */
-type SignalOutcome = "sent" | "gone" | "denied";
+type SignalOutcome =
+  | "sent"
+  | "gone"
+  | "denied"
+  /** The record was written by a different host boot; never signal for it. */
+  | "boot-mismatch"
+  /** The kernel view could not be read; nothing was signaled on a guess. */
+  | "unobservable";
 
-function sendSignal(target: number, signal: NodeJS.Signals): SignalOutcome {
+/** What one process.kill() call established. */
+type SignalSendOutcome = "sent" | "gone" | "denied";
+
+function sendSignal(target: number, signal: NodeJS.Signals): SignalSendOutcome {
   try {
     process.kill(target, signal);
     return "sent";
@@ -1173,16 +1303,42 @@ interface ProcessStat {
   readonly startTimeTicks: string;
 }
 
-/** Parse /proc/[pid]/stat after the parenthesised command name. */
-async function readProcessStat(pid: number): Promise<ProcessStat | null> {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+/**
+ * One /proc/[pid]/stat read. "gone" is a proven absence; "unobservable" only
+ * means the kernel view could not be read, and must never be treated as one.
+ */
+type ProcessStatRead =
+  | { readonly status: "ok"; readonly stat: ProcessStat }
+  | { readonly status: "gone" }
+  | { readonly status: "unobservable" };
+
+/** errno values that prove the process does not exist at this moment. */
+const PROCESS_GONE_CODES = new Set(["ENOENT", "ESRCH"]);
+
+function isProcessGoneError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | null | undefined)?.code;
+  return typeof code === "string" && PROCESS_GONE_CODES.has(code);
+}
+
+/** Read /proc/[pid]/stat, distinguishing "absent" from "cannot observe". */
+async function readProcessStat(
+  procRoot: string,
+  pid: number,
+): Promise<ProcessStatRead> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    return { status: "unobservable" };
+  }
   let text: string;
   try {
-    text = await readFile(`/proc/${pid}/stat`, "utf8");
-  } catch {
-    return null;
+    text = await readFile(`${procRoot}/${pid}/stat`, "utf8");
+  } catch (error) {
+    return isProcessGoneError(error)
+      ? { status: "gone" }
+      : { status: "unobservable" };
   }
-  return parseProcessStat(text);
+  // A truncated or unexpected line proves nothing about the process.
+  const stat = parseProcessStat(text);
+  return stat === null ? { status: "unobservable" } : { status: "ok", stat };
 }
 
 export function parseProcessStat(text: string): ProcessStat | null {
@@ -1196,17 +1352,22 @@ export function parseProcessStat(text: string): ProcessStat | null {
   const sessionId = Number(fields[3]);
   const startTimeTicks = fields[19];
   if (typeof state !== "string" || state.length === 0) return null;
-  if (!Number.isSafeInteger(processGroupId) || processGroupId <= 0) return null;
-  if (!Number.isSafeInteger(sessionId) || sessionId <= 0) return null;
+  // Kernel threads have no group or session (both 0); that is a real value, not
+  // a malformed line. A process that belongs to this instance always has a
+  // positive id, which the callers that care require separately.
+  if (!Number.isSafeInteger(processGroupId) || processGroupId < 0) return null;
+  if (!Number.isSafeInteger(sessionId) || sessionId < 0) return null;
   if (typeof startTimeTicks !== "string" || !/^\d+$/.test(startTimeTicks)) {
     return null;
   }
   return { state, processGroupId, sessionId, startTimeTicks };
 }
 
-async function readBootId(): Promise<string | null> {
+async function readBootId(procRoot: string): Promise<string | null> {
   try {
-    return normalizeBootId(await readFile("/proc/sys/kernel/random/boot_id", "utf8"));
+    return normalizeBootId(
+      await readFile(`${procRoot}/sys/kernel/random/boot_id`, "utf8"),
+    );
   } catch {
     return null;
   }
@@ -1230,32 +1391,51 @@ function parseUid(text: string): number | null {
   return Number.isSafeInteger(effective) ? effective : null;
 }
 
-/** Every live process whose kernel session is the one this instance created. */
-async function sessionMembers(sessionId: number): Promise<SessionMember[]> {
-  if (!Number.isSafeInteger(sessionId) || sessionId <= 0) return [];
+/**
+ * Every live process whose kernel session is the one this instance created.
+ *
+ * `complete: false` means some part of the kernel view could not be read, so an
+ * empty member list is not proof that nothing is left. Callers must keep the
+ * instance unverified in that case rather than settle it as gone.
+ */
+async function sessionMembers(
+  procRoot: string,
+  sessionId: number,
+): Promise<SessionScan> {
+  if (!Number.isSafeInteger(sessionId) || sessionId <= 0) {
+    return { members: [], complete: false };
+  }
   let entries: string[];
   try {
-    entries = await readdir("/proc");
+    entries = await readdir(procRoot);
   } catch {
-    return [];
+    return { members: [], complete: false };
   }
   const members: SessionMember[] = [];
+  let complete = true;
   for (const entry of entries) {
     if (!/^[0-9]+$/.test(entry)) continue;
     const pid = Number(entry);
-    const stat = await readProcessStat(pid);
-    if (stat === null) continue;
-    if (stat.sessionId !== sessionId) continue;
+    const read = await readProcessStat(procRoot, pid);
+    if (read.status === "unobservable") {
+      // Whether this process belongs to the session is unknowable, so absence
+      // of the whole session is unproven.
+      complete = false;
+      continue;
+    }
+    // It exited between readdir() and the read: genuinely absent.
+    if (read.status === "gone") continue;
+    if (read.stat.sessionId !== sessionId) continue;
     // A zombie still holds the session id but is already dead; it must neither
     // count as alive nor receive a signal.
-    if (stat.state === "Z") continue;
+    if (read.stat.state === "Z") continue;
     members.push({
       pid,
-      processGroupId: stat.processGroupId,
-      startTimeTicks: stat.startTimeTicks,
+      processGroupId: read.stat.processGroupId,
+      startTimeTicks: read.stat.startTimeTicks,
     });
   }
-  return members;
+  return { members, complete };
 }
 
 /**
@@ -1268,21 +1448,22 @@ async function sessionMembers(sessionId: number): Promise<SessionMember[]> {
  * session, which must never become a cancellation target.
  */
 function captureIdentity(
+  procRoot: string,
   pid: number,
 ): Omit<ExecutionInstanceProcess, "pid"> | null {
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
-  const bootId = readBootIdSync();
+  const bootId = readBootIdSync(procRoot);
   if (bootId === null) return null;
   const deadline = Date.now() + IDENTITY_CAPTURE_TIMEOUT_MS;
   for (;;) {
-    const stat = readProcessStatSync(pid);
+    const stat = readProcessStatSync(procRoot, pid);
     if (
       stat !== null &&
       stat.state !== "Z" &&
       stat.sessionId === pid &&
       stat.processGroupId === pid
     ) {
-      const uid = readUidSync(pid);
+      const uid = readUidSync(procRoot, pid);
       if (uid !== null) {
         return {
           processGroupId: stat.processGroupId,
@@ -1290,7 +1471,7 @@ function captureIdentity(
           startTimeTicks: stat.startTimeTicks,
           bootId,
           uid,
-          commandName: readCommandNameSync(pid),
+          commandName: readCommandNameSync(procRoot, pid),
         };
       }
     }
@@ -1299,44 +1480,47 @@ function captureIdentity(
   }
 }
 
-function readProcessStatSync(pid: number): ProcessStat | null {
+function readProcessStatSync(procRoot: string, pid: number): ProcessStat | null {
   try {
-    return parseProcessStat(readFileSync(`/proc/${pid}/stat`, "utf8"));
+    return parseProcessStat(readFileSync(`${procRoot}/${pid}/stat`, "utf8"));
   } catch {
     return null;
   }
 }
 
-function readUidSync(pid: number): number | null {
+function readUidSync(procRoot: string, pid: number): number | null {
   try {
-    return parseUid(readFileSync(`/proc/${pid}/status`, "utf8"));
+    return parseUid(readFileSync(`${procRoot}/${pid}/status`, "utf8"));
   } catch {
     return null;
   }
 }
 
-function readCommandNameSync(pid: number): string {
+function readCommandNameSync(procRoot: string, pid: number): string {
   try {
-    return normalizeCommandName(readFileSync(`/proc/${pid}/comm`, "utf8"));
+    return normalizeCommandName(readFileSync(`${procRoot}/${pid}/comm`, "utf8"));
   } catch {
     return "unknown";
   }
 }
 
-function readBootIdSync(): string | null {
-  if (cachedBootId !== undefined) return cachedBootId;
+function readBootIdSync(procRoot: string): string | null {
+  const cached = bootIdCache.get(procRoot);
+  if (cached !== undefined) return cached;
+  let value: string | null;
   try {
-    cachedBootId = normalizeBootId(
-      readFileSync("/proc/sys/kernel/random/boot_id", "utf8"),
+    value = normalizeBootId(
+      readFileSync(`${procRoot}/sys/kernel/random/boot_id`, "utf8"),
     );
   } catch {
-    cachedBootId = null;
+    value = null;
   }
-  return cachedBootId;
+  bootIdCache.set(procRoot, value);
+  return value;
 }
 
-/** Boot id never changes while the host is up. */
-let cachedBootId: string | null | undefined;
+/** Boot id never changes while the host is up; cached per kernel root. */
+const bootIdCache = new Map<string, string | null>();
 
 function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
