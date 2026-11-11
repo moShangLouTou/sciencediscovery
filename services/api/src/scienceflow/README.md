@@ -659,9 +659,9 @@ exposes no HTTP interface that could start a command, script, or manifest.
 | --- | --- |
 | `capabilities()` | Static capability statement (no discovery, no probing) |
 | `start(spec)` | `started` / `existing` / `conflict` / `failed` / `unsupported` |
-| `observe(id)` | `observed` (state, identity verdict, `processAlive`, `groupAlive`, member count) / `not-found` / `record-invalid` |
+| `observe(id)` | `observed` (state, identity verdict, `processAlive`, `groupAlive`, member count, `observationComplete`) / `not-found` / `record-invalid` |
 | `requestStop(id, request)` | `stopped` / `already-terminal` / `refused` / `unverified` |
-| `confirmExit(id)` | Terminal **and** no live leader and no live member |
+| `confirmExit(id)` | Terminal **and** the kernel view is complete **and** no live leader and no live member |
 
 - The launch specification is trusted server code: absolute `executable` and
   `cwd`, an argv array (`shell: false`), a bounded environment allow-list, and
@@ -695,8 +695,19 @@ A launcher-observed exit with descendants still alive in the recorded session
 does **not** become `exited`: the exit facts are kept as data, the instance stays
 `running`, and an outcome is never claimed for a tree that is still alive.
 
+"Absent" and "cannot observe" are different answers. `observe` carries
+`observationComplete: false` when `/proc` could not be listed or a member's stat
+could not be read; an empty member count from an incomplete view is a lower
+bound, never proof that nothing is left. In that case nothing is settled as
+`lost` or `stopped` and `confirmExit` stays `false`.
+
 ### Cancellation guarantee (limited, and stated as such)
 
+- A stop is authorized only when the record's `boot_id` is this host boot. After
+  a reboot the same pid and start time can occur again, so pid, start time, and
+  session alone never authorize a signal; the check runs again inside the signal
+  path. An unreadable kernel view refuses the stop instead of guessing at a
+  target.
 - TERM is sent to the verified process group when the recorded leader still
   matches its start time and session; otherwise to each live session member by
   exact pid, re-read immediately before every signal. No name-, port-, or
@@ -709,9 +720,13 @@ does **not** become `exited`: the exit facts are kept as data, the instance stay
   the whole tree answers `unverified` with a survivor count. This is why the
   "descendant-process cancellation" blocker stays in place.
 - Refusals are distinct: `owner-mismatch`, `identity-mismatch` (the recorded pid
-  now belongs to another process), `not-permitted` (EPERM),
-  `identity-unverified`, `record-invalid`, `not-found`. A refused stop leaves no
-  trace that a stop was underway.
+  now belongs to another process), `boot-mismatch` (the record was written under
+  a different host boot), `not-permitted` (EPERM), `identity-unverified` (the
+  kernel view could not be read), `record-invalid`, `not-found`. The identity
+  gate runs before the record is touched, so a refusal there leaves no trace
+  that a stop was underway; if the kernel view becomes unreadable during the
+  attempt, the result is `refused`/`identity-unverified` or `unverified`, never
+  `stopped`.
 
 ### Restart semantics
 
@@ -738,6 +753,11 @@ reads the actual HEAD, the checkout root, and the working-tree status.
   path, or repository content is returned or logged.
 - Git runs with an argv array, `shell: false`, a minimal environment, a timeout,
   and bounded output. It never fetches, checks out, installs, or imports.
+- Working-tree status is read with `--porcelain=v1 -z` and split on NUL, so a
+  path with spaces, quotes, non-ASCII characters, or a newline arrives verbatim.
+  A newline-based listing would misparse such a name and could report an
+  untracked `.py` file as clean. The second field of a rename/copy is the source
+  path and is never read as a status record of its own.
 - The path comes from a trusted caller only; there is no default, so the
   untracked reference checkout in a developer worktree is never implied.
 - A source-checkout result is **not** a verification of an installed Python
