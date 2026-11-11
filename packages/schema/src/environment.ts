@@ -565,10 +565,34 @@ export interface RunnerBlockedResult {
 
 export type ExecutionBlockDecision = { action: "retry" | "cancel" } | { action: "switch"; runnerId: string };
 
+/**
+ * What this Runner can actually verify about a managed execution's process
+ * boundary. Every field states a tested property of the platform, not a
+ * configuration switch: a weaker provider reports `unsupported` rather than
+ * inheriting a promise it cannot keep.
+ */
+export interface RunnerExecutionBoundaryCapability {
+  /** The durable handle persisted with each execution. */
+  handle: "pid-namespace" | "process" | "none";
+  /** A restarted Runner can observe and cancel the recorded execution. */
+  reconnect: "supported" | "unsupported";
+  /** The kernel ends the whole boundary when the Runner process dies. */
+  runnerDeathTerminates: "kernel" | "unmanaged";
+  /** A descendant that calls setsid() is still inside the boundary. */
+  escapedDescendant: "included" | "excluded";
+  /** What proves the boundary is gone, rather than a signal having been sent. */
+  terminationProof: "pid-namespace" | "none";
+  reason?: "sandbox-unsupported" | "platform-unsupported";
+}
+
 export interface RunnerHealth {
   runnerInstanceId?: string;
   runnerBootId?: string;
-  capabilities?: { executionRecoveryVersion?: number };
+  capabilities?: {
+    executionRecoveryVersion?: number;
+    /** Absent on older Runners: nothing may be assumed about reconnection. */
+    executionBoundary?: RunnerExecutionBoundaryCapability;
+  };
   /** Absent on older Runners: unknown, not proof that execution is ready. */
   execution?: RunnerExecutionCapability;
   /** Always false: the runner no longer manages a cgroup v2 subtree. */
