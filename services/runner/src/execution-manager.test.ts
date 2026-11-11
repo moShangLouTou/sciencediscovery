@@ -20,6 +20,7 @@ import { ExecutionManager, ExecutionManagerError, type ExecutionManagerOptions, 
 import { EXECUTION_BOUNDARY_SCHEMA_VERSION, type ExecutionBoundaryHandle } from "./execution-boundary.js";
 import { sendSignal } from "@sciencediscovery/sandbox-capability";
 import { ProcessTerminationUnverifiedError } from "./executor.js";
+import { assertEnvironmentMutationAllowed } from "./execution-resource-fences.js";
 
 const owner: ExecutionOwner = { agentId: "main", sessionId: "session" };
 function request(root: string, id: string): ShellExecutionRequest {
@@ -297,6 +298,101 @@ test("running cancellation never aborts when its durable stop-intent write fails
     finish.resolve();
   }
   await until(() => manager.get("stop-storage-failure", owner).state === "completed", 30_000);
+});
+
+test("managed resources wait for the boundary check and unknown executions retain their environment fence", async context => {
+  const { manager, workspace, root } = await fixture(context, {
+    captureBoundary: executionId => ({ status: "captured",
+      handle: JSON.parse(boundaryRow(executionId, { namespaces: [] })) as ExecutionBoundaryHandle }),
+  });
+  let cleaned = false;
+  manager.start({ ...request(workspace, "retain-resources"), environmentId: "selected" }, async (_signal, _log, _revision, lifecycle) => {
+    assert.ok(lifecycle?.retainResource);
+    lifecycle.retainResource(async () => { cleaned = true; }, "synthetic-managed-launch");
+    lifecycle.spawned({ pid: ABSENT_PID, kind: "pid-namespace", sandbox: "bubblewrap" });
+    assert.equal(cleaned, false);
+    return result("retain-resources");
+  });
+  await until(() => manager.get("retain-resources", owner).state === "unknown", 30_000);
+  assert.equal(cleaned, false);
+  assert.throws(() => assertEnvironmentMutationAllowed(resolve(root, "runner-executions/executions.sqlite"), "selected"),
+    { code: "ENVIRONMENT_EXECUTION_UNVERIFIED" });
+});
+
+test("verified managed completion cleans once and releases external CAS and environment mutations", async context => {
+  const { manager, workspace, root } = await fixture(context);
+  let cleanups = 0;
+  const cleanup = async () => { cleanups++; };
+  manager.start({ ...request(workspace, "release-resources"), environmentId: "selected" }, async (_signal, _log, _revision, lifecycle) => {
+    assert.ok(lifecycle?.retainResource);
+    lifecycle.retainResource(cleanup, "synthetic-managed-launch");
+    lifecycle.retainResource(cleanup, "synthetic-managed-launch");
+    assert.equal(cleanups, 0);
+    assert.throws(() => assertEnvironmentMutationAllowed(resolve(root, "runner-executions/executions.sqlite"), "selected"),
+      { code: "ENVIRONMENT_EXECUTION_UNVERIFIED" });
+    return result("release-resources");
+  });
+  await until(() => manager.get("release-resources", owner).state === "completed", 30_000);
+  await withWorkspaceMutation(new VersionStore(root), workspace, async () => {}, { kind: "external-after-completion" });
+  assert.equal(cleanups, 1);
+  assert.doesNotThrow(() => assertEnvironmentMutationAllowed(resolve(root, "runner-executions/executions.sqlite"), "selected"));
+});
+
+test("cancellation after durable fencing but before spawn removes only the unstarted execution fences", async context => {
+  const entered = Promise.withResolvers<void>();
+  const proceed = Promise.withResolvers<void>();
+  // Resolve the pause even when an assertion fails before cancellation.
+  context.after(() => proceed.resolve());
+  const { manager, workspace, root } = await fixture(context, {
+    afterFence: async () => { entered.resolve(); await proceed.promise; },
+  });
+  let launched = false;
+  manager.start({ ...request(workspace, "fenced-not-started"), environmentId: "selected" }, async () => {
+    launched = true; return result("fenced-not-started");
+  });
+  await entered.promise;
+  await manager.cancel("fenced-not-started", owner);
+  proceed.resolve();
+  await withWorkspaceMutation(new VersionStore(root), workspace, async () => {}, { kind: "after-not-started" });
+  assert.equal(launched, false);
+  assert.equal(manager.get("fenced-not-started", owner).evidence?.terminationReason, "not_started");
+  assert.equal(manager.get("fenced-not-started", owner).version, undefined);
+  assert.doesNotThrow(() => assertEnvironmentMutationAllowed(resolve(root, "runner-executions/executions.sqlite"), "selected"));
+});
+
+test("empty or malformed environment IDs cannot bypass default-runtime resource fencing", async context => {
+  const { manager, workspace } = await fixture(context);
+  for (const environmentId of ["", " ", " selected"]) {
+    assert.throws(() => manager.start({ ...request(workspace, "bad-env"), environmentId }, async () => {
+      assert.fail("invalid environment selection launched");
+    }), /Invalid environment ID/);
+  }
+});
+
+test("validated publication recovery releases only evidence-backed workspace and environment fences", async context => {
+  const root = await mkdtemp(resolve(tmpdir(), "manager-resource-publication-"));
+  const workspace = resolve(root, "workspace"); await mkdir(workspace);
+  let manager = new ExecutionManager(root);
+  context.after(async () => { await manager.close(); await rm(root, { recursive: true, force: true }); });
+  const commit = RefStore.prototype.commit;
+  context.mock.method(RefStore.prototype, "commit", async function(this: RefStore, ...args: Parameters<RefStore["commit"]>) {
+    const result = await commit.apply(this, args);
+    if ((await args[0].readRecord(args[3])).kind === "WorkspaceExecution") throw new Error("synthetic response loss after publication");
+    return result;
+  });
+  let launches = 0;
+  manager.start({ ...request(workspace, "publication-resources"), environmentId: "selected" }, async () => {
+    launches++; return result("publication-resources");
+  });
+  await until(() => manager.get("publication-resources", owner).state === "unknown", 30_000);
+  await manager.close();
+  manager = new ExecutionManager(root);
+  await manager.ready();
+  assert.equal(manager.get("publication-resources", owner).state, "completed");
+  assert.equal(manager.get("publication-resources", owner).evidence?.processTerminated, true);
+  assert.equal(launches, 1);
+  await withWorkspaceMutation(new VersionStore(root), workspace, async () => {}, { kind: "after-proven-publication-recovery" });
+  assert.doesNotThrow(() => assertEnvironmentMutationAllowed(resolve(root, "runner-executions/executions.sqlite"), "selected"));
 });
 
 test("external file publication waits for cancelled process join and the execution ref commit", async (context) => {
@@ -940,6 +1036,7 @@ test("a restart without a recorded handle observes not-recorded and refuses to c
   await seedInterruptedExecution(root, "legacy", { workspaceKey: workspace });
   const manager = new ExecutionManager(root);
   try {
+    await manager.ready();
     const recovered = manager.get("legacy", owner);
     assert.equal(recovered.state, "unknown");
     assert.deepEqual({ ...recovered.boundary, observedAt: undefined },
@@ -961,6 +1058,7 @@ test("a restart proves an empty recorded boundary gone and cancels idempotently 
   await seedInterruptedExecution(root, "gone", { workspaceKey: workspace, handle: boundaryRow("gone") });
   const manager = new ExecutionManager(root);
   try {
+    await manager.ready();
     const recovered = manager.get("gone", owner);
     assert.equal(recovered.boundary?.state, "gone");
     assert.equal(recovered.boundary?.terminationConfirmed, true);

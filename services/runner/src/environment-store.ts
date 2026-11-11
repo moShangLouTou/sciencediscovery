@@ -37,6 +37,7 @@ import {
 
 import micromambaManifest from "./micromamba-releases.json" with { type: "json" };
 import { EnvironmentAccess } from "./environment-access.js";
+import { assertEnvironmentMutationAllowed } from "./execution-resource-fences.js";
 // [windows-desktop] win-64 binary name (.exe), conda interpreter layout
 // and rename retry live in the platform adaptation layer ().
 import { environmentInterpreterPath, environmentShellPath, environmentShellUtilityPath, micromambaBinaryName, packageInstallGuidance, renameReplace, starterPackages } from "./platform/index.js";
@@ -88,6 +89,8 @@ export type ProvisionerExecutor = (
 export type ProvisionerInstaller = (destination: string) => Promise<void>;
 
 export interface EnvironmentStoreConfig {
+  /** Runner-private ledger whose resource fences also guard startup repairs. */
+  executionLedgerPath?: string;
   allowedChannels: string[];
   enabled: boolean;
   packageCacheDir?: string;
@@ -350,7 +353,7 @@ export class EnvironmentStore {
   private setupComponents: ScientificEnvironmentSetup["components"];
   private setupPromise?: Promise<ScientificEnvironmentSetup>;
   private mutationTail: Promise<void> = Promise.resolve();
-  private readonly runtimeAccess = new EnvironmentAccess();
+  private readonly runtimeAccess: EnvironmentAccess;
   private lastSetupError?: string;
 
   constructor(
@@ -358,6 +361,7 @@ export class EnvironmentStore {
     provisioner?: ProvisionerExecutor,
     provisionerInstaller: ProvisionerInstaller = installManagedMicromamba,
   ) {
+    this.runtimeAccess = new EnvironmentAccess(id => this.assertMutationAllowed(id));
     this.catalogPath = resolve(config.root, "catalog.json");
     this.revisionsRoot = resolve(config.root, "revisions");
     this.snapshotsRoot = resolve(config.root, "snapshots");
@@ -895,8 +899,13 @@ export class EnvironmentStore {
     return result;
   }
 
+  private assertMutationAllowed(id: string): void {
+    if (this.config.executionLedgerPath) assertEnvironmentMutationAllowed(this.config.executionLedgerPath, id);
+  }
+
   private async bootstrapStarter(language: ScientificLanguage): Promise<void> {
     const id = `starter-${language}`;
+    this.assertMutationAllowed(id);
     const revisionId = `rev-${randomUUID()}`;
     const prefix = this.revisionPath(id, revisionId);
     const previousCatalog = structuredClone(this.catalog);
@@ -1147,6 +1156,7 @@ export class EnvironmentStore {
    * recorded as a distinct audit revision just like an ordinary task update. */
   private async upgradeStarterPackages(language: ScientificLanguage): Promise<void> {
     const environment = this.requiredEnvironment(`starter-${language}`);
+    this.assertMutationAllowed(environment.id);
     const previousRevision = this.currentRevision(environment.id);
     const installedNames = new Set(previousRevision.packages
       .filter((value) => !value.includes(":"))

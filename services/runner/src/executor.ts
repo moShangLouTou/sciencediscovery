@@ -32,6 +32,8 @@ import {
   terminateExecutionBoundary,
   type ExecutionLifecycle,
 } from "./execution-boundary.js";
+import { cleanupExecutionResource, ProcessTerminationUnverifiedError } from "./termination-resources.js";
+export { ProcessTerminationUnverifiedError } from "./termination-resources.js";
 import {
   SANDBOX_SKILL_EXTENSIONS_ROOT,
   SANDBOX_SKILL_PACKAGES_ROOT,
@@ -621,15 +623,6 @@ function localPythonPackageBindArguments(packagePath: string | undefined): strin
  * still be writing to the workspace, so its terminal state cannot be claimed:
  * callers must quarantine the workspace instead of publishing a snapshot.
  */
-export class ProcessTerminationUnverifiedError extends Error {
-  readonly code = "PROCESS_TERMINATION_UNVERIFIED";
-
-  constructor(message: string, options?: { cause?: unknown }) {
-    super(message, options);
-    this.name = "ProcessTerminationUnverifiedError";
-  }
-}
-
 async function runSandboxed(
   config: ExecutorConfig,
   launch: SandboxLaunch,
@@ -653,6 +646,7 @@ async function runSandboxed(
   onSpawned?: (child: ChildProcessWithoutNullStreams, sandbox: SandboxKind) => void,
   spawnProcess = () => spawnSandboxProcess(config, launch, commandArguments, seccompVariant, config.closeSeccompFilter, onSpawned),
 ): Promise<{ exitCode: number; stderr: string; stdout: string }> {
+  let failure: unknown;
   try {
     return await new Promise<{ exitCode: number; stderr: string; stdout: string }>((resolveRun, reject) => {
       let child: ChildProcessWithoutNullStreams | undefined;
@@ -698,7 +692,8 @@ async function runSandboxed(
           if (settled) return;
           if (child && (child.exitCode !== null || child.signalCode !== null)) settleExited();
           else finish(new ProcessTerminationUnverifiedError(
-            `${timeoutLabel} could not be verified as terminated after cancellation`));
+            `${timeoutLabel} could not be verified as terminated after cancellation`,
+            child ? { termination: sandboxTerminationProof(child, launch.sandbox ?? executorSandboxKind(config)) } : undefined));
         }, graceMs);
       };
       // Do not release a writer or clean up its mounts until the process has exited.
@@ -786,8 +781,11 @@ async function runSandboxed(
         child.stdin.end(stdin);
       }).catch((error: Error) => finish(error));
     });
+  } catch (error) {
+    failure = error;
+    throw error;
   } finally {
-    await launch.cleanup?.().catch(() => undefined);
+    await cleanupSandboxLaunch(launch, failure);
   }
 }
 
@@ -1271,6 +1269,46 @@ export function killSandboxProcess(child: ChildProcessWithoutNullStreams): boole
 }
 
 /** Wait, bounded, for a killed process to emit its terminal event. */
+const childTerminals = new WeakMap<ChildProcessWithoutNullStreams, Promise<void>>();
+
+/** Subscribe in the spawn turn, including to error: supervision can fail
+ * before the ordinary executor has received the child and installed handlers. */
+function ownSandboxChild(child: ChildProcessWithoutNullStreams): void {
+  childTerminals.set(child, new Promise<void>(done => {
+    child.once("exit", () => done());
+    child.once("close", () => done());
+    child.on("error", () => { if (!child.pid) done(); });
+  }));
+}
+
+async function sandboxTerminationProof(child: ChildProcessWithoutNullStreams, sandbox: SandboxKind): Promise<void> {
+  if (child.exitCode === null && child.signalCode === null) {
+    const terminal = childTerminals.get(child);
+    if (!terminal) throw new Error("The sandbox terminal event is not owned");
+    await terminal;
+  }
+  if (sandbox === "bubblewrap" && child.pid) {
+    // An owned terminal event plus a kernel read proving this monitor ended
+    // has the same namespace-init teardown guarantee as ended-at-spawn.
+    const outcome = captureExecutionBoundaryOutcome(`joined:${child.pid}`,
+      { pid: child.pid, kind: "pid-namespace", sandbox });
+    if (outcome.status !== "ended") throw new Error("The joined sandbox boundary is still unverified");
+  }
+}
+
+const launchCleanups = new WeakMap<SandboxLaunch, () => Promise<void>>();
+async function cleanupSandboxLaunch(launch: SandboxLaunch, error: unknown): Promise<void> {
+  if (!launch.cleanup) return;
+  let cleanup = launchCleanups.get(launch);
+  if (!cleanup) {
+    const action = launch.cleanup;
+    let result: Promise<void> | undefined;
+    cleanup = () => result ??= Promise.resolve().then(action);
+    launchCleanups.set(launch, cleanup);
+  }
+  await cleanupExecutionResource(error, cleanup, "sandbox-launch");
+}
+
 async function waitForSandboxExit(child: ChildProcessWithoutNullStreams, graceMs: number): Promise<boolean> {
   if (child.exitCode !== null || child.signalCode !== null) return true;
   return await new Promise<boolean>((resolveExit) => {
@@ -1308,20 +1346,20 @@ async function stopUnrecordedSandbox(
     // a label, never persisted.
     const outcome = captureExecutionBoundaryOutcome(`unrecorded:${child.pid}`,
       { pid: child.pid, kind: "pid-namespace", sandbox: "bubblewrap" });
-    if (outcome.status === "ended") return true;
+    if (outcome.status === "ended") return await waitForSandboxExit(child, graceMs);
     if (outcome.status === "captured") {
       const stopped = await terminateExecutionBoundary(outcome.handle, {
         termGraceMs: Math.max(0, Math.min(graceMs, DEFAULT_BOUNDARY_TERM_GRACE_MS)),
         killGraceMs: Math.max(0, Math.min(graceMs, DEFAULT_BOUNDARY_KILL_GRACE_MS)),
       });
-      if (stopped.confirmed) return true;
+      if (stopped.confirmed) return await waitForSandboxExit(child, graceMs);
     }
   }
   // Group kill is still worth attempting: it stops the monitor even when the
   // namespace could not be read. It is not, by itself, proof of termination.
   killSandboxProcess(child);
   const joined = await waitForSandboxExit(child, graceMs);
-  return sandbox !== "bubblewrap" && joined;
+  return (!child.pid || sandbox !== "bubblewrap") && joined;
 }
 
 /** Spawn through the selected sandbox and attach Linux seccomp when applicable. */
@@ -1353,7 +1391,7 @@ export async function spawnSandboxProcess(
       if (stopped) throw error;
       throw new ProcessTerminationUnverifiedError(
         `Sandbox supervision failed after the process started, and its termination could not be verified: ${error instanceof Error ? error.message : String(error)}`,
-        { cause: error });
+        { cause: error, termination: sandboxTerminationProof(child, sandbox) });
     }
   };
   if (kind === "none") {
@@ -1367,10 +1405,11 @@ export async function spawnSandboxProcess(
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
       }) as ChildProcessWithoutNullStreams;
+      ownSandboxChild(direct);
       await record(direct, "none");
       return direct;
     } catch (error) {
-      await launch.cleanup?.().catch(() => undefined);
+      await cleanupSandboxLaunch(launch, error);
       throw error;
     }
   }
@@ -1392,6 +1431,7 @@ export async function spawnSandboxProcess(
       env: launch.sandbox === "seatbelt" ? launch.env : undefined,
       stdio: filter ? ["pipe", "pipe", "pipe", filter.fd] : ["pipe", "pipe", "pipe"],
     }) as ChildProcessWithoutNullStreams;
+    ownSandboxChild(child);
     if (processGroup) {
       sandboxProcessGroups.add(child);
       child.once("close", () => sandboxProcessGroups.delete(child));
@@ -1408,7 +1448,7 @@ export async function spawnSandboxProcess(
     return child;
   } catch (error) {
     await filter?.close().catch(() => undefined);
-    await launch.cleanup?.().catch(() => undefined);
+    await cleanupSandboxLaunch(launch, error);
     throw error;
   }
 }
@@ -1431,6 +1471,7 @@ export async function executePython(
   const networkAccess = baseNetworkAccess.mode === "none" ? baseNetworkAccess : {
     ...baseNetworkAccess, revision: `${baseNetworkAccess.revision}:execution:${randomUUID()}`,
   };
+  let failure: unknown;
   try {
   if (request.permissionEpoch.mounts.length !== 1
     || request.permissionEpoch.mounts[0]?.source !== "workspace"
@@ -1583,8 +1624,12 @@ export async function executePython(
     startedAt,
     workingDirectory: launch.chdir,
   };
+  } catch (error) {
+    failure = error;
+    throw error;
   } finally {
-    if (networkAccess.mode !== "none") await gateways?.release(networkAccess.revision);
+    if (networkAccess.mode !== "none" && gateways) await cleanupExecutionResource(failure,
+      () => gateways.release(networkAccess.revision), "execution-gateway");
   }
 }
 
@@ -1608,6 +1653,11 @@ export async function executeShell(
   const networkAccess = baseNetworkAccess.mode === "none" ? baseNetworkAccess : {
     ...baseNetworkAccess, revision: `${baseNetworkAccess.revision}:execution:${randomUUID()}`,
   };
+  let failure: unknown;
+  const retainResource = lifecycle?.retainResource;
+  if (retainResource && networkAccess.mode !== "none" && gateways) {
+    retainResource(() => gateways.release(networkAccess.revision), "execution-gateway");
+  }
   try {
   if (request.permissionEpoch.mounts.length !== 1
     || request.permissionEpoch.mounts[0]?.source !== "workspace"
@@ -1655,7 +1705,7 @@ export async function executeShell(
   }
   const npu = await resolveExecutionNpu(config, request.npuDevices,
     async () => await sandboxLaunchProfile(config.bwrapPath));
-  const launch = await prepareSandboxLaunch(config, {
+  const preparedLaunch = await prepareSandboxLaunch(config, {
     npu,
     chdir,
     egress: await prepareSandboxEgress(config.dataDir, networkAccess, gateways, sandbox, request.sandboxEgressProxy),
@@ -1676,6 +1726,8 @@ export async function executeShell(
     workspaceBindArgs: workspaceBinds.args,
     workspaceRoot,
   });
+  if (retainResource && preparedLaunch.cleanup) retainResource(preparedLaunch.cleanup, "sandbox-launch");
+  const launch = retainResource ? { ...preparedLaunch, cleanup: undefined } : preparedLaunch;
   await assertSandboxWorkspaceLinks(config, launch, workspaceRoot, readOnlyWorkspaceRoot, signal);
   const commandArguments = [
     sandboxCommandPath(launch, "/usr/bin/bash", "/bin/bash"),
@@ -1736,8 +1788,12 @@ export async function executeShell(
     startedAt,
     workingDirectory: launch.chdir,
   };
+  } catch (error) {
+    failure = error;
+    throw error;
   } finally {
-    if (networkAccess.mode !== "none") await gateways?.release(networkAccess.revision);
+    if (!retainResource && networkAccess.mode !== "none" && gateways) await cleanupExecutionResource(failure,
+      () => gateways.release(networkAccess.revision), "execution-gateway");
   }
 }
 

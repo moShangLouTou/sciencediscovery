@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
 import { killSandboxProcess, spawnSandboxProcess } from "./executor.js";
+import { captureExecutionBoundaryOutcome } from "./execution-boundary.js";
 
 test("sandbox cancellation kills monitor and descendants before parent-death binding", {
   tags: ["os:linux"],
@@ -125,3 +126,46 @@ test("a direct sandbox whose spawn record fails stops its child and rethrows the
   }
 });
 
+test("a captured real bubblewrap boundary joins its monitor before callback failure surfaces", async () => {
+  const root = await mkdtemp(resolve(tmpdir(), "sandbox-captured-record-"));
+  let started: ChildProcessWithoutNullStreams | undefined;
+  let cleanups = 0;
+  const failure = new Error("synthetic ledger callback failure");
+  try {
+    await assert.rejects(spawnSandboxProcess(
+      { dataDir: root, bwrapPath: process.env.SCIENCE_AGENT_BWRAP_PATH ?? "bwrap", terminationGraceMs: 2_000 },
+      { args: ["--unshare-user", "--unshare-pid", "--die-with-parent", "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev"],
+        commandPrefix: [], chdir: root, env: {}, sandbox: "bubblewrap", cleanup: async () => { cleanups++; } },
+      ["/bin/sh", "-c", "while :; do sleep 1; done"], "baseline", undefined,
+      child => {
+        started = child;
+        assert.ok(child.pid);
+        assert.equal(captureExecutionBoundaryOutcome("captured-record", { pid: child.pid, kind: "pid-namespace", sandbox: "bubblewrap" }).status,
+          "captured", "this test must exercise a real captured namespace");
+        throw failure;
+      },
+    ), error => error === failure);
+    assert.ok(started?.pid);
+    assert.notEqual(started.exitCode ?? started.signalCode, null);
+    assertGone(started.pid);
+    assert.equal(cleanups, 1);
+  } finally {
+    if (started?.pid && started.exitCode === null && started.signalCode === null) killSandboxProcess(started);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a failed spawn and throwing callback own the child error event instead of crashing the Runner", async () => {
+  const root = await mkdtemp(resolve(tmpdir(), "sandbox-missing-executable-"));
+  let cleanups = 0;
+  const failure = new Error("synthetic callback failure after ENOENT");
+  try {
+    await assert.rejects(spawnSandboxProcess(
+      { dataDir: root, bwrapPath: "unused", terminationGraceMs: 2_000 },
+      { args: [], commandPrefix: [], chdir: root, env: {}, sandbox: "none", executable: resolve(root, "missing-executable"),
+        cleanup: async () => { cleanups++; } },
+      [], "baseline", undefined, () => { throw failure; },
+    ), error => error === failure);
+    assert.equal(cleanups, 1);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

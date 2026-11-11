@@ -58,6 +58,8 @@ export interface SpawnedExecution {
  */
 export interface ExecutionLifecycle {
   spawned(execution: SpawnedExecution): void;
+  /** Transfer cleanup to the manager before spawn; release only after proof. */
+  retainResource?(cleanup: () => Promise<void>, label: string): void;
 }
 
 /** Exactly what the Runner persists; unknown fields are rejected on load. */

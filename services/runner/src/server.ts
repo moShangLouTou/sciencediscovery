@@ -1215,6 +1215,7 @@ export async function startRunnerServer(config = loadRunnerConfig()): Promise<Se
   const sandbox = executorSandboxKind(config);
   const logger = createOperationalLogger({ category: "runner", dataDir: config.dataDir, service: "runner" });
   const environmentStore = new EnvironmentStore({
+    executionLedgerPath: resolve(config.dataDir, "runner-executions", "executions.sqlite"),
     allowedChannels: config.scientificAllowedChannels ?? ["conda-forge"],
     enabled: config.scientificEnvsEnabled === true,
     packageCacheDir: config.scientificPackageCacheDir,

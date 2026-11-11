@@ -9,6 +9,7 @@ import { StringDecoder } from "node:string_decoder";
 import { ensureWorkspaceBaseline, fenceWorkspaceExecution, releaseWorkspaceExecutionFence, poisonWorkspace, RefStore, snapshotWorkspace, VersionStore, withWorkspaceLease, withWorkspaceAdmission, type AgentStateRef } from "@sciencediscovery/cas";
 import { assertRecoveryContext, recoveryRelativePath, unknownRecovery } from "@sciencediscovery/schema";
 import { collectExecutionRecovery, validateExecutionRecovery } from "./execution-recovery.js";
+import { cleanupExecutionResource, ProcessTerminationUnverifiedError } from "./termination-resources.js";
 import {
   captureExecutionBoundaryOutcome,
   isValidExecutionBoundaryHandle,
@@ -66,6 +67,8 @@ export interface ExecutionManagerOptions {
    * can supply or redirect a handle.
    */
   captureBoundary?: (executionId: string, spawned: SpawnedExecution) => BoundaryCaptureOutcome;
+  /** Test-only pause after the durable fence, before the final abort check. */
+  afterFence?: () => Promise<void>;
 }
 
 /** The Runner owns process lifetime; an HTTP request only submits or observes it. */
@@ -76,6 +79,8 @@ export class ExecutionManager {
   private readonly runnerInstanceId: string;
   private readonly runnerBootId = randomUUID();
   private readonly captureBoundary: (executionId: string, spawned: SpawnedExecution) => BoundaryCaptureOutcome;
+  private readonly afterFence: (() => Promise<void>) | undefined;
+  private readonly resources = new Map<string, Map<() => Promise<void>, string>>();
   private readonly controllers = new Map<string, AbortController>();
   /** Whether the sandbox of one in-flight execution promised a durable boundary. */
   private readonly boundaryExpectations = new Map<string, "required" | "not-applicable" | "ended">();
@@ -95,6 +100,7 @@ export class ExecutionManager {
   constructor(dataDir: string, private readonly onQuarantine?: (detail: ExecutionQuarantineDiagnostic) => void,
     options: ExecutionManagerOptions = {}) {
     this.captureBoundary = options.captureBoundary ?? captureExecutionBoundaryOutcome;
+    this.afterFence = options.afterFence;
     const root = resolve(dataDir, "runner-executions");
     const ledgerPath = resolve(root, "executions.sqlite");
     const existingLedger = existsSync(ledgerPath);
@@ -134,6 +140,7 @@ export class ExecutionManager {
         CREATE TABLE IF NOT EXISTS execution_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS execution_publications (id TEXT PRIMARY KEY, record TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS execution_boundaries (execution TEXT PRIMARY KEY, record TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS execution_resources (execution TEXT PRIMARY KEY, environment TEXT);
         CREATE TABLE IF NOT EXISTS recovery_store (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), id TEXT NOT NULL);`);
       this.db.exec("BEGIN IMMEDIATE");
       this.db.prepare("INSERT OR IGNORE INTO recovery_store VALUES (1, ?)").run(randomUUID());
@@ -217,6 +224,10 @@ export class ExecutionManager {
     if (!/^[A-Za-z0-9_:.-]{1,160}$/.test(request.executionId)) throw new Error("Invalid Execution ID");
     // Bind the deferred admission and the digest to one immutable request snapshot.
     request = structuredClone(request);
+    if (request.environmentId !== undefined && (typeof request.environmentId !== "string"
+      || request.environmentId.length === 0 || request.environmentId.trim() !== request.environmentId)) {
+      throw new Error("Invalid environment ID");
+    }
     if (request.recoveryContext) assertRecoveryContext(request.recoveryContext);
     if (request.recoveryMetadataPath !== undefined && !recoveryRelativePath(request.recoveryMetadataPath)) throw new Error("UNSAFE_RECOVERY_PATH");
     const owner = { agentId: request.agentId, sessionId: request.permissionEpoch.sessionId };
@@ -274,6 +285,7 @@ export class ExecutionManager {
       return withWorkspaceAdmission(this.versions, key, () => withWorkspaceLease(key, async () => {
       if (!request.explicitHandoff) await ensureWorkspaceBaseline(this.versions, key);
       let changed = false;
+      let resourcesRecorded = false;
       let cursor = 0;
       let retained = 0;
       const decoders = { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") };
@@ -317,9 +329,18 @@ export class ExecutionManager {
         // Cancellation can arrive while recovery validation above was awaited;
         // never launch a command the user already cancelled.
         if (controller.signal.aborted) throw new Error("Execution cancelled before start");
+        // Persist the selected environment before the operation obtains its
+        // runtime reader. Its release is not permission to mutate the prefix:
+        // only the manager's later termination/publication check can give that.
+        try {
+          this.db.prepare("INSERT INTO execution_resources VALUES (?, ?)").run(execution.id, request.environmentId ?? null);
+          resourcesRecorded = true;
+        } catch (error) { this.storageHealthy = false; throw error; }
         await fenceWorkspaceExecution(this.versions, key, this.fenceOwner(execution.id));
+        await this.afterFence?.();
         if (controller.signal.aborted) {
           await releaseWorkspaceExecutionFence(this.versions, key, this.fenceOwner(execution.id));
+          this.db.prepare("DELETE FROM execution_resources WHERE execution = ?").run(execution.id);
           throw new Error("Execution cancelled before start");
         }
         execution.state = "running";
@@ -329,6 +350,9 @@ export class ExecutionManager {
         execution.result = await operation(controller.signal, log, expectedEnvironmentRevisionId, this.lifecycleFor(execution.id));
         execution.state = controller.signal.aborted ? "cancelled" : execution.result.exitCode === 0 && !execution.result.networkDeniedHosts?.length ? "completed" : "failed";
       } catch (error) {
+        if (!changed && resourcesRecorded) {
+          this.db.prepare("DELETE FROM execution_resources WHERE execution = ?").run(execution.id);
+        }
         if ((error as { code?: string }).code === "PROCESS_TERMINATION_UNVERIFIED") {
           // The kill did not join, so a writer may still hold the workspace.
           // Publishing a snapshot or claiming a cancelled exit would both be
@@ -339,6 +363,7 @@ export class ExecutionManager {
           execution.error = error instanceof Error ? error.message : String(error);
           this.quarantine(execution);
           this.save(execution);
+          await this.releaseResources(execution.id, error);
           return;
         }
         execution.state = controller.signal.aborted ? "cancelled" : "failed";
@@ -368,8 +393,10 @@ export class ExecutionManager {
               : "Execution ended, but its recorded process boundary could not be proven empty; state is unverified";
         this.quarantine(execution);
         this.save(execution);
+        await this.releaseResources(execution.id, new ProcessTerminationUnverifiedError(execution.error));
         return;
       }
+      await this.releaseResources(execution.id);
       const endedState = execution.state;
       execution.evidence = { ...this.identity, revision: execution.receipt!.revision, processTerminated: true,
         terminationReason: changed ? controller.signal.aborted ? "cancelled" : execution.result ? "exited" : "operation_rejected_after_join" : "not_started" };
@@ -418,6 +445,7 @@ export class ExecutionManager {
             await refs.commit(this.versions, name, journal.expected, version);
             Object.assign(execution, this.finishPublication(journal));
             await releaseWorkspaceExecutionFence(this.versions, key, this.fenceOwner(execution.id));
+            this.db.prepare("DELETE FROM execution_resources WHERE execution = ?").run(execution.id);
             return;
           } finally { refs.close(); }
         }
@@ -439,6 +467,7 @@ export class ExecutionManager {
       this.save(execution); // before releasing this Workspace queue
       if (changed && execution.evidence?.processTerminated && execution.version) {
         await releaseWorkspaceExecutionFence(this.versions, key, this.fenceOwner(execution.id));
+        this.db.prepare("DELETE FROM execution_resources WHERE execution = ?").run(execution.id);
       }
     }, controller.signal), controller.signal);
     }).then(() => {
@@ -462,7 +491,11 @@ export class ExecutionManager {
       if (!execution.startedAt) execution.evidence = { ...this.identity, revision: execution.receipt!.revision,
         processTerminated: true, terminationReason: "not_started" };
       this.save(execution);
-    }).finally(() => {
+    }).finally(async () => {
+      // A storage failure can bypass the ordinary post-run checks. Preserve
+      // cleanup ownership and its diagnostic rather than dropping callbacks.
+      await this.releaseResources(execution.id, new ProcessTerminationUnverifiedError(
+        "Execution cleanup remains fenced because termination was not durably verified"));
       this.boundaryExpectations.delete(execution.id);
       this.controllers.delete(execution.id);
       if (this.queues.get(key) === work) this.queues.delete(key);
@@ -521,6 +554,11 @@ export class ExecutionManager {
    */
   private lifecycleFor(id: string): ExecutionLifecycle {
     return {
+      retainResource: (cleanup, label) => {
+        let owned = this.resources.get(id);
+        if (!owned) { owned = new Map(); this.resources.set(id, owned); }
+        owned.set(cleanup, label);
+      },
       spawned: (spawned) => {
         const outcome = this.captureBoundary(id, spawned);
         if (outcome.status === "not-applicable" || outcome.status === "ended") {
@@ -546,6 +584,13 @@ export class ExecutionManager {
         }
       },
     };
+  }
+
+  private async releaseResources(id: string, error?: unknown): Promise<void> {
+    const resources = this.resources.get(id);
+    if (!resources) return;
+    this.resources.delete(id);
+    for (const [cleanup, label] of resources) await cleanupExecutionResource(error, cleanup, label);
   }
 
   /**
@@ -785,6 +830,7 @@ export class ExecutionManager {
           this.finishPublication(journal);
         } finally { refs.close(); }
         await releaseWorkspaceExecutionFence(this.versions, completed.workspaceKey, this.fenceOwner(completed.id));
+        this.db.prepare("DELETE FROM execution_resources WHERE execution = ?").run(completed.id);
         // No private CAS lock paths or generic active-marker deletion here. A
         // real crash may leave its write fence: recover the result, but require
         // verified/manual fence recovery before admitting another writer.

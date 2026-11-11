@@ -18,6 +18,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 
 import {
@@ -160,6 +161,32 @@ test("scientific environment lifecycle advances immutable revisions only after s
   assert.ok(store.getRevision(installed.id), "deleting runtime retains past revision metadata");
   assert.deepEqual(await store.snapshotBytes(installed.id), snapshot);
   await assert.rejects(store.withRuntime(task.id, async () => undefined), /Unknown scientific environment/);
+});
+
+test("execution resource fences guard startup starter repairs and fresh bootstrap before provisioner writes", async context => {
+  const { store, root, provisionerPath, executor, commands } = await fixture(context);
+  await store.initialize();
+  await store.setupManagedEnvironments();
+  const ledger = resolve(root, "execution-fences.sqlite");
+  const db = new DatabaseSync(ledger);
+  db.exec("CREATE TABLE executions (id TEXT, record TEXT); CREATE TABLE execution_resources (execution TEXT, environment TEXT)");
+  db.prepare("INSERT INTO executions VALUES (?, ?)").run("legacy", JSON.stringify({ state: "unknown" }));
+  db.close();
+  const before = commands.length;
+  const reloaded = new EnvironmentStore({
+    allowedChannels: ["conda-forge"], enabled: true, provisionerPath,
+    root: resolve(root, "envs"), runnerVersion: "test", executionLedgerPath: ledger,
+  }, executor);
+  await reloaded.initialize();
+  assert.equal(reloaded.setup.state, "failed");
+  assert.equal(commands.length, before, "startup must not repair an environment whose execution is unverified");
+  const fresh = new EnvironmentStore({
+    allowedChannels: ["conda-forge"], enabled: true, provisionerPath,
+    root: resolve(root, "blocked-envs"), runnerVersion: "test", executionLedgerPath: ledger,
+  }, executor);
+  await fresh.initialize();
+  await assert.rejects(fresh.setupManagedEnvironments(), /execution still owns this environment/);
+  assert.equal(commands.length, before, "bootstrap must not create or install over a quarantined environment");
 });
 
 test("scientific environments accept micromamba's package-list envelope", async (context) => {
