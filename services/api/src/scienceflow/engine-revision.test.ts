@@ -270,17 +270,80 @@ test("malformed options are rejected before any Git call", async () => {
 });
 
 test("porcelain parsing separates tracked changes from runnable additions", () => {
+  const record = (...fields: string[]): string =>
+    fields.map((field) => `${field}\0`).join("");
   const parsed = parsePorcelain(
-    [
+    record(
       " M scienceflow/runner.py",
       "?? scienceflow/overlay.py",
       "?? NOTES.md",
-      "R  old.py -> scienceflow/renamed.py",
-      "",
-    ].join("\n"),
+      // A rename carries the original path as a second, unprefixed field.
+      "R  scienceflow/renamed.py",
+      "old.py",
+    ),
   );
   assert.equal(parsed.trackedModified, true);
   assert.equal(parsed.untrackedRunnable, true);
-  assert.equal(parsePorcelain("?? NOTES.md\n").trackedModified, false);
-  assert.equal(parsePorcelain("?? NOTES.md\n").untrackedRunnable, false);
+  assert.equal(
+    parsePorcelain(record("?? NOTES.md")).trackedModified,
+    false,
+  );
+  assert.equal(
+    parsePorcelain(record("?? NOTES.md")).untrackedRunnable,
+    false,
+  );
 });
+
+test("porcelain parsing keeps quoted-looking and multiline names intact", () => {
+  const record = (...fields: string[]): string =>
+    fields.map((field) => `${field}\0`).join("");
+  // -z output is never quoted: a Chinese name, a name containing a newline, and
+  // a name whose characters look like porcelain syntax all arrive verbatim.
+  const parsed = parsePorcelain(
+    record(
+      "?? 科学覆盖.py",
+      "?? line\nbreak.py",
+      "?? stage one.py",
+      "R  new.py",
+      "?? trap.py",
+    ),
+  );
+  assert.equal(parsed.untrackedRunnable, true);
+  // The source path of a rename is a path, never a status record of its own.
+  assert.equal(parsePorcelain(record("R  new.py", "?? trap.py")).untrackedRunnable, false);
+  assert.equal(parsePorcelain(record("R  new.py", "?? trap.py")).trackedModified, true);
+});
+
+test("an untracked source file with a non-ASCII or multiline name is reported", async (t) => {
+  const repo = await repository("round9-rev-quoted", {
+    "scienceflow/runner.py": "def run():\n    return 1\n",
+  });
+  t.after(() => rm(repo.root, { recursive: true, force: true }));
+  await writeFile(join(repo.root, "科学覆盖.py"), "PLANTED = 1\n", "utf8");
+  await writeFile(join(repo.root, "line\nbreak.py"), "PLANTED = 2\n", "utf8");
+  const result = await checkEngineRevision({
+    path: repo.root,
+    expectedRevision: repo.commit,
+  });
+  assert.equal(result.status, "dirty");
+  assert.equal(result.untrackedRunnable, true);
+});
+
+test("a rename is a tracked change and its two NUL fields are not confused", async (t) => {
+  const repo = await repository("round9-rev-rename", {
+    "scienceflow/runner.py": "def run():\n    return 1\n",
+  });
+  t.after(() => rm(repo.root, { recursive: true, force: true }));
+  await writeFile(join(repo.root, "?? trap.py"), "TRAP = 1\n", "utf8");
+  await repo.git("add", "--all");
+  await repo.git("commit", "--quiet", "--message", "fixture rename source");
+  await repo.git("mv", "?? trap.py", "scienceflow/renamed.py");
+  const result = await checkEngineRevision({
+    path: repo.root,
+    expectedRevision: await repo.git("rev-parse", "HEAD"),
+  });
+  assert.equal(result.trackedModified, true);
+  assert.equal(result.untrackedRunnable, false);
+  assert.equal(result.dirty, true);
+});
+

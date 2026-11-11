@@ -174,6 +174,11 @@ export async function checkEngineRevision(
   const status = await run([
     "status",
     "--porcelain=v1",
+    // NUL-terminated records: Git never quotes or escapes a path in -z mode, so
+    // a name with spaces, quotes, non-ASCII bytes, or a newline stays intact.
+    // A newline-separated listing would misparse those and could report an
+    // untracked .py file as clean.
+    "-z",
     "--untracked-files=all",
   ]);
   if (status.kind !== "ok") return unavailableFrom(status);
@@ -203,19 +208,23 @@ interface PorcelainSummary {
 export function parsePorcelain(text: string): PorcelainSummary {
   let trackedModified = false;
   let untrackedRunnable = false;
-  for (const line of text.split("\n")) {
-    if (line.length < 4) continue;
-    // XY<space>PATH; a rename prints "XY ORIG -> NEW".
-    const index = line.slice(0, 2);
-    let path = line.slice(3);
-    const arrow = path.indexOf(" -> ");
-    if (arrow >= 0) path = path.slice(arrow + 4);
+  // -z records: "XY<space>PATH\0"; a rename or copy is followed by the original
+  // path as its own NUL-terminated field. Paths are never quoted, so a filename
+  // with spaces, non-ASCII characters, or a newline arrives verbatim.
+  const fields = text.split("\0");
+  for (let index = 0; index < fields.length; index += 1) {
+    const record = fields[index];
+    if (record === undefined || record.length < 4) continue;
+    const status = record.slice(0, 2);
+    const path = record.slice(3);
     if (path.length === 0) continue;
-    if (index === "??") {
+    if (status === "??") {
       if (isRunnablePath(path)) untrackedRunnable = true;
       continue;
     }
     trackedModified = true;
+    // The second path of a rename/copy is the source, not a separate change.
+    if (status.includes("R") || status.includes("C")) index += 1;
   }
   return { trackedModified, untrackedRunnable };
 }
