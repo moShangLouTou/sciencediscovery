@@ -369,3 +369,5 @@ export function disableUsernsOmittedMessage(bwrapPath: string, capability: Sandb
     + "because the option works by writing user.max_user_namespaces. "
     + `The option is omitted so executions still run. ${consequence}`;
 }
+
+export * from "./linux-process.js";

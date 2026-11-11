@@ -43,9 +43,25 @@
  * states that as unsupported; no test result may be read as a broader promise.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { access, constants, readFile, readdir } from "node:fs/promises";
-import { createWriteStream, readFileSync } from "node:fs";
+import { access, constants } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
 import { isAbsolute } from "node:path";
+
+import {
+  captureProcessIdentitySync,
+  readBootId,
+  readProcessStat,
+  scanSessionMembers,
+  sendSignal,
+  type SessionMember,
+  type SessionScan,
+} from "@sciencediscovery/sandbox-capability";
+
+// The /proc identity rules live in the shared package so the Runner and this
+// prototype cannot drift. Re-exported because this module's contract (and its
+// tests) name it here.
+export { parseProcessStat } from "@sciencediscovery/sandbox-capability";
+export type { ProcessStat, ProcessStatRead, SessionMember, SessionScan } from "@sciencediscovery/sandbox-capability";
 
 import {
   EXECUTION_INSTANCE_SCHEMA_VERSION,
@@ -68,8 +84,6 @@ export const DEFAULT_TERM_GRACE_MS = 3_000;
 export const DEFAULT_KILL_GRACE_MS = 3_000;
 /** Kernel re-read interval while a stop waits. */
 export const DEFAULT_POLL_INTERVAL_MS = 100;
-/** Bound on capturing a just-spawned child's kernel identity. */
-const IDENTITY_CAPTURE_TIMEOUT_MS = 250;
 
 const ENVIRONMENT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
 const MAX_ARGUMENTS = 256;
@@ -238,19 +252,6 @@ export interface ExecutionInstanceBackendOptions {
    * view; production never passes it.
    */
   readonly procRoot?: string;
-}
-
-interface SessionMember {
-  readonly pid: number;
-  readonly processGroupId: number;
-  readonly startTimeTicks: string;
-}
-
-/** A kernel session scan that also says whether absence was proven. */
-interface SessionScan {
-  readonly members: readonly SessionMember[];
-  /** False when the kernel view could not be read completely. */
-  readonly complete: boolean;
 }
 
 interface LaunchedInstance {
@@ -526,7 +527,7 @@ export class ExecutionInstanceBackend {
       }
       // A terminal state for the launched process does not mean the tree is
       // gone: descendants may still live in the recorded session.
-      const initial = await sessionMembers(this.procRoot, identity.sessionId);
+      const initial = await scanSessionMembers(this.procRoot, identity.sessionId);
       if (!initial.complete) {
         return { status: "refused", reason: "identity-unverified" };
       }
@@ -601,7 +602,7 @@ export class ExecutionInstanceBackend {
       }
       // Without a complete kernel view the survivor count is a lower bound, and
       // the stop stays unverified rather than being called stopped.
-      const finalScan = await sessionMembers(this.procRoot, identity.sessionId);
+      const finalScan = await scanSessionMembers(this.procRoot, identity.sessionId);
       const latest = await this.store.read(executionId);
       return {
         status: "unverified",
@@ -993,7 +994,7 @@ export class ExecutionInstanceBackend {
           : "mismatched";
     const processAlive =
       identity === "verified" && stat.status === "ok" && stat.stat.state !== "Z";
-    const scan = await sessionMembers(this.procRoot, record.process.sessionId);
+    const scan = await scanSessionMembers(this.procRoot, record.process.sessionId);
     const groupAlive = scan.members.length > 0;
     if (
       !processAlive &&
@@ -1096,7 +1097,7 @@ export class ExecutionInstanceBackend {
     ) {
       return sendSignal(-process.processGroupId, signal);
     }
-    const scan = await sessionMembers(this.procRoot, process.sessionId);
+    const scan = await scanSessionMembers(this.procRoot, process.sessionId);
     // Without a complete scan the target set is unknown; signal nothing.
     if (!scan.complete) return "unobservable";
     let sent = false;
@@ -1126,7 +1127,7 @@ export class ExecutionInstanceBackend {
   ): Promise<"gone" | "surviving" | "unobservable"> {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
-      const scan = await sessionMembers(this.procRoot, sessionId);
+      const scan = await scanSessionMembers(this.procRoot, sessionId);
       if (scan.complete && scan.members.length === 0) return "gone";
       if (Date.now() >= deadline) {
         return scan.complete ? "surviving" : "unobservable";
@@ -1137,7 +1138,7 @@ export class ExecutionInstanceBackend {
 
   /** True unless the kernel view was read completely and found empty. */
   private async sessionHasMembers(sessionId: number): Promise<boolean> {
-    const scan = await sessionMembers(this.procRoot, sessionId);
+    const scan = await scanSessionMembers(this.procRoot, sessionId);
     return !scan.complete || scan.members.length > 0;
   }
 
@@ -1281,247 +1282,26 @@ type SignalOutcome =
   /** The kernel view could not be read; nothing was signaled on a guess. */
   | "unobservable";
 
-/** What one process.kill() call established. */
-type SignalSendOutcome = "sent" | "gone" | "denied";
-
-function sendSignal(target: number, signal: NodeJS.Signals): SignalSendOutcome {
-  try {
-    process.kill(target, signal);
-    return "sent";
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ESRCH") return "gone";
-    // EPERM or anything unexpected: the signal was not delivered.
-    return "denied";
-  }
-}
-
-interface ProcessStat {
-  readonly state: string;
-  readonly processGroupId: number;
-  readonly sessionId: number;
-  readonly startTimeTicks: string;
-}
-
 /**
- * One /proc/[pid]/stat read. "gone" is a proven absence; "unobservable" only
- * means the kernel view could not be read, and must never be treated as one.
- */
-type ProcessStatRead =
-  | { readonly status: "ok"; readonly stat: ProcessStat }
-  | { readonly status: "gone" }
-  | { readonly status: "unobservable" };
-
-/** errno values that prove the process does not exist at this moment. */
-const PROCESS_GONE_CODES = new Set(["ENOENT", "ESRCH"]);
-
-function isProcessGoneError(error: unknown): boolean {
-  const code = (error as NodeJS.ErrnoException | null | undefined)?.code;
-  return typeof code === "string" && PROCESS_GONE_CODES.has(code);
-}
-
-/** Read /proc/[pid]/stat, distinguishing "absent" from "cannot observe". */
-async function readProcessStat(
-  procRoot: string,
-  pid: number,
-): Promise<ProcessStatRead> {
-  if (!Number.isSafeInteger(pid) || pid <= 0) {
-    return { status: "unobservable" };
-  }
-  let text: string;
-  try {
-    text = await readFile(`${procRoot}/${pid}/stat`, "utf8");
-  } catch (error) {
-    return isProcessGoneError(error)
-      ? { status: "gone" }
-      : { status: "unobservable" };
-  }
-  // A truncated or unexpected line proves nothing about the process.
-  const stat = parseProcessStat(text);
-  return stat === null ? { status: "unobservable" } : { status: "ok", stat };
-}
-
-export function parseProcessStat(text: string): ProcessStat | null {
-  // The command name is parenthesised and may itself contain parentheses and
-  // spaces, so only the last ')' delimits the numeric fields.
-  const close = text.lastIndexOf(")");
-  if (close < 0) return null;
-  const fields = text.slice(close + 1).trim().split(/\s+/);
-  const state = fields[0];
-  const processGroupId = Number(fields[2]);
-  const sessionId = Number(fields[3]);
-  const startTimeTicks = fields[19];
-  if (typeof state !== "string" || state.length === 0) return null;
-  // Kernel threads have no group or session (both 0); that is a real value, not
-  // a malformed line. A process that belongs to this instance always has a
-  // positive id, which the callers that care require separately.
-  if (!Number.isSafeInteger(processGroupId) || processGroupId < 0) return null;
-  if (!Number.isSafeInteger(sessionId) || sessionId < 0) return null;
-  if (typeof startTimeTicks !== "string" || !/^\d+$/.test(startTimeTicks)) {
-    return null;
-  }
-  return { state, processGroupId, sessionId, startTimeTicks };
-}
-
-async function readBootId(procRoot: string): Promise<string | null> {
-  try {
-    return normalizeBootId(
-      await readFile(`${procRoot}/sys/kernel/random/boot_id`, "utf8"),
-    );
-  } catch {
-    return null;
-  }
-}
-
-function normalizeBootId(text: string): string | null {
-  const value = text.trim();
-  return /^[0-9a-f-]{36}$/.test(value) ? value : null;
-}
-
-function normalizeCommandName(text: string): string {
-  const value = text.trim();
-  return value.length > 0 ? value.slice(0, 64) : "unknown";
-}
-
-function parseUid(text: string): number | null {
-  const line = text.split("\n").find((entry) => entry.startsWith("Uid:"));
-  if (!line) return null;
-  const fields = line.slice(4).trim().split(/\s+/);
-  const effective = Number(fields[1]);
-  return Number.isSafeInteger(effective) ? effective : null;
-}
-
-/**
- * Every live process whose kernel session is the one this instance created.
- *
- * `complete: false` means some part of the kernel view could not be read, so an
- * empty member list is not proof that nothing is left. Callers must keep the
- * instance unverified in that case rather than settle it as gone.
- */
-async function sessionMembers(
-  procRoot: string,
-  sessionId: number,
-): Promise<SessionScan> {
-  if (!Number.isSafeInteger(sessionId) || sessionId <= 0) {
-    return { members: [], complete: false };
-  }
-  let entries: string[];
-  try {
-    entries = await readdir(procRoot);
-  } catch {
-    return { members: [], complete: false };
-  }
-  const members: SessionMember[] = [];
-  let complete = true;
-  for (const entry of entries) {
-    if (!/^[0-9]+$/.test(entry)) continue;
-    const pid = Number(entry);
-    const read = await readProcessStat(procRoot, pid);
-    if (read.status === "unobservable") {
-      // Whether this process belongs to the session is unknowable, so absence
-      // of the whole session is unproven.
-      complete = false;
-      continue;
-    }
-    // It exited between readdir() and the read: genuinely absent.
-    if (read.status === "gone") continue;
-    if (read.stat.sessionId !== sessionId) continue;
-    // A zombie still holds the session id but is already dead; it must neither
-    // count as alive nor receive a signal.
-    if (read.stat.state === "Z") continue;
-    members.push({
-      pid,
-      processGroupId: read.stat.processGroupId,
-      startTimeTicks: read.stat.startTimeTicks,
-    });
-  }
-  return { members, complete };
-}
-
-/**
- * Capture the kernel identity of a just-spawned child.
- *
- * Synchronous on purpose: an instance may exit within a millisecond, and an
- * `await` between spawn() and the first /proc read loses that race. The loop
- * also waits until `detached: true` has taken effect, proven by the child's own
- * session id equalling its pid; a pre-setsid read would record the *parent's*
- * session, which must never become a cancellation target.
+ * Capture the kernel identity of a just-spawned child, plus the command name
+ * this prototype records for diagnostics. The identity rules — exact session,
+ * boot id, start time, tri-state absence — live in the shared package so the
+ * Runner cannot grow a second, drifting implementation of them.
  */
 function captureIdentity(
   procRoot: string,
   pid: number,
 ): Omit<ExecutionInstanceProcess, "pid"> | null {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
-  const bootId = readBootIdSync(procRoot);
-  if (bootId === null) return null;
-  const deadline = Date.now() + IDENTITY_CAPTURE_TIMEOUT_MS;
-  for (;;) {
-    const stat = readProcessStatSync(procRoot, pid);
-    if (
-      stat !== null &&
-      stat.state !== "Z" &&
-      stat.sessionId === pid &&
-      stat.processGroupId === pid
-    ) {
-      const uid = readUidSync(procRoot, pid);
-      if (uid !== null) {
-        return {
-          processGroupId: stat.processGroupId,
-          sessionId: stat.sessionId,
-          startTimeTicks: stat.startTimeTicks,
-          bootId,
-          uid,
-          commandName: readCommandNameSync(procRoot, pid),
-        };
-      }
-    }
-    if (Date.now() >= deadline) return null;
-    sleepSync(1);
-  }
-}
-
-function readProcessStatSync(procRoot: string, pid: number): ProcessStat | null {
-  try {
-    return parseProcessStat(readFileSync(`${procRoot}/${pid}/stat`, "utf8"));
-  } catch {
-    return null;
-  }
-}
-
-function readUidSync(procRoot: string, pid: number): number | null {
-  try {
-    return parseUid(readFileSync(`${procRoot}/${pid}/status`, "utf8"));
-  } catch {
-    return null;
-  }
-}
-
-function readCommandNameSync(procRoot: string, pid: number): string {
-  try {
-    return normalizeCommandName(readFileSync(`${procRoot}/${pid}/comm`, "utf8"));
-  } catch {
-    return "unknown";
-  }
-}
-
-function readBootIdSync(procRoot: string): string | null {
-  const cached = bootIdCache.get(procRoot);
-  if (cached !== undefined) return cached;
-  let value: string | null;
-  try {
-    value = normalizeBootId(
-      readFileSync(`${procRoot}/sys/kernel/random/boot_id`, "utf8"),
-    );
-  } catch {
-    value = null;
-  }
-  bootIdCache.set(procRoot, value);
-  return value;
-}
-
-/** Boot id never changes while the host is up; cached per kernel root. */
-const bootIdCache = new Map<string, string | null>();
-
-function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  const captured = captureProcessIdentitySync(procRoot, pid, {
+    commandName: true,
+  });
+  if (captured === null) return null;
+  return {
+    processGroupId: captured.processGroupId,
+    sessionId: captured.sessionId,
+    startTimeTicks: captured.startTimeTicks,
+    bootId: captured.bootId,
+    uid: captured.uid,
+    commandName: captured.commandName ?? "unknown",
+  };
 }
