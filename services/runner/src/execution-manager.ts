@@ -10,12 +10,14 @@ import { ensureWorkspaceBaseline, poisonWorkspace, RefStore, snapshotWorkspace, 
 import { assertRecoveryContext, recoveryRelativePath, unknownRecovery } from "@sciencediscovery/schema";
 import { collectExecutionRecovery, validateExecutionRecovery } from "./execution-recovery.js";
 import {
-  captureExecutionBoundary,
+  captureExecutionBoundaryOutcome,
   isValidExecutionBoundaryHandle,
   observeExecutionBoundary,
   terminateExecutionBoundary,
+  type BoundaryCaptureOutcome,
   type ExecutionBoundaryHandle,
   type ExecutionLifecycle,
+  type SpawnedExecution,
 } from "./execution-boundary.js";
 import type { ExecutionLogPage, ExecutionOwner, ManagedExecution, ShellExecutionRequest, ShellExecutionResult } from "@sciencediscovery/schema";
 
@@ -57,6 +59,15 @@ export interface ExecutionQuarantineDiagnostic {
   npuDevices?: number[];
 }
 
+export interface ExecutionManagerOptions {
+  /**
+   * Test seam for the kernel identity read that must happen inside the spawn
+   * turn. Production leaves it unset and reads /proc directly; no request field
+   * can supply or redirect a handle.
+   */
+  captureBoundary?: (executionId: string, spawned: SpawnedExecution) => BoundaryCaptureOutcome;
+}
+
 /** The Runner owns process lifetime; an HTTP request only submits or observes it. */
 export class ExecutionManager {
   private readonly db: DatabaseSync;
@@ -64,7 +75,10 @@ export class ExecutionManager {
   private readonly versions: VersionStore;
   private readonly runnerInstanceId: string;
   private readonly runnerBootId = randomUUID();
+  private readonly captureBoundary: (executionId: string, spawned: SpawnedExecution) => BoundaryCaptureOutcome;
   private readonly controllers = new Map<string, AbortController>();
+  /** Whether the sandbox of one in-flight execution promised a durable boundary. */
+  private readonly boundaryExpectations = new Map<string, "required" | "not-applicable" | "ended">();
   private readonly queues = new Map<string, Promise<void>>();
   private readonly failedWorkspaces = new Set<string>();
   private readonly uncertainWorkspaces = new Set<string>();
@@ -78,7 +92,9 @@ export class ExecutionManager {
   private recovery: Promise<void> = Promise.resolve();
   private readonly recoveryStoreId: string;
 
-  constructor(dataDir: string, private readonly onQuarantine?: (detail: ExecutionQuarantineDiagnostic) => void) {
+  constructor(dataDir: string, private readonly onQuarantine?: (detail: ExecutionQuarantineDiagnostic) => void,
+    options: ExecutionManagerOptions = {}) {
+    this.captureBoundary = options.captureBoundary ?? captureExecutionBoundaryOutcome;
     const root = resolve(dataDir, "runner-executions");
     const ledgerPath = resolve(root, "executions.sqlite");
     const existingLedger = existsSync(ledgerPath);
@@ -328,7 +344,21 @@ export class ExecutionManager {
       if (changed && !(await this.boundaryTerminationAfterRun(execution))) {
         execution.state = "unknown";
         delete execution.finishedAt;
-        execution.error = "Execution ended, but its recorded process boundary could not be proven empty; state is unverified";
+        // The command may have returned, but its process tree was not proven
+        // gone. Keeping its result would let an observer read an outcome the
+        // Runner cannot vouch for; the retained logs still carry the output.
+        delete execution.result;
+        const reason = execution.boundary?.reason;
+        // Name what was actually missing: a sandbox that promised an identity
+        // but produced none is a different defect from one whose namespace the
+        // kernel refused to verify, and both differ from a live leftover.
+        execution.error = reason === "no-handle"
+          ? "Execution ended, but the sandbox process identity was never recorded; its process state is unverified"
+          : reason === "handle-invalid"
+            ? "Execution ended, but its recorded process identity is corrupt; its process state is unverified"
+            : reason === "namespace-unverified"
+              ? "Execution ended, but the recorded process namespace is empty and cannot be verified; its process state is unverified"
+              : "Execution ended, but its recorded process boundary could not be proven empty; state is unverified";
         this.quarantine(execution);
         this.save(execution);
         return;
@@ -422,6 +452,7 @@ export class ExecutionManager {
         processTerminated: true, terminationReason: "not_started" };
       this.save(execution);
     }).finally(() => {
+      this.boundaryExpectations.delete(execution.id);
       this.controllers.delete(execution.id);
       if (this.queues.get(key) === work) this.queues.delete(key);
     });
@@ -471,15 +502,30 @@ export class ExecutionManager {
    * Persist the just-spawned monitor's identity. Called synchronously from the
    * executor's spawn turn, so no other event can run between the kernel
    * creating the process and this row being written.
+   *
+   * The callback also records whether this execution promised a durable
+   * boundary, and throws when a promise was made but could not be kept. That
+   * throws inside the spawn call on purpose: the executor still holds the child
+   * and must terminate it before the execution may settle.
    */
   private lifecycleFor(id: string): ExecutionLifecycle {
     return {
       spawned: (spawned) => {
-        const handle = captureExecutionBoundary(id, spawned);
-        if (handle === null) return;
+        const outcome = this.captureBoundary(id, spawned);
+        if (outcome.status === "not-applicable" || outcome.status === "ended") {
+          this.boundaryExpectations.set(id, outcome.status);
+          return;
+        }
+        this.boundaryExpectations.set(id, "required");
+        if (outcome.status !== "captured") {
+          // The sandbox runs, but its identity was never read. It cannot be
+          // observed, stopped, or proven ended later, so it must not be left
+          // running under a record that will claim a verified termination.
+          throw new Error(`Execution boundary identity is unavailable (${outcome.reason}); the started sandbox cannot be supervised`);
+        }
         try {
           this.db.prepare("INSERT INTO execution_boundaries VALUES (?, ?) ON CONFLICT(execution) DO UPDATE SET record = excluded.record")
-            .run(id, JSON.stringify(handle));
+            .run(id, JSON.stringify(outcome.handle));
         } catch (error) {
           // Losing the identity row does not lose the process; it loses the
           // ability to prove anything about it later. Admission must stop
@@ -493,15 +539,40 @@ export class ExecutionManager {
 
   /**
    * Prove the boundary empty after the operation reported the command joined.
-   * Returns true when no verifiable claim exists (nothing was recorded, or the
-   * sandbox never exposed a namespace); false only when a recorded namespace
-   * still has members or cannot be read, which must fence the workspace.
+   *
+   * Returns true only when no durable boundary was required (an unsupported
+   * sandbox keeps its existing semantics, and a sandbox that had already ended
+   * in its spawn turn left nothing behind). Every other shape — no handle where
+   * one was required, a corrupt row, an empty namespace list, or a namespace
+   * that still has members or cannot be read — fails closed so the caller
+   * fences the workspace instead of publishing over a possible live writer.
    */
   private async boundaryTerminationAfterRun(execution: ManagedExecution): Promise<boolean> {
-    const handle = this.loadBoundary(execution.id);
-    if (handle === undefined || handle === "invalid" || handle.namespaces.length === 0) return true;
+    const expectation = this.boundaryExpectations.get(execution.id);
+    this.boundaryExpectations.delete(execution.id);
     const stopRequestedAt = execution.boundary?.stopRequestedAt;
     const stop = stopRequestedAt ? { stopRequestedAt } : {};
+    const handle = this.loadBoundary(execution.id);
+    if (handle === "invalid") {
+      execution.boundary = { observedAt: new Date().toISOString(), state: "unverifiable",
+        terminationConfirmed: false, reason: "handle-invalid", ...stop };
+      return false;
+    }
+    if (handle === undefined) {
+      if (expectation !== "required") return true;
+      // This sandbox promised an identity and none was persisted. The process
+      // tree was started and is now unowned; the record must stay unverified.
+      execution.boundary = { observedAt: new Date().toISOString(), state: "not-recorded",
+        terminationConfirmed: false, reason: "no-handle", ...stop };
+      return false;
+    }
+    if (handle.namespaces.length === 0) {
+      // Observation already calls this namespace-unverified, and a valid
+      // capture never produces an empty list. It can only come from a
+      // corrupted or edited row, so it is never proof of termination.
+      execution.boundary = observeExecutionBoundary(handle, stop);
+      return false;
+    }
     // Kernel teardown of a PID namespace is complete once its init exits, but
     // the monitor's own close can be delivered a tick later: re-read within a
     // small bound instead of quarantining a correct record.

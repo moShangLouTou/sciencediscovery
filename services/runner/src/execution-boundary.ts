@@ -27,6 +27,7 @@ import {
   readBootIdSync,
   readPidNamespaceSync,
   readProcessStat,
+  readProcessStatSync,
   scanNamespaceMembers,
   scanNamespaceMembersSync,
   sendSignal,
@@ -99,6 +100,75 @@ export function isValidExecutionBoundaryHandle(value: unknown): value is Executi
 }
 
 /**
+ * What the kernel said about a just-spawned sandbox in the spawn turn.
+ *
+ * The distinction that matters: a sandbox which should have a durable boundary
+ * but produced none is not the same thing as a platform that never had one. The
+ * former is an unowned process tree and must fail closed; the latter keeps the
+ * execution's existing (non-boundary) semantics.
+ */
+export type BoundaryCaptureOutcome =
+  | { status: "captured"; handle: ExecutionBoundaryHandle }
+  | { status: "not-applicable" }
+  | { status: "ended" }
+  | { status: "unavailable"; reason: "identity-unreadable" | "namespace-unobserved" };
+
+/**
+ * Capture the boundary of a process the executor just spawned, keeping the
+ * reason when no handle can be produced.
+ *
+ * `ended` means the monitor itself was already gone (or its pid already named
+ * another process), so nothing it started can still be inside its namespace:
+ * bubblewrap does not outlive its namespace init, and the kernel tears the
+ * namespace down with that init. `unavailable` means the process may still be
+ * alive but the kernel view could not prove its identity or namespace; callers
+ * must not treat that as a boundary.
+ */
+export function captureExecutionBoundaryOutcome(
+  executionId: string,
+  spawned: SpawnedExecution,
+  procRoot: string = DEFAULT_PROC_ROOT,
+): BoundaryCaptureOutcome {
+  if (spawned.kind !== "pid-namespace" || spawned.sandbox !== "bubblewrap") {
+    return { status: "not-applicable" };
+  }
+  const captured = captureSandboxBoundarySync(procRoot, spawned.pid);
+  if (captured === null) {
+    const current = readProcessStatSync(procRoot, spawned.pid);
+    return current.status === "gone" || (current.status === "ok" && current.stat.state === "Z")
+      ? { status: "ended" }
+      : { status: "unavailable", reason: "identity-unreadable" };
+  }
+  if (captured.namespaces.length === 0) {
+    const current = readProcessStatSync(procRoot, spawned.pid);
+    if (current.status === "gone" || (current.status === "ok" && (current.stat.state === "Z"
+      || current.stat.startTimeTicks !== captured.identity.startTimeTicks))) {
+      return { status: "ended" };
+    }
+    // The monitor is still this process but no sandbox namespace was observed
+    // within the capture budget: the bound of its tree is unknown.
+    return { status: "unavailable", reason: "namespace-unobserved" };
+  }
+  return {
+    status: "captured",
+    handle: {
+      schemaVersion: EXECUTION_BOUNDARY_SCHEMA_VERSION,
+      kind: "pid-namespace",
+      executionId,
+      sandbox: "bubblewrap",
+      bootId: captured.identity.bootId,
+      pid: spawned.pid,
+      startTimeTicks: captured.identity.startTimeTicks,
+      processGroupId: captured.identity.processGroupId,
+      sessionId: captured.identity.sessionId,
+      uid: captured.identity.uid,
+      namespaces: captured.namespaces,
+      capturedAt: new Date().toISOString(),
+    },
+  };
+}
+
+/**
  * Capture the boundary of a process the executor just spawned.
  *
  * Returns null when the kernel view cannot name the identity or the boot
@@ -112,23 +182,8 @@ export function captureExecutionBoundary(
   spawned: SpawnedExecution,
   procRoot: string = DEFAULT_PROC_ROOT,
 ): ExecutionBoundaryHandle | null {
-  if (spawned.kind !== "pid-namespace" || spawned.sandbox !== "bubblewrap") return null;
-  const captured = captureSandboxBoundarySync(procRoot, spawned.pid);
-  if (captured === null) return null;
-  return {
-    schemaVersion: EXECUTION_BOUNDARY_SCHEMA_VERSION,
-    kind: "pid-namespace",
-    executionId,
-    sandbox: "bubblewrap",
-    bootId: captured.identity.bootId,
-    pid: spawned.pid,
-    startTimeTicks: captured.identity.startTimeTicks,
-    processGroupId: captured.identity.processGroupId,
-    sessionId: captured.identity.sessionId,
-    uid: captured.identity.uid,
-    namespaces: captured.namespaces,
-    capturedAt: new Date().toISOString(),
-  };
+  const outcome = captureExecutionBoundaryOutcome(executionId, spawned, procRoot);
+  return outcome.status === "captured" ? outcome.handle : null;
 }
 
 /** The namespace this Runner itself lives in, or null when it cannot be read. */

@@ -16,7 +16,7 @@ import { DatabaseSync } from "node:sqlite";
 import { RefStore, VersionStore, withWorkspaceMutation, withWorkspaceRetirement, workspaceHeadName } from "@sciencediscovery/cas";
 import type { ExecutionOwner, ShellExecutionRequest, ShellExecutionResult } from "@sciencediscovery/schema";
 import { executionDigestVectors } from "../../../test/support/execution-digest-vectors.js";
-import { ExecutionManager, ExecutionManagerError, type ExecutionQuarantineDiagnostic } from "./execution-manager.js";
+import { ExecutionManager, ExecutionManagerError, type ExecutionManagerOptions, type ExecutionQuarantineDiagnostic } from "./execution-manager.js";
 import { EXECUTION_BOUNDARY_SCHEMA_VERSION, type ExecutionBoundaryHandle } from "./execution-boundary.js";
 import { sendSignal } from "@sciencediscovery/sandbox-capability";
 import { ProcessTerminationUnverifiedError } from "./executor.js";
@@ -39,11 +39,11 @@ async function until(check: () => boolean, timeoutMs = 5_000): Promise<void> {
     await new Promise((done) => setTimeout(done, 5));
   }
 }
-async function fixture(context: { after: (fn: () => Promise<void>) => void }) {
+async function fixture(context: { after: (fn: () => Promise<void>) => void }, options?: ExecutionManagerOptions) {
   const root = await mkdtemp(resolve(tmpdir(), "execution-manager-"));
   const workspace = resolve(root, "workspace");
   await mkdir(workspace);
-  const manager = new ExecutionManager(root);
+  const manager = new ExecutionManager(root, undefined, options);
   context.after(async () => { await manager.close(); await rm(root, { recursive: true, force: true }); });
   return { root, workspace, manager };
 }
@@ -946,4 +946,135 @@ test("a corrupt or foreign boundary row fails closed instead of being repaired",
         { code: "EXECUTION_RESOURCE_QUARANTINED" });
     }
   } finally { await manager.close(); }
+});
+
+test("a sandbox that promised a boundary but never yielded one stays unknown and fenced", async context => {
+  const { manager, workspace } = await fixture(context);
+  // A live host process that is not a PID namespace init: its identity may be
+  // readable, but no sandbox namespace exists to bound. That is exactly the
+  // shape a capture can fail in, and it must not degrade into the legacy
+  // "nothing was recorded, so nothing can be wrong" pass.
+  const bare = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+  context.after(async () => {
+    if (bare.exitCode === null && bare.signalCode === null) {
+      try { bare.kill("SIGKILL"); } catch { /* already gone */ }
+      await once(bare, "exit").catch(() => undefined);
+    }
+  });
+  manager.start(request(workspace, "uncaptured"), async (_signal, _log, _revision, lifecycle) => {
+    assert.ok(lifecycle, "a managed execution always receives a lifecycle");
+    assert.ok(bare.pid);
+    lifecycle.spawned({ pid: bare.pid, kind: "pid-namespace", sandbox: "bubblewrap" });
+    return result("uncaptured");
+  });
+  await until(() => manager.get("uncaptured", owner).state === "unknown");
+  const record = manager.get("uncaptured", owner);
+  assert.match(record.error!, /process identity was never recorded/);
+  assert.deepEqual({ ...record.boundary, observedAt: undefined },
+    { observedAt: undefined, state: "not-recorded", terminationConfirmed: false, reason: "no-handle" });
+  assert.equal(record.evidence, undefined, "no exit evidence is invented for an unverified sandbox");
+  assert.equal(record.result, undefined, "no result is published over a possibly live writer");
+  assert.equal(record.version, undefined);
+  assert.throws(() => manager.start(request(workspace, "behind"), async () => assert.fail("queued work launched into a fenced workspace")),
+    { code: "EXECUTION_RESOURCE_QUARANTINED" });
+});
+
+test("a recorded handle with an empty namespace list is never accepted as termination", async context => {
+  const { manager, workspace } = await fixture(context, {
+    captureBoundary: (executionId) => ({ status: "captured",
+      handle: JSON.parse(boundaryRow(executionId, { namespaces: [] })) as ExecutionBoundaryHandle }),
+  });
+  manager.start(request(workspace, "empty-namespace"), async (_signal, _log, _revision, lifecycle) => {
+    assert.ok(lifecycle, "a managed execution always receives a lifecycle");
+    lifecycle.spawned({ pid: ABSENT_PID, kind: "pid-namespace", sandbox: "bubblewrap" });
+    return result("empty-namespace");
+  });
+  await until(() => manager.get("empty-namespace", owner).state === "unknown");
+  const record = manager.get("empty-namespace", owner);
+  // Persisted as-is by the spawn turn; only the after-run check may refuse it,
+  // and it must refuse rather than let the observation path pass.
+  assert.equal(record.boundary?.state, "unverifiable");
+  assert.equal(record.boundary?.reason, "namespace-unverified");
+  assert.equal(record.boundary?.terminationConfirmed, false);
+  assert.match(record.error!, /namespace is empty and cannot be verified/);
+  assert.equal(record.result, undefined);
+  assert.equal(record.evidence, undefined);
+  assert.throws(() => manager.start(request(workspace, "behind"), async () => assert.fail("fence released")),
+    { code: "EXECUTION_RESOURCE_QUARANTINED" });
+});
+
+test("a corrupt boundary row written after capture fails the after-run check", async context => {
+  const { manager, workspace, root } = await fixture(context, {
+    captureBoundary: (executionId) => ({ status: "captured",
+      handle: JSON.parse(boundaryRow(executionId)) as ExecutionBoundaryHandle }),
+  });
+  const db = new DatabaseSync(resolve(root, "runner-executions", "executions.sqlite"));
+  try {
+    // Simulate an edit or partial write after the Runner recorded a good row:
+    // the row now exists but cannot be trusted, which is not the same thing as
+    // a platform that never had one.
+    db.exec(`CREATE TRIGGER corrupt_boundary AFTER INSERT ON execution_boundaries
+      BEGIN UPDATE execution_boundaries SET record = '{not-json' WHERE execution = NEW.execution; END;`);
+  } finally { db.close(); }
+  manager.start(request(workspace, "corrupt-after-run"), async (_signal, _log, _revision, lifecycle) => {
+    assert.ok(lifecycle, "a managed execution always receives a lifecycle");
+    lifecycle.spawned({ pid: ABSENT_PID, kind: "pid-namespace", sandbox: "bubblewrap" });
+    return result("corrupt-after-run");
+  });
+  await until(() => manager.get("corrupt-after-run", owner).state === "unknown");
+  const record = manager.get("corrupt-after-run", owner);
+  assert.equal(record.boundary?.reason, "handle-invalid");
+  assert.equal(record.boundary?.terminationConfirmed, false);
+  assert.match(record.error!, /process identity is corrupt/);
+  assert.equal(record.result, undefined);
+  assert.throws(() => manager.start(request(workspace, "behind"), async () => assert.fail("fence released")),
+    { code: "EXECUTION_RESOURCE_QUARANTINED" });
+});
+
+test("a boundary row the ledger refuses to persist stops admission instead of running unsupervised", async context => {
+  const { manager, workspace, root } = await fixture(context, {
+    captureBoundary: (executionId) => ({ status: "captured",
+      handle: JSON.parse(boundaryRow(executionId)) as ExecutionBoundaryHandle }),
+  });
+  const db = new DatabaseSync(resolve(root, "runner-executions", "executions.sqlite"));
+  try {
+    db.exec(`CREATE TRIGGER reject_boundary BEFORE INSERT ON execution_boundaries
+      BEGIN SELECT RAISE(ABORT, 'injected boundary write failure'); END;`);
+  } finally { db.close(); }
+  manager.start(request(workspace, "unpersisted"), async (_signal, _log, _revision, lifecycle) => {
+    assert.ok(lifecycle, "a managed execution always receives a lifecycle");
+    lifecycle.spawned({ pid: ABSENT_PID, kind: "pid-namespace", sandbox: "bubblewrap" });
+    return result("unpersisted");
+  });
+  await until(() => manager.get("unpersisted", owner).state === "unknown");
+  const record = manager.get("unpersisted", owner);
+  assert.equal(record.boundary?.reason, "no-handle", "the identity that could not be stored is not claimed as recorded");
+  assert.equal(record.evidence, undefined);
+  assert.equal(record.result, undefined);
+  // The row that could not be written also means nothing later can be fenced
+  // by identity, so the ledger stops taking work instead of guessing.
+  assert.throws(() => manager.start(request(workspace, "after-storage-failure"), async () => result("after")),
+    { code: "EXECUTION_LEDGER_UNAVAILABLE" });
+});
+
+test("a sandbox that ended in its spawn turn is not quarantined for a boundary it cannot have", async context => {
+  const { manager, workspace, root } = await fixture(context, {
+    captureBoundary: () => ({ status: "ended" }),
+  });
+  manager.start(request(workspace, "ended-at-spawn"), async (_signal, _log, _revision, lifecycle) => {
+    assert.ok(lifecycle, "a managed execution always receives a lifecycle");
+    lifecycle.spawned({ pid: ABSENT_PID, kind: "pid-namespace", sandbox: "bubblewrap" });
+    return result("ended-at-spawn");
+  });
+  await until(() => manager.get("ended-at-spawn", owner).state === "completed");
+  const record = manager.get("ended-at-spawn", owner);
+  assert.equal(record.result?.stdout, "done");
+  assert.equal(record.evidence?.processTerminated, true);
+  assert.equal(record.boundary, undefined, "nothing remained to observe");
+  const db = new DatabaseSync(resolve(root, "runner-executions", "executions.sqlite"));
+  try {
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM execution_boundaries").get()!.n, 0);
+  } finally { db.close(); }
+  manager.start(request(workspace, "after-ended"), async () => result("after-ended"));
+  await until(() => manager.get("after-ended", owner).state === "completed");
 });

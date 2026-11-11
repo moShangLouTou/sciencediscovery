@@ -16,6 +16,7 @@ import {
   EXECUTION_BOUNDARY_SCHEMA_VERSION,
   boundaryTerminationVerified,
   captureExecutionBoundary,
+  captureExecutionBoundaryOutcome,
   isValidExecutionBoundaryHandle,
   observeExecutionBoundary,
   terminateExecutionBoundary,
@@ -142,6 +143,37 @@ test("capture records the monitor identity and only bubblewrap namespaces", asyn
   // group would signal the parent that created it.
   await writeProcess(root, 502, { parentPid: ownPid, namespace: 1, sessionId: ownPid, processGroupId: ownPid });
   assert.equal(captureExecutionBoundary("execution", { pid: 502, kind: "pid-namespace", sandbox: "bubblewrap" }, root), null);
+});
+
+test("capture distinguishes a platform without a boundary from a sandbox that lost it", async context => {
+  const bubblewrap: SpawnedExecution = { pid: 500, kind: "pid-namespace", sandbox: "bubblewrap" };
+  // No durable boundary was ever promised on these paths; they keep their
+  // existing semantics.
+  assert.deepEqual(captureExecutionBoundaryOutcome("execution", { pid: 500, kind: "process", sandbox: "none" }), { status: "not-applicable" });
+  assert.deepEqual(captureExecutionBoundaryOutcome("execution", { pid: 500, kind: "pid-namespace", sandbox: "seatbelt" }), { status: "not-applicable" });
+
+  const root = await procFixture(context);
+  await writeProcess(root, process.pid, { namespace: 1, startTimeTicks: "1" });
+  // Gone before the identity read: nothing it started outlives it.
+  assert.deepEqual(captureExecutionBoundaryOutcome("execution", { ...bubblewrap, pid: 600 }, root), { status: "ended" });
+  await writeProcess(root, 601, { state: "Z" });
+  assert.deepEqual(captureExecutionBoundaryOutcome("execution", { ...bubblewrap, pid: 601 }, root), { status: "ended" },
+    "a reaped monitor whose pid already names a zombie is ended, not captured");
+  // Alive, but its session/group prove it is not the init the Runner spawned.
+  await writeProcess(root, 602, { sessionId: 1, processGroupId: 1 });
+  assert.deepEqual(captureExecutionBoundaryOutcome("execution", { ...bubblewrap, pid: 602 }, root),
+    { status: "unavailable", reason: "identity-unreadable" });
+  // Identity read, but the sandbox namespace was never observed. This is the
+  // case that must not be mistaken for "this platform has no boundary".
+  const unreadableSelf = await procFixture(context);
+  await writeProcess(unreadableSelf, 700);
+  assert.deepEqual(captureExecutionBoundaryOutcome("execution", { ...bubblewrap, pid: 700 }, unreadableSelf),
+    { status: "unavailable", reason: "namespace-unobserved" });
+  // The ordinary case: identity plus a namespace other than the Runner's own.
+  await writeProcess(root, 500, { parentPid: process.pid, namespace: 2 });
+  const captured = captureExecutionBoundaryOutcome("execution", bubblewrap, root);
+  assert.equal(captured.status, "captured");
+  assert.equal(captured.status === "captured" && captured.handle.namespaces[0], "pid:[2]");
 });
 
 test("observation never turns an unreadable or absent handle into absence", async context => {
