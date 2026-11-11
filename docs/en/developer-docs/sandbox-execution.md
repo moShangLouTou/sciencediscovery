@@ -9,6 +9,7 @@ Runner is a rootless executor. Ordinary Agent execution uses `run_shell`, includ
 | `server.ts` | Routes, bearer/HMAC auth, Workspace admission and execution queue, startup preflight |
 | `executor.ts` | Ephemeral Bubblewrap construction, quota/timeout, workspace snapshots |
 | `execution-manager.ts` | Managed Shell lifetime, status/logs/cancel and committed Workspace receipts |
+| `execution-boundary.ts` | Durable per-execution process identity: capture, observation, and kernel-verified termination |
 | `kernel-manager.ts`, `shell-session-manager.ts`, `session-env-profile.ts` | Legacy internal primitives; HTTP execution no longer starts persistent workers or injects saved profiles |
 | `environment-store.ts` | micromamba catalog, in-place named environments and revision records |
 | `npu-broker.ts` | Optional Host NPU Broker that starts allowlisted host NPU workloads under Runner control |
@@ -225,6 +226,31 @@ HTTP `/execute`, `/execute-shell` and `/shell-executions` reject `kernelMode=per
 A resident interpreter could otherwise leave a thread or subprocess writing after a call returned and the Workspace lease was released. On Linux, ephemeral executions end their Bubblewrap PID namespace before the final snapshot and lease release. A managed background Execution instead retains ownership while its workload runs; it is not a reusable interactive Shell.
 
 Historical Session profiles are not injected. Select cwd and environment on every call; put required exports and commands in the same script. Python/R memory is not retained between calls. Notebook-style shared memory is outside this implementation.
+
+### 7.1 Durable process boundary and Runner restart
+
+A Runner that is killed mid-execution used to leave work nothing could later observe or stop. Every managed execution now records a **Runner-private boundary** in the execution ledger, written in the executor's spawn turn before any `await` so the kernel view is captured while the pid provably still names the process that was just created:
+
+- boot id, host pid, `/proc/[pid]/stat` start time, process group, session and uid of the sandbox monitor;
+- every PID namespace (`pid:[n]`) the sandbox exposed.
+
+The handle is never returned in a request or a DTO and cannot be supplied by a client: it is read only from the ledger. The client sees the additive, host-free `boundary` status on a managed execution instead — `state`, `terminationConfirmed`, `stopRequestedAt`, and a `reason` when nothing could be proven.
+
+Bubblewrap unshares PID, so the workload lives in its own PID namespace with bubblewrap as its init, and `--die-with-parent` ties that init to the Runner. When the Runner process dies, the kernel ends the namespace, including a descendant that called `setsid()` — it left the group and session, not the namespace. `/health` reports this per Runner in `capabilities.executionBoundary`, derived from the sandbox the host actually has rather than from a configuration switch, and `executionRecoveryVersion` is now `2`.
+
+On startup the Runner re-observes executions a previous process left `unknown`. It verifies the recorded boot, start time and boundary in that order and only then reports. It never marks an execution running because a pid exists, never marks one completed or stopped because observation failed, and never resumes or replays anything. A missing, corrupt, foreign, unreadable or namespace-unverifiable handle is reported (`not-recorded`, `unverifiable`, `boot-changed`) and stays fenced. A handle naming the Runner's own PID namespace is refused before anything else happens: that can only come from a corrupted ledger, and honouring it would turn a cancel into a host-wide kill.
+
+Cancelling such an execution persists the stop intent first, then acts:
+
+1. No trustworthy handle — persist the intent and return `409 EXECUTION_BOUNDARY_UNAVAILABLE`. Nothing is signaled and nothing is released.
+2. Otherwise send `SIGTERM` to the monitor only while its pid and start time still match the record, then escalate to `SIGKILL` for the monitor and for every remaining namespace member, re-reading each member's start time so a recycled pid is never hit.
+3. Termination is confirmed only by a complete scan that finds the namespace empty. Otherwise the call returns `409 EXECUTION_TERMINATION_UNVERIFIED` and the quarantine stays.
+
+A confirmed stop still leaves the execution `unknown`: no exit status was ever observed, so `exitCode` stays unknown and no result is published. Repeating the cancel is idempotent — it reports the same proof and signals nothing new. Workspace and device quarantine is released only by the existing publication and workspace recovery paths, never by observation or by a failed stop. A normal execution is verified the same way after its command joins: if a recorded namespace cannot be proven empty, the record becomes `unknown` and the workspace is fenced instead of publishing a snapshot over a possible live writer.
+
+Namespace scans report completeness, not just a member list. An empty result is trusted only when every pid was readable, or provably outside the boundary: a different uid, or a single `NSpid` value meaning the process shares the Runner's own PID namespace. On a normal multi-user host `readlink /proc/<pid>/ns/pid` is refused (`EACCES`, `PTRACE_MODE_READ`) for root-owned and cross-user-namespace processes; without that exclusion an empty scan would always look unproven and cancellation could never be confirmed.
+
+Ledgers written before this change have no handle. Those executions keep their state and quarantine, report `not-recorded`, and cannot be cancelled through this path; they are not migrated or inferred. On a host without a usable Bubblewrap sandbox (including non-Linux), the capability reports `handle: "none"` and `reconnect: "unsupported"`, existing execution semantics are unchanged, and no simulated success is reported.
 
 ## 8. Real-model Runner recovery E2E
 

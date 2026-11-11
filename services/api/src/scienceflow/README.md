@@ -640,13 +640,16 @@ this feature can start a research run.
 
 The Runner (`services/runner/src/executor.ts`, `execution-recovery.ts`,
 `platform/posix.ts`, `packages/executor`) was read first and remains the intended
-host for real execution. For this round it cannot carry the required lifecycle:
-its abort controllers are in-memory (a restart leaves non-terminal executions
-`unknown` with no handle), its cancellation terminates the direct child except
-for tracked bubblewrap groups, and its start path is bound to workspace
-admission, leases, bash code text, and CAS publication — none of which belongs in
-a control-plane capability query or in an instance that must be stoppable by a
-different process.
+host for real execution. At the time of round 9 it could not carry the required
+lifecycle: its abort controllers were in-memory (a restart left non-terminal
+executions `unknown` with no handle), its cancellation terminated the direct
+child except for tracked bubblewrap groups, and its start path is bound to
+workspace admission, leases, bash code text, and CAS publication — none of which
+belongs in a control-plane capability query or in an instance that must be
+stoppable by a different process. Round 10 closed the first two gaps for the
+Runner's own managed executions (see below); the adapter stays narrow for the
+remaining reason: its unit of execution is a trusted launch specification with
+its own durable record, not a Workspace-admitted bash line.
 
 `ExecutionInstanceBackend` is therefore a deliberately narrow adapter for
 explicitly configured Linux standalone execution. It is built by a trusted
@@ -771,6 +774,28 @@ No research-start route, no real `start_run`, no engine installation, no model,
 GPU, or evaluator execution, no `control.json` write, no budget enforcement, no
 event import, and no change to any existing plan, registration, or snapshot
 behavior.
+
+### Round 10: the Runner's own durable execution boundary
+
+The prototype's restart question was answered in the Runner instead of by
+widening this adapter. Every Runner-managed execution now persists a private
+boundary — boot id, monitor pid and start time, uid, and the sandbox's PID
+namespace inodes — in the execution ledger, and `/health` reports it as
+`capabilities.executionBoundary` with `executionRecoveryVersion: 2`. A restarted
+Runner verifies that identity, then observes or cancels: the kernel ends the
+whole PID namespace when the Runner dies, a `setsid()` descendant is still
+inside it, and termination is confirmed only by a complete scan proving the
+namespace empty. A missing, corrupt, foreign or unreadable handle signals
+nothing and releases nothing; old ledgers keep their quarantine and report
+`not-recorded`. A host without a usable Bubblewrap sandbox reports `handle:
+"none"` rather than a weaker promise.
+
+The prototype now imports those `/proc` identity rules from
+`@sciencediscovery/sandbox-capability` instead of keeping its own copy, so the
+two cannot drift. Its own cancellation guarantee is unchanged and remains
+session-scoped: an escaped descendant is still out of reach there, because it
+runs without a PID namespace. Nothing in round 10 starts a research run, adds a
+route, or changes `canStart`; the five blockers stay as they were.
 
 ## Known limits
 

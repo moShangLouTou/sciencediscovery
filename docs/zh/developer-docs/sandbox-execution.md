@@ -9,6 +9,7 @@ Runner 是无 root 的代码执行器：Agent 的常规执行统一使用 `run_s
 | `server.ts` | HTTP 路由、Bearer + HMAC 鉴权、Workspace 准入与执行队列、启动预检 |
 | `executor.ts` | 一次性沙箱执行：bwrap 参数组装、配额与超时、工作区快照 |
 | `execution-manager.ts` | 受管理 Shell 的生命周期、状态/日志/取消与已提交 Workspace 回执 |
+| `execution-boundary.ts` | 每次执行的持久进程身份：采集、观测与内核验证的终止确认 |
 | `kernel-manager.ts`、`shell-session-manager.ts`、`session-env-profile.ts` | 旧内部基础组件；HTTP 执行不再启动持久 worker，也不注入历史 profile |
 | `environment-store.ts` | 科学环境 provisioning：micromamba、目录 catalog、命名环境原地更新与 revision 记录 |
 | `seccomp.ts` | x86_64/aarch64 seccomp BPF（拒绝同一类高风险 syscall，`EPERM`），baseline、network 与无 egress 的 NPU 兼容 profile 按宿主架构写入 `.sciencediscovery-data/runner-runtime/seccomp-*.bpf` |
@@ -240,6 +241,31 @@ HTTP `/execute`、`/execute-shell`、`/shell-executions` 在创建 Workspace 或
 持久解释器可能在一次调用返回后留下线程或子进程，越过 Workspace 写锁与快照提交边界继续写入。Linux ephemeral 执行在最终快照和释放租约前结束整个 Bubblewrap PID namespace。受管理后台 Execution 则在真实负载运行期间持续持有写入权；它不是可跨调用复用的交互式 Shell。
 
 历史 Session profile 不再注入。每次显式选择 cwd 与环境，需要的 export 和命令写在同一个脚本中。Python/R 内存不跨调用保留；Notebook 式共享内存不属于本次实现。
+
+### 7.1 持久进程边界与 Runner 重启
+
+Runner 在受管理执行进行中被杀，过去会留下无法再观测、也无法停止的工作。现在每次受管理执行都会在执行账本里记录一份 **Runner 私有边界**，写入发生在 executor 的 spawn 时刻、任何 `await` 之前，因此读取内核视图时 pid 仍然确定地指向刚创建的那个进程：
+
+- 沙箱 monitor 的 boot id、宿主 pid、`/proc/[pid]/stat` start time、进程组、会话与 uid；
+- 沙箱实际暴露的每一个 PID namespace（`pid:[n]`）。
+
+该句柄不会出现在请求或 DTO 中，客户端也无法提供：只从账本读取。客户端看到的是受管理执行上新增的、不含宿主信息的 `boundary` 状态——`state`、`terminationConfirmed`、`stopRequestedAt`，以及无法证明时的 `reason`。
+
+Bubblewrap 会 unshare PID，负载因此位于自己的 PID namespace 中、以 bubblewrap 为 init，而 `--die-with-parent` 把该 init 绑定到 Runner。Runner 进程死亡时内核会结束整个 namespace，包括调用过 `setsid()` 的后代——它脱离的是进程组和会话，不是 namespace。`/health` 在 `capabilities.executionBoundary` 中按 Runner 报告这一能力，其取值来自宿主机实际可用的沙箱，而不是配置开关；`executionRecoveryVersion` 现为 `2`。
+
+启动时 Runner 只对上一个进程留下的 `unknown` 执行重新观测：先校验记录的 boot、start time 与边界，再给出结论。不会因为 pid 存在就把执行标成 running，不会因为观测失败就标成 completed/stopped，也不会自动续跑或重放。句柄缺失、损坏、属于其它执行、内核不可读或 namespace 无法验证时，如实报告 `not-recorded`/`unverifiable`/`boot-changed` 并保持隔离。句柄若指向 Runner 自己的 PID namespace，会在任何动作之前被拒绝：这只可能来自被篡改的账本，照做会把一次 cancel 变成全机 kill。
+
+取消这类执行时先持久化停止意图，再行动：
+
+1. 没有可信句柄：持久化意图并返回 `409 EXECUTION_BOUNDARY_UNAVAILABLE`，不发送信号，不释放任何资源。
+2. 否则仅在 pid 与 start time 仍与记录一致时向 monitor 发送 `SIGTERM`，随后升级为 `SIGKILL`：先 monitor，再对 namespace 内其余成员逐个重新读取 start time 后发送，复用的 pid 永远不会被误伤。
+3. 只有完整扫描证明 namespace 已空才算确认终止；否则返回 `409 EXECUTION_TERMINATION_UNVERIFIED`，隔离继续保留。
+
+即使确认终止，执行仍保持 `unknown`：从未观测到退出状态，因此 `exitCode` 保持未知，也不会伪造结果。重复取消是幂等的——报告同一份证据，不再发送信号。Workspace 与设备隔离只由既有的发布/工作区恢复路径解除，观测或失败的停止都不会解除。正常执行在命令 join 之后也走同一套校验：记录的 namespace 若无法证明为空，记录转为 `unknown` 并隔离工作区，而不是在可能有存活写入者的情况下发布快照。
+
+namespace 扫描报告的是完整性，而不只是成员列表。只有当每个 pid 都可读、或被证明在边界之外时，空结果才可信；后者指 uid 不同，或 `NSpid` 只有一个值、说明它与 Runner 共享同一个 PID namespace。普通多用户主机上，root 拥有以及跨 user namespace 的进程 `readlink /proc/<pid>/ns/pid` 会被拒绝（`EACCES`，`PTRACE_MODE_READ`）；没有这一排除，空扫描会永远显得未被证明，取消就永远无法确认。
+
+此变更之前的账本没有句柄。这些执行保持原状态与隔离，报告 `not-recorded`，不能通过该路径取消；不会被迁移或推断。在沙箱不可用的宿主机（包括非 Linux）上，能力报告为 `handle: "none"`、`reconnect: "unsupported"`，执行语义保持不变，也不报告任何模拟的成功。
 
 ## 8. Runner 恢复的真实模型 E2E
 
