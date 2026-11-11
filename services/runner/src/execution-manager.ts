@@ -9,11 +9,20 @@ import { StringDecoder } from "node:string_decoder";
 import { ensureWorkspaceBaseline, poisonWorkspace, RefStore, snapshotWorkspace, VersionStore, withWorkspaceLease, withWorkspaceAdmission, type AgentStateRef } from "@sciencediscovery/cas";
 import { assertRecoveryContext, recoveryRelativePath, unknownRecovery } from "@sciencediscovery/schema";
 import { collectExecutionRecovery, validateExecutionRecovery } from "./execution-recovery.js";
+import {
+  captureExecutionBoundary,
+  isValidExecutionBoundaryHandle,
+  observeExecutionBoundary,
+  terminateExecutionBoundary,
+  type ExecutionBoundaryHandle,
+  type ExecutionLifecycle,
+} from "./execution-boundary.js";
 import type { ExecutionLogPage, ExecutionOwner, ManagedExecution, ShellExecutionRequest, ShellExecutionResult } from "@sciencediscovery/schema";
 
 export type ExecutionLogSink = (stream: "stdout" | "stderr", chunk: Buffer) => void;
 /** Resolving or rejecting must join every launched child, including cancellation. */
-type Operation = (signal: AbortSignal, log: ExecutionLogSink, expectedEnvironmentRevisionId?: string) => Promise<ShellExecutionResult>;
+type Operation = (signal: AbortSignal, log: ExecutionLogSink, expectedEnvironmentRevisionId?: string,
+  lifecycle?: ExecutionLifecycle) => Promise<ShellExecutionResult>;
 /** Rejecting here records a deterministic pre-admission failure; no process is launched. */
 type Preflight = (signal: AbortSignal) => Promise<void>;
 const terminal = (state: ManagedExecution["state"]) => state !== "queued" && state !== "running";
@@ -95,7 +104,7 @@ export class ExecutionManager {
     catch (error) { this.ownership.close(); throw error; }
     try {
       const schemaVersion = Number(this.db.prepare("PRAGMA user_version").get()?.user_version ?? 0);
-      if (schemaVersion > 1) throw new Error("Execution ledger schema is newer than this Runner");
+      if (schemaVersion > 2) throw new Error("Execution ledger schema is newer than this Runner");
       if (existingLedger) {
         const tables = new Set(this.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(row => row.name));
         if (!tables.has("executions") || !tables.has("logs")) throw new Error("Execution ledger tables are missing");
@@ -108,6 +117,7 @@ export class ExecutionManager {
           PRIMARY KEY(execution, cursor));
         CREATE TABLE IF NOT EXISTS execution_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS execution_publications (id TEXT PRIMARY KEY, record TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS execution_boundaries (execution TEXT PRIMARY KEY, record TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS recovery_store (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), id TEXT NOT NULL);`);
       this.db.exec("BEGIN IMMEDIATE");
       this.db.prepare("INSERT OR IGNORE INTO recovery_store VALUES (1, ?)").run(randomUUID());
@@ -121,7 +131,7 @@ export class ExecutionManager {
       this.runnerInstanceId = identity ? String(identity.value) : randomUUID();
       if (!/^[a-f0-9-]{36}$/i.test(this.runnerInstanceId)) throw new Error("Execution ledger identity is invalid");
       if (!identity) this.db.prepare("INSERT INTO execution_metadata VALUES ('runnerInstanceId', ?)").run(this.runnerInstanceId);
-      this.db.exec("PRAGMA user_version=1");
+      this.db.exec("PRAGMA user_version=2");
       for (const row of records) {
         const execution = JSON.parse(String(row.record)) as ManagedExecution;
         if (!execution || execution.id !== row.id || execution.sessionId !== row.session || execution.agentId !== row.agent
@@ -148,6 +158,9 @@ export class ExecutionManager {
       this.ownership.close();
       throw new ExecutionManagerError("EXECUTION_LEDGER_UNAVAILABLE", `Execution ledger cannot be trusted; new submissions are disabled: ${error instanceof Error ? error.message : String(error)}`, 503);
     }
+    // Reconcile observations for work the previous Runner process could not
+    // settle, before any caller can ask about it.
+    this.reconcileRecordedBoundaries();
     this.versions = new VersionStore(dataDir);
     if (this.db.prepare("SELECT 1 FROM execution_publications LIMIT 1").get()) {
       this.recoveryPending = true;
@@ -290,7 +303,7 @@ export class ExecutionManager {
         execution.startedAt = new Date().toISOString();
         this.save(execution);
         changed = true;
-        execution.result = await operation(controller.signal, log, expectedEnvironmentRevisionId);
+        execution.result = await operation(controller.signal, log, expectedEnvironmentRevisionId, this.lifecycleFor(execution.id));
         execution.state = controller.signal.aborted ? "cancelled" : execution.result.exitCode === 0 && !execution.result.networkDeniedHosts?.length ? "completed" : "failed";
       } catch (error) {
         if ((error as { code?: string }).code === "PROCESS_TERMINATION_UNVERIFIED") {
@@ -307,6 +320,18 @@ export class ExecutionManager {
         }
         execution.state = controller.signal.aborted ? "cancelled" : "failed";
         execution.error = error instanceof Error ? error.message : "Execution failed";
+      }
+      // A joined monitor is not proof that nothing it started is still alive.
+      // When a durable boundary was recorded, the kernel must show that boundary
+      // empty before exit evidence or a workspace snapshot is accepted;
+      // otherwise the record becomes unknown and stays fenced.
+      if (changed && !(await this.boundaryTerminationAfterRun(execution))) {
+        execution.state = "unknown";
+        delete execution.finishedAt;
+        execution.error = "Execution ended, but its recorded process boundary could not be proven empty; state is unverified";
+        this.quarantine(execution);
+        this.save(execution);
+        return;
       }
       const endedState = execution.state;
       execution.evidence = { ...this.identity, revision: execution.receipt!.revision, processTerminated: true,
@@ -424,6 +449,104 @@ export class ExecutionManager {
     return { ...execution, recovery: execution.recovery ?? unknownRecovery() };
   }
 
+  /**
+   * Load the durable handle for one execution. It is Runner-private and read
+   * only from the ledger: no request field can supply or redirect it.
+   * `undefined` means none was recorded (older ledger, unsupported platform, or
+   * a crash between spawn and persistence); "invalid" means the stored row no
+   * longer describes a trustworthy identity.
+   */
+  private loadBoundary(id: string): ExecutionBoundaryHandle | "invalid" | undefined {
+    const row = this.db.prepare("SELECT record FROM execution_boundaries WHERE execution = ?").get(id);
+    if (!row) return undefined;
+    try {
+      const parsed: unknown = JSON.parse(String(row.record));
+      return isValidExecutionBoundaryHandle(parsed) && parsed.executionId === id ? parsed : "invalid";
+    } catch {
+      return "invalid";
+    }
+  }
+
+  /**
+   * Persist the just-spawned monitor's identity. Called synchronously from the
+   * executor's spawn turn, so no other event can run between the kernel
+   * creating the process and this row being written.
+   */
+  private lifecycleFor(id: string): ExecutionLifecycle {
+    return {
+      spawned: (spawned) => {
+        const handle = captureExecutionBoundary(id, spawned);
+        if (handle === null) return;
+        try {
+          this.db.prepare("INSERT INTO execution_boundaries VALUES (?, ?) ON CONFLICT(execution) DO UPDATE SET record = excluded.record")
+            .run(id, JSON.stringify(handle));
+        } catch (error) {
+          // Losing the identity row does not lose the process; it loses the
+          // ability to prove anything about it later. Admission must stop
+          // rather than keep accepting work it cannot fence.
+          this.storageHealthy = false;
+          throw error;
+        }
+      },
+    };
+  }
+
+  /**
+   * Prove the boundary empty after the operation reported the command joined.
+   * Returns true when no verifiable claim exists (nothing was recorded, or the
+   * sandbox never exposed a namespace); false only when a recorded namespace
+   * still has members or cannot be read, which must fence the workspace.
+   */
+  private async boundaryTerminationAfterRun(execution: ManagedExecution): Promise<boolean> {
+    const handle = this.loadBoundary(execution.id);
+    if (handle === undefined || handle === "invalid" || handle.namespaces.length === 0) return true;
+    const stopRequestedAt = execution.boundary?.stopRequestedAt;
+    const stop = stopRequestedAt ? { stopRequestedAt } : {};
+    // Kernel teardown of a PID namespace is complete once its init exits, but
+    // the monitor's own close can be delivered a tick later: re-read within a
+    // small bound instead of quarantining a correct record.
+    const deadline = Date.now() + 100;
+    for (;;) {
+      const status = observeExecutionBoundary(handle, stop);
+      execution.boundary = status;
+      if (status.terminationConfirmed) return true;
+      if (status.state === "unverifiable" || Date.now() >= deadline) return false;
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
+  /**
+   * Observe executions a previous Runner process left unverified. This never
+   * changes a state, never releases a fence, and never re-runs anything: it
+   * only replaces a stale observation with the current kernel truth, so a
+   * client sees it before deciding whether to cancel.
+   */
+  private reconcileRecordedBoundaries(): void {
+    for (const row of this.db.prepare("SELECT id, record FROM executions").all()) {
+      const execution = JSON.parse(String(row.record)) as ManagedExecution;
+      if (execution.state !== "unknown" || !execution.startedAt) continue;
+      const handle = this.loadBoundary(String(row.id));
+      if (handle === undefined) {
+        // An older ledger has no handle at all. Persisting the explicit
+        // `not-recorded` answer is still an observation, not a guess: it says
+        // the Runner cannot vouch for this execution's processes, which is why
+        // cancellation refuses and the quarantine stays.
+        execution.boundary = { observedAt: new Date().toISOString(), state: "not-recorded",
+          terminationConfirmed: false, reason: "no-handle" };
+        try { this.save(execution); }
+        catch { this.storageHealthy = false; }
+        continue;
+      }
+      const stopRequestedAt = execution.boundary?.stopRequestedAt;
+      const stop = stopRequestedAt ? { stopRequestedAt } : {};
+      execution.boundary = handle === "invalid"
+        ? { observedAt: new Date().toISOString(), state: "unverifiable", terminationConfirmed: false, reason: "handle-invalid", ...stop }
+        : observeExecutionBoundary(handle, stop);
+      try { this.save(execution); }
+      catch { this.storageHealthy = false; }
+    }
+  }
+
   logs(id: string, owner: ExecutionOwner, cursor = 0): ExecutionLogPage {
     const execution = this.readStored(id, owner);
     if (!Number.isSafeInteger(cursor) || cursor < 0) throw new Error("Invalid log cursor");
@@ -434,7 +557,7 @@ export class ExecutionManager {
       truncated: Boolean(this.db.prepare("SELECT 1 FROM logs WHERE execution = ? AND cursor > ? LIMIT 1").get(id, nextCursor)) };
   }
 
-  cancel(id: string, owner: ExecutionOwner): ManagedExecution {
+  async cancel(id: string, owner: ExecutionOwner): Promise<ManagedExecution> {
     const execution = this.get(id, owner);
     if (execution.state === "queued") {
       // Nothing was launched, so cancelling needs no join and must not wait for
@@ -452,8 +575,49 @@ export class ExecutionManager {
       this.controllers.get(id)?.abort();
       return this.get(id, owner);
     }
-    if (!terminal(execution.state)) this.controllers.get(id)?.abort();
-    return this.get(id, owner); // a running execution is terminal only after process exit and version commit
+    if (execution.state === "running") {
+      // The operation is in this process image; its own stop path joins the
+      // child. No durable signal is sent here, and the record stays running
+      // until that join and the workspace commit decide the outcome.
+      this.controllers.get(id)?.abort();
+      return this.get(id, owner);
+    }
+    if (execution.state !== "unknown") return this.get(id, owner);
+    // Unknown: either nothing was ever launched, or a previous Runner process
+    // died with the execution in flight. Only a recorded boundary can answer
+    // which; without a trustworthy one nothing is signaled and nothing is
+    // released.
+    const stopRequestedAt = execution.boundary?.stopRequestedAt ?? new Date().toISOString();
+    const handle = this.loadBoundary(id);
+    if (handle === undefined || handle === "invalid") {
+      // Persist the intent even on refusal: it is the durable record of what a
+      // caller asked for, and it never becomes evidence of termination.
+      execution.boundary = { observedAt: new Date().toISOString(), state: "unverifiable",
+        terminationConfirmed: false, reason: handle === "invalid" ? "handle-invalid" : "no-handle", stopRequestedAt };
+      this.save(execution);
+      throw new ExecutionManagerError("EXECUTION_BOUNDARY_UNAVAILABLE",
+        "No durable process boundary was recorded for this execution; nothing was signaled and its resources stay quarantined", 409);
+    }
+    // Intent is durable before the first signal. Observation alone never flips
+    // a state, so this record stays unknown unless the boundary is proven gone.
+    execution.boundary = { observedAt: new Date().toISOString(), state: "unverifiable",
+      terminationConfirmed: false, stopRequestedAt };
+    this.save(execution);
+    const outcome = await terminateExecutionBoundary(handle, { stopRequestedAt });
+    const latest = this.readStored(id, owner);
+    latest.boundary = { ...outcome.status, stopRequestedAt };
+    this.save(latest);
+    if (!outcome.confirmed) {
+      throw new ExecutionManagerError("EXECUTION_TERMINATION_UNVERIFIED",
+        outcome.signaled
+          ? "Stop intent recorded, but the process boundary could not be proven gone; its resources stay quarantined"
+          : "Stop intent recorded, but no verified process was available to signal; its resources stay quarantined", 409);
+    }
+    // The process tree is gone, but its exit status was never observed and no
+    // result was published. The state stays unknown; only the boundary status
+    // is now proof of termination, and the quarantine is released by the
+    // existing publication/workspace recovery, never here.
+    return this.get(id, owner);
   }
 
   async close(): Promise<void> {

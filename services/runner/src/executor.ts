@@ -25,6 +25,7 @@ import {
   procMountArguments,
   type SandboxProcMode,
 } from "@sciencediscovery/sandbox-capability";
+import type { ExecutionLifecycle } from "./execution-boundary.js";
 import {
   SANDBOX_SKILL_EXTENSIONS_ROOT,
   SANDBOX_SKILL_PACKAGES_ROOT,
@@ -636,7 +637,15 @@ async function runSandboxed(
   maxOutputBytes: number,
   seccompVariant: SeccompVariant = "baseline",
   onOutput?: (stream: "stdout" | "stderr", chunk: Buffer) => void,
-  spawnProcess = () => spawnSandboxProcess(config, launch, commandArguments, seccompVariant, config.closeSeccompFilter),
+  /**
+   * Receives the just-spawned monitor synchronously, inside the spawn call —
+   * before the first await — so a durable identity can be captured in the only
+   * window where the process is guaranteed to still be the one that was
+   * created. A custom `spawnProcess` may decline to call it; callers must then
+   * treat the execution as having no durable handle.
+   */
+  onSpawned?: (child: ChildProcessWithoutNullStreams, sandbox: SandboxKind) => void,
+  spawnProcess = () => spawnSandboxProcess(config, launch, commandArguments, seccompVariant, config.closeSeccompFilter, onSpawned),
 ): Promise<{ exitCode: number; stderr: string; stdout: string }> {
   try {
     return await new Promise<{ exitCode: number; stderr: string; stdout: string }>((resolveRun, reject) => {
@@ -1262,6 +1271,7 @@ export async function spawnSandboxProcess(
   commandArguments: string[],
   seccompVariant: SeccompVariant,
   closeFilter: (handle: FileHandle) => Promise<void> = (handle) => handle.close(),
+  onSpawned?: (child: ChildProcessWithoutNullStreams, sandbox: SandboxKind) => void,
 ): Promise<ChildProcessWithoutNullStreams> {
   const kind = launch.sandbox ?? executorSandboxKind(config);
   if (kind === "none") {
@@ -1269,12 +1279,14 @@ export async function spawnSandboxProcess(
     // interpreter directly. killSandboxProcess routes this through
     // terminateTree (taskkill /T on win32), so timeout/abort still work.
     try {
-      return spawn(launch.executable!, [...launch.commandPrefix, ...commandArguments], {
+      const direct = spawn(launch.executable!, [...launch.commandPrefix, ...commandArguments], {
         cwd: launch.hostCwd,
         env: launch.env,
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
       }) as ChildProcessWithoutNullStreams;
+      onSpawned?.(direct, "none");
+      return direct;
     } catch (error) {
       await launch.cleanup?.().catch(() => undefined);
       throw error;
@@ -1302,6 +1314,9 @@ export async function spawnSandboxProcess(
       sandboxProcessGroups.add(child);
       child.once("close", () => sandboxProcessGroups.delete(child));
     }
+    // No await may precede this call: identity has to be read from the kernel
+    // while the pid provably still names the process that was just created.
+    onSpawned?.(child, kind);
     // Do not await this close. A missing device node makes bwrap exit in the
     // same turn, and that close event is delivered while the fd close is in
     // flight. Waiting here returns the child only after the caller can no
@@ -1501,6 +1516,8 @@ export async function executeShell(
   onOutput?: (stream: "stdout" | "stderr", chunk: Buffer) => void,
   environmentStore?: Pick<EnvironmentStore, "capability" | "resolveRuntime">,
   expectedEnvironmentRevisionId?: string,
+  /** Receives the spawned monitor synchronously so the ledger can capture its identity. */
+  lifecycle?: ExecutionLifecycle,
 ): Promise<ShellExecutionResult> {
   if (!request.code.trim()) throw new Error("Shell code is required");
   if (!request.executionId?.trim()) throw new Error("Execution ID is required");
@@ -1600,6 +1617,13 @@ export async function executeShell(
     maxOutputBytes,
     seccompVariantFor(networkAccess, Boolean(npu)),
     onOutput,
+    lifecycle
+      ? (child, sandbox) => lifecycle.spawned({
+          pid: child.pid ?? 0,
+          kind: sandbox === "bubblewrap" ? "pid-namespace" : "process",
+          sandbox,
+        })
+      : undefined,
   );
   await assertWorkspaceWithinQuota(workspaceRoot, maxWorkspaceBytes);
 

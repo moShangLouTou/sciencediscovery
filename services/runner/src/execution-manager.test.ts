@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
+import { readFileSync } from "node:fs";
 
 import { lstat, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -16,6 +17,8 @@ import { RefStore, VersionStore, withWorkspaceMutation, withWorkspaceRetirement,
 import type { ExecutionOwner, ShellExecutionRequest, ShellExecutionResult } from "@sciencediscovery/schema";
 import { executionDigestVectors } from "../../../test/support/execution-digest-vectors.js";
 import { ExecutionManager, ExecutionManagerError, type ExecutionQuarantineDiagnostic } from "./execution-manager.js";
+import { EXECUTION_BOUNDARY_SCHEMA_VERSION, type ExecutionBoundaryHandle } from "./execution-boundary.js";
+import { sendSignal } from "@sciencediscovery/sandbox-capability";
 import { ProcessTerminationUnverifiedError } from "./executor.js";
 
 const owner: ExecutionOwner = { agentId: "main", sessionId: "session" };
@@ -154,7 +157,7 @@ test("cancel waits for process join; queued cancellation never starts or replays
   let queuedRan = false;
   manager.start(request(workspace, "queued"), async () => { queuedRan = true; return result("queued"); });
   manager.cancel("queued", owner);
-  assert.equal(manager.cancel("running", owner).state, "running");
+  assert.equal((await manager.cancel("running", owner)).state, "running");
   assert.equal(joined, false);
   await until(() => manager.get("running", owner).state === "cancelled" && manager.get("queued", owner).state === "cancelled");
   assert.equal(joined, true);
@@ -171,7 +174,7 @@ test("cancelling a queued execution is terminal before its turn without starting
   await until(() => manager.get("head", owner).state === "running");
   manager.start(request(workspace, "waiting"), async () => assert.fail("a cancelled queued command launched"));
   manager.start(request(workspace, "after-cancel"), async () => result("after-cancel"));
-  const cancelled = manager.cancel("waiting", owner);
+  const cancelled = await manager.cancel("waiting", owner);
   assert.equal(cancelled.state, "cancelled", "no process was launched, so cancellation needs no join");
   assert.ok(cancelled.finishedAt);
   assert.equal(cancelled.evidence?.terminationReason, "not_started");
@@ -419,7 +422,10 @@ test("restart preserves identity and quarantines original workspace and selected
     assert.ok(recovered.receipt!.revision > original.receipt!.revision);
     assert.equal(recovered.receipt?.runnerBootId, identity.runnerBootId);
     assert.deepEqual(restarted.submit(input, async () => assert.fail("orphan replay launched")), { execution: recovered, accepted: false });
-    assert.deepEqual(restarted.cancel("orphan", owner), recovered, "cannot claim to cancel an orphan without a controller");
+    // No durable boundary was ever recorded, so the restart cannot prove which
+    // process (if any) belongs to this execution. Cancellation fails closed:
+    // nothing is signaled and the workspace/device quarantine stays in force.
+    await assert.rejects(restarted.cancel("orphan", owner), { code: "EXECUTION_BOUNDARY_UNAVAILABLE" });
     assert.throws(() => restarted.start(request(workspace, "same-workspace"), async () => assert.fail("workspace isolation lost")), { code: "EXECUTION_RESOURCE_QUARANTINED" });
     assert.throws(() => restarted.start({ ...request(other, "same-device"), npuDevices: [0] }, async () => assert.fail("device isolation lost")), { code: "EXECUTION_RESOURCE_QUARANTINED" });
     restarted.start({ ...request(other, "unrelated"), npuDevices: [1] }, async () => result("unrelated"));
@@ -785,4 +791,159 @@ test("runtime publication failure emits a fence diagnostic despite a throwing si
   assert.equal(messages[0]?.executionId, "runtime-fence");
   assert.throws(() => manager.submit(request(workspace, "blocked"), async () => assert.fail("must not replay")),
     { code: "EXECUTION_RESOURCE_QUARANTINED" });
+});
+
+// --- Round 10: durable process boundary across a Runner restart ---------------
+
+function realBootId(): string {
+  return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+}
+
+/** A pid above the kernel's pid_max: no signal can ever reach a real process. */
+const ABSENT_PID = 2_147_483_646;
+
+function boundaryRow(executionId: string, overrides: Partial<ExecutionBoundaryHandle> = {}): string {
+  return JSON.stringify({
+    schemaVersion: EXECUTION_BOUNDARY_SCHEMA_VERSION,
+    kind: "pid-namespace",
+    executionId,
+    sandbox: "bubblewrap",
+    bootId: realBootId(),
+    pid: ABSENT_PID,
+    startTimeTicks: "1",
+    processGroupId: ABSENT_PID,
+    sessionId: ABSENT_PID,
+    uid: process.getuid?.() ?? 1000,
+    namespaces: ["pid:[424242]"],
+    capturedAt: new Date().toISOString(),
+    ...overrides,
+  });
+}
+
+/**
+ * Create the ledger first, then seed one interrupted execution exactly as a
+ * previous Runner process would have left it: state unknown, started, no
+ * receipt (that is what an older ledger looks like), and optionally a handle.
+ */
+async function seedInterruptedExecution(root: string, executionId: string,
+  options: { workspaceKey: string; handle?: string | null }): Promise<void> {
+  const created = new ExecutionManager(root);
+  await created.close();
+  const db = new DatabaseSync(resolve(root, "runner-executions", "executions.sqlite"));
+  const now = new Date().toISOString();
+  const record = { id: executionId, sessionId: owner.sessionId, agentId: owner.agentId, state: "unknown",
+    queuedAt: now, startedAt: now, workspaceKey: options.workspaceKey, npuDevices: [] };
+  db.prepare("INSERT INTO executions VALUES (?, ?, ?, ?)").run(executionId, owner.sessionId, owner.agentId, JSON.stringify(record));
+  if (options.handle !== undefined && options.handle !== null) {
+    db.prepare("INSERT INTO execution_boundaries VALUES (?, ?)").run(executionId, options.handle);
+  }
+  db.close();
+}
+
+test("a restart without a recorded handle observes not-recorded and refuses to cancel", async context => {
+  const root = await mkdtemp(resolve(tmpdir(), "execution-boundary-legacy-"));
+  const workspace = resolve(root, "workspace"); await mkdir(workspace);
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await seedInterruptedExecution(root, "legacy", { workspaceKey: workspace });
+  const manager = new ExecutionManager(root);
+  try {
+    const recovered = manager.get("legacy", owner);
+    assert.equal(recovered.state, "unknown");
+    assert.deepEqual({ ...recovered.boundary, observedAt: undefined },
+      { observedAt: undefined, state: "not-recorded", terminationConfirmed: false, reason: "no-handle" });
+    await assert.rejects(manager.cancel("legacy", owner), { code: "EXECUTION_BOUNDARY_UNAVAILABLE" });
+    const after = manager.get("legacy", owner);
+    assert.equal(after.state, "unknown", "a refused cancel never settles the execution");
+    assert.ok(after.boundary?.stopRequestedAt, "the stop intent is durable even when nothing was signaled");
+    assert.equal(after.boundary?.terminationConfirmed, false);
+    assert.throws(() => manager.start(request(workspace, "blocked"), async () => assert.fail("quarantine released")),
+      { code: "EXECUTION_RESOURCE_QUARANTINED" });
+  } finally { await manager.close(); }
+});
+
+test("a restart proves an empty recorded boundary gone and cancels idempotently without settling the state", async context => {
+  const root = await mkdtemp(resolve(tmpdir(), "execution-boundary-gone-"));
+  const workspace = resolve(root, "workspace"); await mkdir(workspace);
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await seedInterruptedExecution(root, "gone", { workspaceKey: workspace, handle: boundaryRow("gone") });
+  const manager = new ExecutionManager(root);
+  try {
+    const recovered = manager.get("gone", owner);
+    assert.equal(recovered.boundary?.state, "gone");
+    assert.equal(recovered.boundary?.terminationConfirmed, true);
+    const cancelled = await manager.cancel("gone", owner);
+    assert.equal(cancelled.state, "unknown", "no exit status was ever observed");
+    assert.equal(cancelled.boundary?.terminationConfirmed, true);
+    assert.ok(cancelled.boundary?.stopRequestedAt);
+    assert.equal(cancelled.result, undefined, "no result is fabricated");
+    // Repeating the request must report the same proof, not signal anything new.
+    const again = await manager.cancel("gone", owner);
+    assert.equal(again.state, "unknown");
+    assert.equal(again.boundary?.terminationConfirmed, true);
+    // Confirming termination does not release the fence; only existing recovery does.
+    assert.throws(() => manager.start(request(workspace, "still-fenced"), async () => assert.fail("fence released")),
+      { code: "EXECUTION_RESOURCE_QUARANTINED" });
+  } finally { await manager.close(); }
+});
+
+test("a handle from another boot is never signaled and never settles the record", async context => {
+  const root = await mkdtemp(resolve(tmpdir(), "execution-boundary-boot-"));
+  const workspace = resolve(root, "workspace"); await mkdir(workspace);
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const bystander = spawn(process.execPath,
+    ["-e", "process.on('SIGTERM', () => {}); process.on('SIGINT', () => {}); setInterval(() => {}, 1000);"],
+    { detached: true, stdio: "ignore" });
+  context.after(async () => {
+    if (bystander.exitCode === null && bystander.signalCode === null) {
+      try { bystander.kill("SIGKILL"); } catch { /* gone */ }
+      await once(bystander, "exit").catch(() => undefined);
+    }
+  });
+  const pid = bystander.pid!;
+  await seedInterruptedExecution(root, "other-boot", { workspaceKey: workspace,
+    handle: boundaryRow("other-boot", { bootId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", pid,
+      processGroupId: pid, sessionId: pid }) });
+  const manager = new ExecutionManager(root);
+  try {
+    const recovered = manager.get("other-boot", owner);
+    assert.equal(recovered.boundary?.state, "boot-changed");
+    assert.equal(recovered.boundary?.terminationConfirmed, false);
+    await assert.rejects(manager.cancel("other-boot", owner), error => {
+      assert.ok(error instanceof ExecutionManagerError);
+      assert.equal(error.code, "EXECUTION_TERMINATION_UNVERIFIED");
+      assert.equal(error.statusCode, 409);
+      return true;
+    });
+    // The pid now names an unrelated process; refusing must have left it running.
+    assert.equal(sendSignal(pid, "SIGKILL"), "sent", "the bystander was alive after the refusal");
+    await once(bystander, "exit");
+    const after = manager.get("other-boot", owner);
+    assert.equal(after.state, "unknown");
+    assert.equal(after.boundary?.terminationConfirmed, false);
+    assert.throws(() => manager.start(request(workspace, "blocked"), async () => assert.fail("fence released")),
+      { code: "EXECUTION_RESOURCE_QUARANTINED" });
+  } finally { await manager.close(); }
+});
+
+test("a corrupt or foreign boundary row fails closed instead of being repaired", async context => {
+  const root = await mkdtemp(resolve(tmpdir(), "execution-boundary-corrupt-"));
+  const workspace = resolve(root, "workspace"); await mkdir(workspace);
+  const other = resolve(root, "other"); await mkdir(other);
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await seedInterruptedExecution(root, "corrupt", { workspaceKey: workspace, handle: "{not-json" });
+  await seedInterruptedExecution(root, "foreign", { workspaceKey: other,
+    handle: boundaryRow("someone-else") });
+  const manager = new ExecutionManager(root);
+  try {
+    for (const [id, key] of [["corrupt", workspace], ["foreign", other]] as const) {
+      const recovered = manager.get(id, owner);
+      assert.equal(recovered.boundary?.state, "unverifiable", id);
+      assert.equal(recovered.boundary?.reason, "handle-invalid", id);
+      assert.equal(recovered.boundary?.terminationConfirmed, false, id);
+      await assert.rejects(manager.cancel(id, owner), { code: "EXECUTION_BOUNDARY_UNAVAILABLE" });
+      assert.equal(manager.get(id, owner).state, "unknown");
+      assert.throws(() => manager.start(request(key, `blocked-${id}`), async () => assert.fail("fence released")),
+        { code: "EXECUTION_RESOURCE_QUARANTINED" });
+    }
+  } finally { await manager.close(); }
 });

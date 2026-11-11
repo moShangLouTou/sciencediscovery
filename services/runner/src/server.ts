@@ -33,6 +33,7 @@ import type {
   CreateNpuJobRequest,
   InstallEnvironmentRequest,
   PythonExecutionRequest,
+  RunnerExecutionBoundaryCapability,
   RunnerExecutionStatus,
   RunnerHealth,
   RunnerRuntimeStatus,
@@ -131,6 +132,39 @@ const DISABLED_SCIENTIFIC_ENVS: ScientificEnvsCapability = {
   startersReady: false,
   unavailableReason: "Scientific environments are disabled by configuration",
 };
+
+/**
+ * What this Runner can actually promise about the processes one execution
+ * started. Every field is backed by the boundary implementation, never by a
+ * configuration flag: a strong claim is made only on Linux with a usable
+ * Bubblewrap sandbox, where the workload lives in its own PID namespace and the
+ * kernel can be asked whether that namespace is empty.
+ *
+ * An unsupported Runner reports the weak shape explicitly so a client treats
+ * reconnection and cancellation as unavailable rather than assuming them.
+ */
+function executionBoundaryCapability(
+  platform: NodeJS.Platform,
+  sandboxUsable: boolean,
+): RunnerExecutionBoundaryCapability {
+  if (platform === "linux" && sandboxUsable) {
+    return {
+      handle: "pid-namespace",
+      reconnect: "supported",
+      runnerDeathTerminates: "kernel",
+      escapedDescendant: "included",
+      terminationProof: "pid-namespace",
+    };
+  }
+  return {
+    handle: "none",
+    reconnect: "unsupported",
+    runnerDeathTerminates: "unmanaged",
+    escapedDescendant: "excluded",
+    terminationProof: "none",
+    reason: platform === "linux" ? "sandbox-unsupported" : "platform-unsupported",
+  };
+}
 
 function sendJson(response: ServerResponse, statusCode: number, value: unknown): void {
   if (response.destroyed || response.writableEnded) return;
@@ -552,14 +586,23 @@ export function createRunnerServer(
     try {
       const url = new URL(request.url ?? "/", "http://runner.local");
       if (request.method === "GET" && url.pathname === "/health") {
+        const executionCapability = await readiness.get();
         sendJson(response, 200, {
-          execution: await readiness.get(),
+          execution: executionCapability,
           cgroupDelegated: false,
           cgroupMode: RESOURCE_LIMIT_MODE,
           cgroupRoot: "",
           executionAuth: "bearer+hmac-sha256",
           ...managedExecutions.identity,
-          capabilities: { executionRecoveryVersion: 1 },
+          capabilities: {
+            // Version 2 adds the durable process boundary: a restarted Runner
+            // can observe and cancel a recorded execution.
+            executionRecoveryVersion: 2,
+            executionBoundary: executionBoundaryCapability(
+              process.platform,
+              executionCapability.sandboxUsable && executionCapability.sandbox === "bubblewrap",
+            ),
+          },
           executionUser,
           executionTimeoutMs: config.execTimeoutMs,
           maxFileBytes: MAX_RUNNER_FILE_BYTES,
@@ -995,7 +1038,7 @@ export function createRunnerServer(
           return;
         }
         if (request.method === "POST" && managedMatch[2] === "cancel") {
-          sendJson(response, 202, managedExecutions.cancel(id, owner));
+          sendJson(response, 202, await managedExecutions.cancel(id, owner));
           return;
         }
       }
@@ -1018,14 +1061,14 @@ export function createRunnerServer(
         // ended but the Runner could not observe it.
         if (!direct) execution.executionTimeoutMs = config.execTimeoutMs > 0 ? config.execTimeoutMs : 0;
         execution.maxOutputBytes ??= config.maxOutputBytes;
-        const accepted = managedExecutions.submit(execution, (signal, log, expectedEnvironmentRevisionId) => direct
+        const accepted = managedExecutions.submit(execution, (signal, log, expectedEnvironmentRevisionId, lifecycle) => direct
           ? executeDirectShell(executorConfig, execution, signal, log)
           : execution.environmentId
           ? environmentStore?.withRuntime(execution.environmentId, (runtime) => {
               if (signal.aborted) throw new Error("Execution cancelled before environment admission");
-              return executeShell(executorConfig, execution, signal, undefined, gateways, runtime, log, environmentStore, expectedEnvironmentRevisionId);
+              return executeShell(executorConfig, execution, signal, undefined, gateways, runtime, log, environmentStore, expectedEnvironmentRevisionId, lifecycle);
             }) ?? Promise.reject(new Error("Scientific environments are unavailable"))
-          : executeShell(executorConfig, execution, signal, undefined, gateways, undefined, log, environmentStore, expectedEnvironmentRevisionId),
+          : executeShell(executorConfig, execution, signal, undefined, gateways, undefined, log, environmentStore, expectedEnvironmentRevisionId, lifecycle),
         direct ? undefined : async () => {
           // Admission-time check: the managed Shell may be repaired while this
           // request waits behind earlier work in the same Workspace queue. A
