@@ -6,7 +6,7 @@ import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
-import { ensureWorkspaceBaseline, poisonWorkspace, RefStore, snapshotWorkspace, VersionStore, withWorkspaceLease, withWorkspaceAdmission, type AgentStateRef } from "@sciencediscovery/cas";
+import { ensureWorkspaceBaseline, fenceWorkspaceExecution, releaseWorkspaceExecutionFence, poisonWorkspace, RefStore, snapshotWorkspace, VersionStore, withWorkspaceLease, withWorkspaceAdmission, type AgentStateRef } from "@sciencediscovery/cas";
 import { assertRecoveryContext, recoveryRelativePath, unknownRecovery } from "@sciencediscovery/schema";
 import { collectExecutionRecovery, validateExecutionRecovery } from "./execution-recovery.js";
 import {
@@ -178,10 +178,12 @@ export class ExecutionManager {
     // settle, before any caller can ask about it.
     this.reconcileRecordedBoundaries();
     this.versions = new VersionStore(dataDir);
-    if (this.db.prepare("SELECT 1 FROM execution_publications LIMIT 1").get()) {
+    if (this.db.prepare("SELECT 1 FROM execution_publications LIMIT 1").get()
+      || this.uncertainWorkspaces.size > 0) {
       this.recoveryPending = true;
       for (const row of this.db.prepare("SELECT id FROM execution_publications").all()) this.recoveringIds.add(String(row.id));
-      this.recovery = this.recoverPublications().finally(() => { this.recoveryPending = false; });
+      this.recovery = this.restoreExecutionFences().then(() => this.recoverPublications())
+        .finally(() => { this.recoveryPending = false; });
       void this.recovery.catch(() => { this.storageHealthy = false; });
     }
   }
@@ -315,6 +317,11 @@ export class ExecutionManager {
         // Cancellation can arrive while recovery validation above was awaited;
         // never launch a command the user already cancelled.
         if (controller.signal.aborted) throw new Error("Execution cancelled before start");
+        await fenceWorkspaceExecution(this.versions, key, this.fenceOwner(execution.id));
+        if (controller.signal.aborted) {
+          await releaseWorkspaceExecutionFence(this.versions, key, this.fenceOwner(execution.id));
+          throw new Error("Execution cancelled before start");
+        }
         execution.state = "running";
         execution.startedAt = new Date().toISOString();
         this.save(execution);
@@ -410,6 +417,7 @@ export class ExecutionManager {
             this.db.prepare("INSERT INTO execution_publications VALUES (?, ?)").run(execution.id, JSON.stringify(journal));
             await refs.commit(this.versions, name, journal.expected, version);
             Object.assign(execution, this.finishPublication(journal));
+            await releaseWorkspaceExecutionFence(this.versions, key, this.fenceOwner(execution.id));
             return;
           } finally { refs.close(); }
         }
@@ -429,6 +437,9 @@ export class ExecutionManager {
       }
       execution.finishedAt = new Date().toISOString();
       this.save(execution); // before releasing this Workspace queue
+      if (changed && execution.evidence?.processTerminated && execution.version) {
+        await releaseWorkspaceExecutionFence(this.versions, key, this.fenceOwner(execution.id));
+      }
     }, controller.signal), controller.signal);
     }).then(() => {
       // Keep the journal until the Workspace lease (including its active marker)
@@ -602,8 +613,9 @@ export class ExecutionManager {
         // `not-recorded` answer is still an observation, not a guess: it says
         // the Runner cannot vouch for this execution's processes, which is why
         // cancellation refuses and the quarantine stays.
+        const stopRequestedAt = execution.boundary?.stopRequestedAt;
         execution.boundary = { observedAt: new Date().toISOString(), state: "not-recorded",
-          terminationConfirmed: false, reason: "no-handle" };
+          terminationConfirmed: false, reason: "no-handle", ...(stopRequestedAt ? { stopRequestedAt } : {}) };
         try { this.save(execution); }
         catch { this.storageHealthy = false; }
         continue;
@@ -650,6 +662,11 @@ export class ExecutionManager {
       // The operation is in this process image; its own stop path joins the
       // child. No durable signal is sent here, and the record stays running
       // until that join and the workspace commit decide the outcome.
+      execution.boundary = { ...execution.boundary,
+        observedAt: new Date().toISOString(), state: execution.boundary?.state ?? "not-recorded",
+        terminationConfirmed: execution.boundary?.terminationConfirmed ?? false,
+        stopRequestedAt: execution.boundary?.stopRequestedAt ?? new Date().toISOString() };
+      this.save(execution);
       this.controllers.get(id)?.abort();
       return this.get(id, owner);
     }
@@ -715,6 +732,18 @@ export class ExecutionManager {
     this.db.prepare("DELETE FROM execution_publications WHERE id = ?").run(id);
   }
 
+  private fenceOwner(id: string): string { return `${this.runnerInstanceId}:${id}`; }
+
+  private async restoreExecutionFences(): Promise<void> {
+    for (const row of this.db.prepare("SELECT record FROM executions").all()) {
+      const execution = JSON.parse(String(row.record)) as ManagedExecution;
+      if (execution.workspaceKey && (execution.state === "unknown"
+        || (execution.state === "failed" && execution.startedAt && !execution.version))) {
+        await fenceWorkspaceExecution(this.versions, execution.workspaceKey, this.fenceOwner(execution.id));
+      }
+    }
+  }
+
   private async recoverPublications(): Promise<void> {
     for (const row of this.db.prepare("SELECT id, record FROM execution_publications ORDER BY id").all()) {
       let previous: ManagedExecution | undefined;
@@ -755,6 +784,7 @@ export class ExecutionManager {
           }
           this.finishPublication(journal);
         } finally { refs.close(); }
+        await releaseWorkspaceExecutionFence(this.versions, completed.workspaceKey, this.fenceOwner(completed.id));
         // No private CAS lock paths or generic active-marker deletion here. A
         // real crash may leave its write fence: recover the result, but require
         // verified/manual fence recovery before admitting another writer.
@@ -812,7 +842,24 @@ export class ExecutionManager {
 
   private save(execution: ManagedExecution): void {
     try {
+      // Cancellation operates on a separately read DTO. Retain its durable
+      // intent when the in-flight operation later saves its older copy.
+      const stored = this.db.prepare("SELECT record FROM executions WHERE id = ?").get(execution.id);
+      const previous = stored ? JSON.parse(String(stored.record)) as ManagedExecution : undefined;
+      const stopRequestedAt = previous?.boundary?.stopRequestedAt;
+      if (stopRequestedAt) execution.boundary = { ...execution.boundary,
+        observedAt: execution.boundary?.observedAt ?? new Date().toISOString(),
+        state: execution.boundary?.state ?? "not-recorded",
+        terminationConfirmed: execution.boundary?.terminationConfirmed ?? false, stopRequestedAt };
       if (execution.receipt) {
+        if (previous?.receipt) {
+          if (!Number.isSafeInteger(previous.receipt.revision) || previous.receipt.revision < 1
+            || previous.receipt.runnerInstanceId !== execution.receipt.runnerInstanceId
+            || previous.receipt.runnerBootId !== execution.receipt.runnerBootId
+            || previous.receipt.requestDigest !== execution.receipt.requestDigest
+            || previous.receipt.acceptedAt !== execution.receipt.acceptedAt) throw new Error("Execution receipt identity changed");
+          execution.receipt.revision = Math.max(execution.receipt.revision, previous.receipt.revision);
+        }
         execution.receipt.revision += 1;
         if (!Number.isSafeInteger(execution.receipt.revision)) throw new Error("Execution revision exhausted");
         if (execution.evidence) execution.evidence.revision = execution.receipt.revision;

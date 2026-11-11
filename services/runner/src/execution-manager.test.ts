@@ -206,6 +206,99 @@ test("an execution whose process cannot be verified as terminated quarantines th
     "an unverified kill must not claim the process terminated");
 });
 
+test("unknown execution fences CAS mutation and retirement after Runner lease release and restart", async context => {
+  const root = await mkdtemp(resolve(tmpdir(), "manager-shared-fence-"));
+  const workspace = resolve(root, "workspace");
+  await mkdir(workspace);
+  let manager = new ExecutionManager(root);
+  context.after(async () => { await manager.close(); await rm(root, { recursive: true, force: true }); });
+  manager.start(request(workspace, "shared-fence"), async () => {
+    throw new ProcessTerminationUnverifiedError("synthetic unverified child");
+  });
+  await until(() => manager.get("shared-fence", owner).state === "unknown", 30_000);
+  const mutation = () => withWorkspaceMutation(new VersionStore(root), workspace,
+    async () => assert.fail("API mutation bypassed Runner quarantine"), { kind: "upload" });
+  await assert.rejects(mutation(), { code: "WORKSPACE_EXECUTION_UNVERIFIED" });
+  await manager.close();
+  const restarted = new ExecutionManager(root);
+  manager = restarted;
+  await restarted.ready();
+  await assert.rejects(mutation(), { code: "WORKSPACE_EXECUTION_UNVERIFIED" });
+  await assert.rejects(withWorkspaceRetirement(new VersionStore(root), [workspace], "delete", async () => {
+    assert.fail("API deletion bypassed Runner quarantine");
+  }), { code: "WORKSPACE_EXECUTION_UNVERIFIED" });
+  assert.equal(restarted.get("shared-fence", owner).state, "unknown");
+});
+
+test("missing-handle cancellation keeps its stop intent across restart and repeated cancellation", async context => {
+  const root = await mkdtemp(resolve(tmpdir(), "manager-missing-stop-"));
+  const workspace = resolve(root, "workspace");
+  await mkdir(workspace);
+  let manager = new ExecutionManager(root);
+  context.after(async () => { await manager.close(); await rm(root, { recursive: true, force: true }); });
+  manager.start(request(workspace, "missing-stop"), async () => {
+    throw new ProcessTerminationUnverifiedError("no handle captured");
+  });
+  await until(() => manager.get("missing-stop", owner).state === "unknown", 30_000);
+  await assert.rejects(manager.cancel("missing-stop", owner), { code: "EXECUTION_BOUNDARY_UNAVAILABLE" });
+  const first = manager.get("missing-stop", owner).boundary?.stopRequestedAt;
+  assert.ok(first);
+  await manager.close();
+  const restarted = new ExecutionManager(root);
+  manager = restarted;
+  await restarted.ready();
+  assert.equal(restarted.get("missing-stop", owner).boundary?.stopRequestedAt, first);
+  await assert.rejects(restarted.cancel("missing-stop", owner), { code: "EXECUTION_BOUNDARY_UNAVAILABLE" });
+  assert.equal(restarted.get("missing-stop", owner).boundary?.stopRequestedAt, first);
+});
+
+test("running cancellation persists its stop intent before abort and later operation saves retain it", async context => {
+  const { manager, workspace } = await fixture(context);
+  let intentAtAbort: string | undefined;
+  manager.start(request(workspace, "running-stop"), async signal => {
+    await new Promise<void>(done => signal.addEventListener("abort", () => {
+      intentAtAbort = manager.get("running-stop", owner).boundary?.stopRequestedAt;
+      done();
+    }, { once: true }));
+    return result("running-stop");
+  });
+  await until(() => manager.get("running-stop", owner).state === "running", 30_000);
+  const cancelled = await manager.cancel("running-stop", owner);
+  const cancellationRevision = cancelled.receipt!.revision;
+  assert.ok(intentAtAbort);
+  assert.equal(cancelled.boundary?.stopRequestedAt, intentAtAbort);
+  await until(() => manager.get("running-stop", owner).state === "cancelled", 30_000);
+  assert.equal(manager.get("running-stop", owner).boundary?.stopRequestedAt, intentAtAbort);
+  assert.ok(manager.get("running-stop", owner).receipt!.revision > cancellationRevision);
+});
+
+test("running cancellation never aborts when its durable stop-intent write fails", async context => {
+  const { manager, workspace, root } = await fixture(context);
+  const finish = Promise.withResolvers<void>();
+  let signal: AbortSignal | undefined;
+  manager.start(request(workspace, "stop-storage-failure"), async current => {
+    signal = current;
+    current.addEventListener("abort", () => finish.resolve(), { once: true });
+    await finish.promise;
+    return result("stop-storage-failure");
+  });
+  await until(() => signal !== undefined, 30_000);
+  const db = new DatabaseSync(resolve(root, "runner-executions", "executions.sqlite"));
+  try {
+    db.exec(`CREATE TRIGGER reject_stop BEFORE UPDATE ON executions
+      WHEN NEW.id = 'stop-storage-failure'
+      BEGIN SELECT RAISE(ABORT, 'injected stop-intent failure'); END;`);
+    await assert.rejects(manager.cancel("stop-storage-failure", owner), /injected stop-intent failure/);
+    assert.equal(signal?.aborted, false);
+    assert.equal(manager.get("stop-storage-failure", owner).boundary?.stopRequestedAt, undefined);
+  } finally {
+    db.exec("DROP TRIGGER IF EXISTS reject_stop");
+    db.close();
+    finish.resolve();
+  }
+  await until(() => manager.get("stop-storage-failure", owner).state === "completed", 30_000);
+});
+
 test("external file publication waits for cancelled process join and the execution ref commit", async (context) => {
   const { manager, workspace, root } = await fixture(context);
   let joined = false;
