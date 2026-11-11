@@ -25,7 +25,13 @@ import {
   procMountArguments,
   type SandboxProcMode,
 } from "@sciencediscovery/sandbox-capability";
-import type { ExecutionLifecycle } from "./execution-boundary.js";
+import {
+  DEFAULT_BOUNDARY_KILL_GRACE_MS,
+  DEFAULT_BOUNDARY_TERM_GRACE_MS,
+  captureExecutionBoundaryOutcome,
+  terminateExecutionBoundary,
+  type ExecutionLifecycle,
+} from "./execution-boundary.js";
 import {
   SANDBOX_SKILL_EXTENSIONS_ROOT,
   SANDBOX_SKILL_PACKAGES_ROOT,
@@ -124,6 +130,11 @@ export interface SandboxRuntimeConfig {
   /** macOS Seatbelt launcher. */
   seatbeltPath?: string;
   dataDir: string;
+  /**
+   * Bound on observing a process's terminal event after its own exit or after
+   * a kill. Tests shorten it; production uses DEFAULT_TERMINATION_GRACE_MS.
+   */
+  terminationGraceMs?: number;
 }
 
 export interface ExecutorConfig extends SandboxRuntimeConfig {
@@ -142,11 +153,6 @@ export interface ExecutorConfig extends SandboxRuntimeConfig {
   maxWorkspaceBytes: number;
   /** Combined stdout+stderr retain budget; 0 disables truncation. */
   maxOutputBytes: number;
-  /**
-   * Bound on observing a process's terminal event after its own exit or after
-   * a kill. Tests shorten it; production uses DEFAULT_TERMINATION_GRACE_MS.
-   */
-  terminationGraceMs?: number;
   /**
    * [windows-desktop] operator-authorized workspace roots (in addition to
    * the data dir's projects/remote-workspaces) accepted by the workspace
@@ -618,8 +624,8 @@ function localPythonPackageBindArguments(packagePath: string | undefined): strin
 export class ProcessTerminationUnverifiedError extends Error {
   readonly code = "PROCESS_TERMINATION_UNVERIFIED";
 
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
     this.name = "ProcessTerminationUnverifiedError";
   }
 }
@@ -1264,6 +1270,60 @@ export function killSandboxProcess(child: ChildProcessWithoutNullStreams): boole
   }
 }
 
+/** Wait, bounded, for a killed process to emit its terminal event. */
+async function waitForSandboxExit(child: ChildProcessWithoutNullStreams, graceMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return true;
+  return await new Promise<boolean>((resolveExit) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.off("exit", onExit);
+      child.off("close", onExit);
+    };
+    const onExit = () => { cleanup(); resolveExit(true); };
+    const timer = setTimeout(() => { cleanup(); resolveExit(false); }, graceMs);
+    child.once("exit", onExit);
+    child.once("close", onExit);
+  });
+}
+
+/**
+ * Stop a process whose spawn turn failed, and say whether its whole tree is
+ * provably gone.
+ *
+ * The caller was holding a live child and then lost the record that would have
+ * supervised it, so "kill it" alone is not enough: the sandbox's own bound has
+ * to be checked. A bubblewrap tree is bounded by its PID namespace, which a
+ * descendant can keep alive after leaving the group via setsid(); only an
+ * empty namespace proves it ended. A "none" process has no such namespace, so
+ * its own exit is the proof. Any doubt returns false, and the caller must
+ * report an unverified termination rather than release the workspace.
+ */
+async function stopUnrecordedSandbox(
+  child: ChildProcessWithoutNullStreams,
+  sandbox: SandboxKind,
+  graceMs: number,
+): Promise<boolean> {
+  if (sandbox === "bubblewrap" && child.pid) {
+    // Capture on the same turn path the normal flow uses; the id here is only
+    // a label, never persisted.
+    const outcome = captureExecutionBoundaryOutcome(`unrecorded:${child.pid}`,
+      { pid: child.pid, kind: "pid-namespace", sandbox: "bubblewrap" });
+    if (outcome.status === "ended") return true;
+    if (outcome.status === "captured") {
+      const stopped = await terminateExecutionBoundary(outcome.handle, {
+        termGraceMs: Math.max(0, Math.min(graceMs, DEFAULT_BOUNDARY_TERM_GRACE_MS)),
+        killGraceMs: Math.max(0, Math.min(graceMs, DEFAULT_BOUNDARY_KILL_GRACE_MS)),
+      });
+      if (stopped.confirmed) return true;
+    }
+  }
+  // Group kill is still worth attempting: it stops the monitor even when the
+  // namespace could not be read. It is not, by itself, proof of termination.
+  killSandboxProcess(child);
+  const joined = await waitForSandboxExit(child, graceMs);
+  return sandbox !== "bubblewrap" && joined;
+}
+
 /** Spawn through the selected sandbox and attach Linux seccomp when applicable. */
 export async function spawnSandboxProcess(
   config: SandboxRuntimeConfig,
@@ -1274,6 +1334,28 @@ export async function spawnSandboxProcess(
   onSpawned?: (child: ChildProcessWithoutNullStreams, sandbox: SandboxKind) => void,
 ): Promise<ChildProcessWithoutNullStreams> {
   const kind = launch.sandbox ?? executorSandboxKind(config);
+  const graceMs = config.terminationGraceMs ?? DEFAULT_TERMINATION_GRACE_MS;
+  // The record callback runs after the process exists but before anyone else
+  // can hear about it. If it fails (an unreadable identity, or the ledger
+  // refusing the row), the child is still ours and still running: stop it and
+  // say whether that could be proven, so a caller never receives an
+  // unsupervised process and never claims a termination it did not verify.
+  const record = async (child: ChildProcessWithoutNullStreams, sandbox: SandboxKind): Promise<void> => {
+    try {
+      onSpawned?.(child, sandbox);
+    } catch (error) {
+      let stopped = false;
+      try {
+        stopped = await stopUnrecordedSandbox(child, sandbox, graceMs);
+      } catch {
+        // A failed kill leaves the same doubt as an unconfirmed one.
+      }
+      if (stopped) throw error;
+      throw new ProcessTerminationUnverifiedError(
+        `Sandbox supervision failed after the process started, and its termination could not be verified: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error });
+    }
+  };
   if (kind === "none") {
     // [windows-desktop] no namespace init, no seccomp — spawn the
     // interpreter directly. killSandboxProcess routes this through
@@ -1285,7 +1367,7 @@ export async function spawnSandboxProcess(
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
       }) as ChildProcessWithoutNullStreams;
-      onSpawned?.(direct, "none");
+      await record(direct, "none");
       return direct;
     } catch (error) {
       await launch.cleanup?.().catch(() => undefined);
@@ -1316,7 +1398,7 @@ export async function spawnSandboxProcess(
     }
     // No await may precede this call: identity has to be read from the kernel
     // while the pid provably still names the process that was just created.
-    onSpawned?.(child, kind);
+    await record(child, kind);
     // Do not await this close. A missing device node makes bwrap exit in the
     // same turn, and that close event is delivered while the fd close is in
     // flight. Waiting here returns the child only after the caller can no
