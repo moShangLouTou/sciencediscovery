@@ -81,6 +81,15 @@ import { SessionEnvProfileStore } from "./session-env-profile.js";
 import { ShellSessionManager } from "./shell-session-manager.js";
 import { agentExecutionKey, KeyedTaskQueue, requestAgentExecutionKey } from "./agent-execution.js";
 import { ExecutionManager, ExecutionManagerError } from "./execution-manager.js";
+import {
+  createScienceFlowRuntimeCheckService,
+  parseScienceFlowRuntimeProbeRequest,
+  type ScienceFlowRuntimeCheckService,
+} from "./scienceflow-runtime-check.js";
+import {
+  loadScienceFlowRuntimeBindings,
+  type ScienceFlowRuntimeBindings,
+} from "./scienceflow-runtime-config.js";
 import { committedWorkspaceSnapshot, publishWorkspaceFile, RefStore, streamSnapshotFile, VersionStore, withWorkspaceMutation,
   workspaceSnapshotFiles, type AgentStateRef, type SnapshotFile } from "@sciencediscovery/cas";
 import { HostNpuJobBroker } from "./npu-broker.js";
@@ -108,6 +117,8 @@ export interface RunnerConfig extends ExecutorConfig {
   npuPythonPath?: string;
   npuSmokeScriptPath?: string;
   npuWorkloadConfigPath?: string;
+  /** Admin-trusted ScienceFlow checkout declarations; absent disables checks. */
+  scienceFlowRuntimeBindings?: ScienceFlowRuntimeBindings;
 }
 
 const MAX_BODY_BYTES = 2_000_000;
@@ -431,6 +442,8 @@ export function loadRunnerConfig(env: NodeJS.ProcessEnv = process.env, cwd = rep
     scientificPackageCacheDir: env.SCIENCE_AGENT_PACKAGE_CACHE_DIR?.trim()
       ? resolve(cwd, env.SCIENCE_AGENT_PACKAGE_CACHE_DIR.trim())
       : undefined,
+    // Optional and admin-only; a malformed file fails startup.
+    scienceFlowRuntimeBindings: loadScienceFlowRuntimeBindings(env, cwd),
     shellSessionIdleMs,
   };
 }
@@ -497,6 +510,16 @@ export function createRunnerServer(
     ...await sandboxLaunchProfile(config.bwrapPath),
   });
   const executorConfig: RunnerConfig = { ...config, npuDeviceProbe: probeRequestedNpuDevices };
+  // The runtime identity check leases the selected environment and reuses the
+  // ordinary sandbox launch; it has no execution record and no ledger row.
+  const scienceFlowRuntime: ScienceFlowRuntimeCheckService | undefined = environmentStore
+    ? createScienceFlowRuntimeCheckService({
+        config: executorConfig,
+        environmentStore,
+        bindings: config.scienceFlowRuntimeBindings,
+        onDiagnostic: (event, detail) => logger.warn(event, detail),
+      })
+    : undefined;
   const executionQueues = new KeyedTaskQueue();
   const managedExecutions = new ExecutionManager(config.dataDir, detail => {
     logger.warn("execution_resources_quarantined", { ...detail });
@@ -1041,6 +1064,46 @@ export function createRunnerServer(
           sendJson(response, 202, await managedExecutions.cancel(id, owner));
           return;
         }
+      }
+      if (request.method === "POST" && url.pathname === "/scienceflow/runtime-check") {
+        const body = await readBody(request);
+        if (!verifyExecutionSignature(config.authToken, request.headers[EXECUTION_TIMESTAMP_HEADER] as string | undefined,
+          body, request.headers[EXECUTION_SIGNATURE_HEADER] as string | undefined)) {
+          sendJson(response, 401, { error: "Invalid or expired execution signature" } satisfies ApiError);
+          return;
+        }
+        // The route is off unless an administrator declared bindings; a fixed
+        // code lets the API distinguish "not configured" from a transport fault.
+        if (!scienceFlowRuntime || !config.scienceFlowRuntimeBindings) {
+          sendJson(response, 503, {
+            error: "ScienceFlow runtime identity checks are not configured on this Runner",
+            code: "SCIENCEFLOW_RUNTIME_CHECK_DISABLED",
+          } satisfies ApiError);
+          return;
+        }
+        let bodyValue: unknown;
+        try {
+          bodyValue = JSON.parse(body);
+        } catch {
+          sendJson(response, 400, { error: "ScienceFlow runtime check body is not valid JSON" } satisfies ApiError);
+          return;
+        }
+        const probe = parseScienceFlowRuntimeProbeRequest(bodyValue);
+        if (!probe) {
+          sendJson(response, 400, { error: "Invalid ScienceFlow runtime check request" } satisfies ApiError);
+          return;
+        }
+        // The binding is checked before any environment work; a request for a
+        // binding this Runner does not hold is a uniform 404.
+        if (!scienceFlowRuntime.hasBinding(probe.bindingId)) {
+          sendJson(response, 404, {
+            error: "ScienceFlow runtime binding is not configured on this Runner",
+            code: "SCIENCEFLOW_RUNTIME_BINDING_UNKNOWN",
+          } satisfies ApiError);
+          return;
+        }
+        sendJson(response, 200, await scienceFlowRuntime.check(probe));
+        return;
       }
       if (request.method === "POST" && ["/shell-executions", "/direct-shell-executions"].includes(url.pathname)) {
         const body = await readBody(request);

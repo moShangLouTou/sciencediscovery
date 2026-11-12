@@ -48,6 +48,8 @@ import type {
   ExecutionOwner,
   ExecutionLogPage,
   ManagedExecution,
+  ScienceFlowRuntimeProbeRequest,
+  ScienceFlowRuntimeProbeResult,
   UninstallEnvironmentRequest,
 } from "@sciencediscovery/schema";
 
@@ -65,6 +67,8 @@ const RUNNER_ERROR_CODE_MESSAGES: Readonly<Record<string, string>> = {
   RESULT_DIGEST_MISMATCH: "Runner execution result digest mismatch",
   EXECUTION_RESULT_CONFLICT: "Runner execution result conflict",
   EXECUTION_ID_CONFLICT: "Runner execution identity conflict",
+  SCIENCEFLOW_RUNTIME_CHECK_DISABLED: "ScienceFlow runtime identity checks are not configured on the Runner",
+  SCIENCEFLOW_RUNTIME_BINDING_UNKNOWN: "ScienceFlow runtime binding is not configured on the Runner",
 };
 
 /** HTTP adapter for the isolated execution service. */
@@ -539,5 +543,28 @@ export class RunnerClient {
 
   async cancelShellExecution(id: string, owner: ExecutionOwner, signal?: AbortSignal): Promise<ManagedExecution> {
     return this.request(`/shell-executions/${encodeURIComponent(id)}/cancel?${new URLSearchParams({ ...owner })}`, { method: "POST", signal });
+  }
+
+  /**
+   * Ask the Runner to establish which ScienceFlow source the selected
+   * environment resolves, and whether it is the administrator-declared
+   * checkout. Signed like the other execution routes; the request carries only
+   * identities, never a path or command.
+   */
+  async scienceFlowRuntimeCheck(
+    request: ScienceFlowRuntimeProbeRequest,
+    signal?: AbortSignal,
+  ): Promise<ScienceFlowRuntimeProbeResult> {
+    const body = JSON.stringify(request);
+    const timestamp = this.signingTimestamp();
+    return await this.request<ScienceFlowRuntimeProbeResult>("/scienceflow/runtime-check", {
+      method: "POST",
+      body,
+      signal,
+      headers: {
+        [EXECUTION_SIGNATURE_HEADER]: createExecutionSignature(this.token, timestamp, body),
+        [EXECUTION_TIMESTAMP_HEADER]: timestamp,
+      },
+    });
   }
 }

@@ -623,7 +623,7 @@ function localPythonPackageBindArguments(packagePath: string | undefined): strin
  * still be writing to the workspace, so its terminal state cannot be claimed:
  * callers must quarantine the workspace instead of publishing a snapshot.
  */
-async function runSandboxed(
+export async function runSandboxed(
   config: ExecutorConfig,
   launch: SandboxLaunch,
   commandArguments: string[],
@@ -921,6 +921,12 @@ export function buildSandboxLaunch(options: {
   pathEnv: string;
   procMode: SandboxProcMode;
   pythonPathEnv?: string;
+  /**
+   * Extra host paths bound read-only at their own location. Only an internal
+   * caller may pass one (the ScienceFlow runtime check binds the trusted
+   * checkout this way); it is never derived from a request field.
+   */
+  readOnlyHostBinds?: readonly string[];
   skillRoots?: SandboxSkillRoots;
   workspaceBindArgs: string[];
 }): SandboxLaunch {
@@ -975,6 +981,10 @@ export function buildSandboxLaunch(options: {
       ...options.hostInterpreterMasks,
       "--tmpfs", "/tmp",
       ...options.environmentBinds,
+      // Extra read-only host paths (this round: the trusted ScienceFlow
+      // checkout only). Mounted at their own path so an interpreter inside the
+      // sandbox resolves exactly the `sys.path` a future execution would see.
+      ...(options.readOnlyHostBinds ?? []).flatMap((path) => ["--ro-bind", path, path]),
       ...(options.egress?.bindArgs ?? []),
       ...options.workspaceBindArgs,
       ...(options.skillRoots ? [
@@ -1091,6 +1101,8 @@ export interface PreparedSandboxOptions {
   npu?: SandboxNpu;
   pathEnv: string;
   pythonPathEnv?: string;
+  /** Extra read-only host paths; see `buildSandboxLaunch`. */
+  readOnlyHostBinds?: readonly string[];
   readOnlyWorkspaceRoot?: string;
   skillRoots?: SandboxSkillRoots;
   workspaceBindArgs: string[];
@@ -1160,8 +1172,20 @@ export async function prepareSandboxLaunch(
   config: SandboxRuntimeConfig,
   options: PreparedSandboxOptions,
 ): Promise<SandboxLaunch> {
+  // Internal option, but still refuse something that cannot be a safe mount
+  // source: the root would shadow the whole sandbox, and /workspace or the
+  // environment prefix are mounts this launcher already owns.
+  for (const path of options.readOnlyHostBinds ?? []) {
+    if (typeof path !== "string" || !isAbsolute(path) || path.includes("\0") || path === "/"
+      || path === "/workspace") {
+      throw new TypeError("readOnlyHostBinds must be absolute non-root paths");
+    }
+  }
   if (executorSandboxKind(config) === "seatbelt") {
-    return await buildSeatbeltLaunch(config, { ...options, readPaths: options.environmentPaths });
+    return await buildSeatbeltLaunch(config, {
+      ...options,
+      readPaths: [...options.environmentPaths, ...(options.readOnlyHostBinds ?? [])],
+    });
   }
   const launch = buildSandboxLaunch({
     ...options,
