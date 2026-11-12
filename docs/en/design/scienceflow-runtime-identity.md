@@ -1,6 +1,8 @@
 # ScienceFlow runtime identity check
 
-Status: design note for round 11, committed before implementation.
+Status: implemented in round 11. `services/api/src/scienceflow/README.md`
+documents the shipped routes, configuration, and failure semantics; this note
+keeps the design rationale and the trust boundaries.
 
 This note answers one question and nothing broader:
 
@@ -124,14 +126,15 @@ checkout mounted read-only at its own host path.
   environment prefix and source root are read-only binds, bytecode writing is
   disabled, and the only writable path is a private directory under
   `<dataDir>/runtime-checks/<uuid>` removed after the check.
-- Bounded: fixed probe source (never a request field), 64 KiB output cap,
+- Bounded: fixed probe source (never a request field), 256 KiB output cap,
   discarded stderr, 10 s default / 30 s maximum timeout, one in-flight probe per
   binding. A malformed or oversized protocol answer is `protocol-error`.
 
 ## 5. What the probe reads without importing ScienceFlow
 
-The probe only imports `sys`, `os`, `json`, and `hashlib` and reports structured
-facts: `sys.prefix`, executable identity, `sys.path`, site-packages entries,
+The probe only imports `sys`, `os`, and `json` and reports structured facts:
+`sys.version_info`, `sys.prefix`/`sys.base_prefix`, `sys.path`, site-packages
+entries,
 `.pth` file lines (bounded), dist-info directory names, and whether
 `sitecustomize`/`usercustomize` are loaded. It never calls `find_spec` on
 `scienceflow`, never imports it, and never runs its console entry point.
@@ -166,7 +169,7 @@ distribution without a matching Git checkout is `unsupported`, never
 
 ## 7. API surface, persistence, and failure semantics
 
-```
+```text
 POST /api/projects/:projectId/sessions/:sessionId/scienceflow/plans/:planId/runtime-check
 GET  /api/projects/:projectId/sessions/:sessionId/scienceflow/plans/:planId/runtime-check
 ```

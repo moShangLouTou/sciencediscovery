@@ -1,8 +1,9 @@
 # ScienceFlow control plane: snapshots, registrations, execution plans
 
-Three control-plane capabilities expose ScienceFlow managed runs that an
+Four control-plane capabilities expose ScienceFlow managed runs that an
 administrator has explicitly bound to a ScienceDiscovery Project and Session,
-and freeze one static description of a task package. None of them starts
+freeze one static description of a task package, and answer one runtime
+identity question about a selected Runner environment. None of them starts
 ScienceFlow, imports its Artifacts, executes research code, or claims a
 lifecycle the engine did not report. An execution plan in particular is a
 **static, immutable contract**: it records what the selected files say, never
@@ -18,6 +19,8 @@ POST /api/projects/:projectId/sessions/:sessionId/scienceflow/plans
 GET  /api/projects/:projectId/sessions/:sessionId/scienceflow/plans
 GET  /api/projects/:projectId/sessions/:sessionId/scienceflow/plans/:planId
 POST /api/projects/:projectId/sessions/:sessionId/scienceflow/plans/:planId/preflight
+POST /api/projects/:projectId/sessions/:sessionId/scienceflow/plans/:planId/runtime-check
+GET  /api/projects/:projectId/sessions/:sessionId/scienceflow/plans/:planId/runtime-check
 ```
 
 All routes are mounted behind the existing `/api/` Bearer check and reuse the
@@ -46,6 +49,11 @@ Files:
 | `execution-instance-store.ts` | Durable instance identity/state: atomic, versioned, strict reads |
 | `execution-instance-backend.ts` | Narrow Linux execution adapter: start, observe, stop, confirm |
 | `engine-revision.ts` | Trusted checkout revision and working-tree check, without running the engine |
+| `runtime-config.ts` | Optional admin runtime-binding table; static load-time validation |
+| `runtime-check.ts` | Explicit check action: gates, Runner call, evidence reduction, generation |
+| `runtime-check-dto.ts` | Fixed check vocabulary, descriptions, verified rule, unknown whitelist |
+| `runtime-check-repository.ts` | Additive SQLite table, conditional generation write, corruption detection |
+| `runtime-check-http.ts` | The two runtime-check routes and their status mapping |
 
 ## Enable and disable
 
@@ -797,6 +805,128 @@ session-scoped: an escaped descendant is still out of reach there, because it
 runs without a PID namespace. Nothing in round 10 starts a research run, adds a
 route, or changes `canStart`; the five blockers stay as they were.
 
+## Round 11: the Runner-side runtime identity check
+
+One question, answered on the Runner that would run the work:
+
+> Does the administrator's declared ScienceFlow revision correspond to the
+> package source that the selected environment's interpreter resolves?
+
+Design rationale: `docs/en/design/scienceflow-runtime-identity.md`.
+
+### Enable and disable
+
+Two optional files, both read once at construction:
+
+```bash
+# Runner: the only place a checkout path exists.
+export SCIENCE_AGENT_SCIENCEFLOW_RUNTIME_BINDING_PATH=/etc/sciencediscovery/runner-scienceflow-bindings.json
+# API: identities only; a profile opts in with runtimeBindingId.
+export SCIENCE_AGENT_SCIENCEFLOW_RUNTIME_CONFIG_PATH=/etc/sciencediscovery/api-scienceflow-runtime.json
+```
+
+```json
+// Runner-side binding file
+{ "schemaVersion": 1,
+  "bindings": [{ "bindingId": "sf-source-a",
+                 "sourceRoot": "/srv/scienceflow",
+                 "expectedRevision": "0ef229de1ae126ea04387ce74ae94ffacc437df6" }] }
+
+// API-side runtime file
+{ "schemaVersion": 1,
+  "bindings": [{ "bindingId": "sf-runner-a",
+                 "runnerId": "local",
+                 "runnerBindingId": "sf-source-a",
+                 "environmentId": "env-1",
+                 "expectedEnvironmentRevisionId": "rev-1",
+                 "timeoutMs": 10000 }] }
+```
+
+Either file invalid → the owning service refuses to start with a static
+message. A profile `runtimeBindingId` that no API binding names is also a
+startup error. Unset files, a profile without `runtimeBindingId`, or a withdrawn
+profile/binding answer `503 SCIENCEFLOW_RUNTIME_CHECK_DISABLED`; nothing falls
+back to a default environment or interpreter.
+
+### What the check does
+
+`POST .../plans/:planId/runtime-check` takes no body and no query. Before the
+Runner is contacted it revalidates Project/Session ownership, the Session write
+gate, the current profile and binding, and the Session's Runner selection; after
+the await it repeats those checks, then saves. A Session deleted or a Runner
+deselected meanwhile discards the result. The request the Runner receives names
+only identities and the plan's frozen declared revision — never a path, command,
+interpreter, environment variable, or timeout.
+
+On the Runner, the check leases the configured environment through
+`withRuntime()`, launches the fixed probe through the ordinary supervised
+bubblewrap path (environment prefix and checkout read-only, `-I`, bytecode
+writing off, 10 s bound, 256 KiB output cap), and reduces the facts to fixed
+codes itself. The probe imports nothing from ScienceFlow and executes none of
+its code. A `.pth` that executes an import, a `sitecustomize`/`usercustomize`
+hook, a namespace package, an editable finder, two resolvable origins, or two
+distribution metadata directories is refused, not interpreted. A probe whose
+sandbox termination cannot be proven is `unavailable` and keeps the environment
+refused until the boundary is observed empty.
+
+### Result and storage
+
+A completed check is `200` with fixed codes and `canStart: false`:
+
+```json
+{ "schemaVersion": 1, "planId": "…", "contractDigest": "…", "bindingDigest": "…",
+  "runnerId": "local", "environmentId": "env-1", "environmentRevisionId": "rev-1",
+  "checkedAt": "2026-11-12T05:00:00.000Z", "outcome": "verified",
+  "canStart": false, "sourceKind": "git-checkout",
+  "sourceRevision": "0ef229…", "generation": 1,
+  "checks": [{ "code": "source_revision", "status": "passed", "description": "…" },
+             { "code": "duplicate_distribution", "status": "unknown", "description": "…" }],
+  "unknowns": { "dependencyClosure": "incomplete", "executionStart": "not-checked",
+                "modelGateway": "unknown", "evaluator": "not-checked", "gpu": "not-checked" } }
+```
+
+- `outcome` is `verified` only when every check passed; `duplicate_distribution`
+  may stay `unknown` when no metadata exists. Anything else is `blocked`, with
+  the failing codes.
+- Only the allow-listed evidence is returned or persisted. Host paths,
+  `sys.path`, `sourceRoot`, Git output, stderr, and probe internals never are.
+- The additive `science_flow_runtime_checks` table in `catalog.sqlite` keeps one
+  latest row per plan. Each check takes the next generation and saves
+  conditionally on it, so a slower concurrent check returns the stored winner
+  instead of overwriting it. `deleteSession`/`deleteProject` remove the rows
+  with the plan rows.
+- After a restart the row is readable and **historical**: it is evidence from
+  `checkedAt`, not current health and not a start authorization. A configuration
+  or environment change makes it stale; only a new `POST` rechecks.
+- Statuses: `401` unauthorized, uniform `404` for a foreign or missing identity,
+  `409 SCIENCEFLOW_RUNTIME_RUNNER_DENIED`, `503 ..._DISABLED`, `503
+  ..._UNAVAILABLE` (Runner unreachable, timed out, or protocol mismatch; nothing
+  persisted), `500 ..._CORRUPT` for an unreadable stored row.
+
+### Non-goals
+
+No `start_run`/resume, evaluator, model, GPU, install, network, or engine
+import. The five plan blockers and `canStart: false` are unchanged; a verified
+source binding does not clear `scienceflow_revision` or any other blocker. It
+does not prove the dependency closure, dynamic imports, CUDA/ABI, model
+gateway, evaluator runnability, or that a research run would start.
+
+### Round 11 verification checklist (liyuan)
+
+1. Both files unset → `503 SCIENCEFLOW_RUNTIME_CHECK_DISABLED`; no process
+   starts.
+2. Binding agrees with the checkout → `200 outcome: verified`, `canStart:
+   false`; `GET` returns the same row without contacting a Runner.
+3. Declared revision differs from the checkout HEAD → `200 outcome: blocked`
+   with `source_revision: failed` and `sourceRevision` equal to the real HEAD.
+4. A profile without a binding or a withdrawn binding → `503 ..._DISABLED`.
+5. A Runner binding id the Runner does not hold → `503 ..._UNAVAILABLE` and no
+   stored row.
+6. A probe slower than `timeoutMs` → `503 ..._UNAVAILABLE` and no stored row.
+7. Missing Bearer → `401`; another Project/Session or a missing plan → `404`.
+8. Restart the API → the stored row is readable; a new `POST` advances the
+   generation.
+
 ## Known limits
 
 - Single-service Bearer model: the routes add Project/Session/binding ownership
@@ -810,6 +940,10 @@ route, or changes `canStart`; the five blockers stay as they were.
   mirroring; a registration cannot outlive the administrator's binding for a
   snapshot.
 - `digestVerified`/`candidate` describe on-disk evidence only.
+- The runtime identity check supports one mapping: a plain `.pth` path line that
+  puts one Git checkout on `sys.path`. Wheels, archives, editable installs, and
+  import hooks are `unsupported` rather than guessed. Its result is a
+  point-in-time observation, not a health check or a start gate.
 
 ## Manual verification checklist (liyuan)
 
