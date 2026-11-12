@@ -860,14 +860,23 @@ interpreter, environment variable, or timeout.
 
 On the Runner, the check leases the configured environment through
 `withRuntime()`, launches the fixed probe through the ordinary supervised
-bubblewrap path (environment prefix and checkout read-only, `-I`, bytecode
-writing off, 10 s bound, 256 KiB output cap), and reduces the facts to fixed
-codes itself. The probe imports nothing from ScienceFlow and executes none of
-its code. A `.pth` that executes an import, a `sitecustomize`/`usercustomize`
-hook, a namespace package, an editable finder, two resolvable origins, or two
-distribution metadata directories is refused, not interpreted. A probe whose
-sandbox termination cannot be proven is `unavailable` and keeps the environment
-refused until the boundary is observed empty.
+bubblewrap path (environment prefix and checkout read-only, bytecode writing
+off, 10 s bound per phase, 256 KiB output cap), and reduces the facts to fixed
+codes itself. Two phases run: a **static inventory** under `-I -S -B`, where no
+`.pth` import line, `sitecustomize`, or `usercustomize` can execute before it is
+refused, reconstructs the normal `sys.path`; only when that answer is clean and
+complete does a **normal start** (`-I -B`) confirm the reconstruction exactly.
+A `.pth` that executes an import, a hook, a virtual-environment config, an
+unreadable/oversized/line-limited `.pth`, a path outside the environment or
+checkout, a single-file module, an extension module, a linked package or entry,
+a namespace package, an editable finder, two resolvable origins, or two
+distribution metadata directories is refused, not interpreted. The target
+module is never imported or executed. Every bound that is hit is reported as
+truncation and refuses the whole answer; nothing is sliced and then treated as
+complete. A probe whose sandbox termination cannot be proven is `unavailable`,
+writes a durable reservation into the execution ledger, and keeps the
+environment's package changes and deletion refused across a Runner restart
+until the boundary is observed empty.
 
 ### Result and storage
 
@@ -890,11 +899,18 @@ A completed check is `200` with fixed codes and `canStart: false`:
   the failing codes.
 - Only the allow-listed evidence is returned or persisted. Host paths,
   `sys.path`, `sourceRoot`, Git output, stderr, and probe internals never are.
-- The additive `science_flow_runtime_checks` table in `catalog.sqlite` keeps one
-  latest row per plan. Each check takes the next generation and saves
-  conditionally on it, so a slower concurrent check returns the stored winner
-  instead of overwriting it. `deleteSession`/`deleteProject` remove the rows
-  with the plan rows.
+- The additive `science_flow_runtime_checks` and
+  `science_flow_runtime_check_generations` tables in `catalog.sqlite` keep one
+  latest row per plan. Each check **allocates** its generation atomically before
+  the Runner call and saves conditionally on it, so truly overlapping checks get
+  distinct integers and a slower older result can never replace a newer one.
+  The POST answers: saved → its own `ok`; a strictly newer row stored meanwhile
+  → `ok` with that newer row; rows deleted during the await → `404`; newer
+  generation issued but no newer fact yet → `503 ..._UNAVAILABLE`. An older
+  verified observation is never returned as a new success, and a failed check
+  leaves the last valid row as history. `deleteSession`/`deleteProject` remove
+  the rows and allocations with the plan rows, so a late save cannot resurrect
+  a deleted record.
 - After a restart the row is readable and **historical**: it is evidence from
   `checkedAt`, not current health and not a start authorization. A configuration
   or environment change makes it stale; only a new `POST` rechecks.
