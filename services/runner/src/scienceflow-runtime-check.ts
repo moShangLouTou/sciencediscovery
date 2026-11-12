@@ -204,9 +204,11 @@ export function createScienceFlowRuntimeCheckService(
   deps: ScienceFlowRuntimeCheckDeps,
 ): ScienceFlowRuntimeCheckService {
   const { config, environmentStore, bindings } = deps;
-  // One probe per binding at a time: two concurrent probes would both observe
-  // the same environment and the slower answer would be no more true.
+  // Keep both identities exclusive for the entire lease wait and both phases.
+  // Different bindings may name the same environment; allowing them to run
+  // together would let their single-environment reservation overwrite an owner.
   const inFlight = new Set<string>();
+  const inFlightEnvironments = new Set<string>();
   // A store without durable reservations keeps the handle here; with the real
   // store this is only a mirror used before the store is consulted.
   const unverified = new Map<string, ExecutionBoundaryHandle | "unproven">();
@@ -275,7 +277,7 @@ export function createScienceFlowRuntimeCheckService(
         diagnose("sandbox-unsupported");
         return unavailableResult(request);
       }
-      if (inFlight.has(binding.bindingId)) {
+      if (inFlight.has(binding.bindingId) || inFlightEnvironments.has(request.environmentId)) {
         diagnose("concurrent-check");
         return unavailableResult(request);
       }
@@ -286,8 +288,16 @@ export function createScienceFlowRuntimeCheckService(
       }
 
       inFlight.add(binding.bindingId);
+      inFlightEnvironments.add(request.environmentId);
       try {
         return await environmentStore.withRuntime(request.environmentId, async (leased) => {
+          // A reservation can appear while this reader waits behind an update.
+          // Recheck before using the leased prefix or launching either phase.
+          const afterLease = clearProvenReservation(request.environmentId);
+          if (afterLease !== "clear") {
+            diagnose(afterLease === "corrupt" ? "reservation-corrupt" : "termination-unverified");
+            return unavailableResult(request);
+          }
           if (
             leased.revision.id !== request.expectedEnvironmentRevisionId ||
             leased.revision.language !== "python"
@@ -424,6 +434,7 @@ export function createScienceFlowRuntimeCheckService(
         return unavailableResult(request);
       } finally {
         inFlight.delete(binding.bindingId);
+        inFlightEnvironments.delete(request.environmentId);
       }
     },
   };

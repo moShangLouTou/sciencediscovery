@@ -58,13 +58,9 @@ export const SCIENCE_FLOW_RUNTIME_PROBE_SOURCE = String.raw`
 import sys
 sys.dont_write_bytecode = True
 import json, os, site, stat
-try:
-    import importlib.machinery as _machinery
-    _EXT = tuple(_machinery.EXTENSION_SUFFIXES)
-    _BYTECODE = tuple(_machinery.BYTECODE_SUFFIXES)
-except Exception:
-    _EXT = (".so", ".pyd")
-    _BYTECODE = (".pyc",)
+import importlib.machinery as _machinery
+_EXT = tuple(_machinery.EXTENSION_SUFFIXES)
+_BYTECODE = tuple(_machinery.BYTECODE_SUFFIXES)
 
 SCHEMA = 2
 MAX_PATH = 64
@@ -284,9 +280,13 @@ def hooks_for(entry):
     if st is None or not stat.S_ISDIR(st.st_mode):
         return result
     for name in ("sitecustomize", "usercustomize"):
-        for candidate in (os.path.join(entry, name + ".py"), os.path.join(entry, name)):
-            if os.path.lexists(candidate):
-                result[name] = True
+        # -B forbids writing bytecode, not loading an existing sourceless .pyc.
+        # Ordinary imports also load ABI-specific extensions and packages. Any
+        # candidate is unsupported here, including links and namespace portions.
+        candidates = [os.path.join(entry, name)]
+        candidates.extend(os.path.join(entry, name + suffix)
+                          for suffix in (".py",) + _EXT + _BYTECODE)
+        result[name] = any(os.path.lexists(candidate) for candidate in candidates)
     return result
 
 def distributions(site_dirs):

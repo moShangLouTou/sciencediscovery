@@ -17,7 +17,9 @@ const { test } = createTest(import.meta.url, {
   tags: ["category:ut", "os:linux", "arch:amd64", "arch:arm64"],
 });
 import assert from "node:assert/strict";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { resolve } from "node:path";
 
 import {
   SCIENCE_FLOW_RUNTIME_CHECK_CODES,
@@ -270,4 +272,62 @@ test("RT-REPO-09 an allocation table that predates the stored row still counts p
   assert.equal(store.allocate(PROJECT_ID, SESSION_ID, PLAN_ID), 2);
   assert.equal(store.save(draft(2, check({ generation: 2 }))).saved, true);
   assert.equal(store.latest(PROJECT_ID, SESSION_ID, PLAN_ID)?.generation, 2);
+});
+
+for (const scope of ["Session", "Project"] as const) {
+  test(`RT-REPO save and ${scope} deletion cannot interleave across allocation validation and insertion`, async context => {
+    await mkdir(resolve(process.cwd(), ".tmp/r"), { recursive: true });
+    const root = await mkdtemp(resolve(process.cwd(), ".tmp/r/runtime-save-"));
+    const writer = new ScienceFlowRuntimeCheckRepository(new DatabaseSync(resolve(root, "catalog.sqlite")));
+    const deleter = new ScienceFlowRuntimeCheckRepository(new DatabaseSync(resolve(root, "catalog.sqlite")));
+    context.after(async () => { writer.database.close(); deleter.database.close(); await rm(root, { recursive: true, force: true }); });
+    writer.database.exec("PRAGMA busy_timeout=0");
+    deleter.database.exec("PRAGMA busy_timeout=0");
+    const remove = () => scope === "Session" ? deleter.deleteSession(SESSION_ID) : deleter.deleteProject(PROJECT_ID);
+    const generation = writer.allocate(PROJECT_ID, SESSION_ID, PLAN_ID);
+    const prepare = writer.database.prepare.bind(writer.database);
+    let attempted = false;
+    let deletionCommitted = false;
+    context.mock.method(writer.database, "prepare", (sql: string) => {
+      const statement = prepare(sql);
+      if (sql.includes("SELECT plan_id, project_id, session_id, allocated")) {
+        const get = statement.get.bind(statement);
+        context.mock.method(statement, "get", (...args: SQLInputValue[]) => {
+          const row = get(...args);
+          if (!attempted) {
+            attempted = true;
+            try { remove(); deletionCommitted = true; }
+            catch (error) {
+              assert.ok(error instanceof Error && "errcode" in error && error.errcode === 5, "only a live writer lock may defer deletion");
+            }
+          }
+          return row;
+        });
+      }
+      return statement;
+    });
+    const saved = writer.save(draft(generation, check({ generation })));
+    assert.equal(attempted, true);
+    if (deletionCommitted) {
+      assert.equal(saved.saved, false, "a deletion which committed first must prevent the stale insert");
+    } else {
+      assert.equal(saved.saved, true);
+      remove();
+    }
+    assert.equal(writer.latest(PROJECT_ID, SESSION_ID, PLAN_ID), undefined);
+    assert.equal(writer.database.prepare("SELECT COUNT(*) AS n FROM science_flow_runtime_check_generations").get()?.n, 0);
+  });
+}
+
+test("RT-REPO a failed save rolls back and leaves deletion and retry usable", context => {
+  const store = repository();
+  context.after(() => store.database.close());
+  const generation = store.allocate(PROJECT_ID, SESSION_ID, PLAN_ID);
+  store.database.exec("CREATE TRIGGER reject_check BEFORE INSERT ON science_flow_runtime_checks BEGIN SELECT RAISE(ABORT, 'injected save failure'); END");
+  assert.throws(() => store.save(draft(generation)), /injected save failure/);
+  assert.equal(store.latest(PROJECT_ID, SESSION_ID, PLAN_ID), undefined);
+  store.database.exec("DROP TRIGGER reject_check");
+  assert.equal(store.save(draft(generation)).saved, true);
+  store.deleteSession(SESSION_ID);
+  assert.equal(store.latest(PROJECT_ID, SESSION_ID, PLAN_ID), undefined);
 });

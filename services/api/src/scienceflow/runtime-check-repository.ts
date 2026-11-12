@@ -235,55 +235,66 @@ export class ScienceFlowRuntimeCheckRepository
     ) {
       throw new ScienceFlowRuntimeCheckCorruptError();
     }
-    // Only a generation this plan actually issued may be written. Once the
-    // Session/Project delete removed the allocations, a check that was still in
-    // flight cannot insert a row back into an empty table.
-    const allocation = this.database
-      .prepare(
-        `SELECT plan_id, project_id, session_id, allocated
-           FROM science_flow_runtime_check_generations
-          WHERE plan_id = ?`,
-      )
-      .get(draft.check.planId) as GenerationRow | undefined;
-    if (
-      allocation === undefined ||
-      allocation.plan_id !== draft.check.planId ||
-      allocation.project_id !== draft.projectId ||
-      allocation.session_id !== draft.sessionId ||
-      typeof allocation.allocated !== "number" ||
-      !Number.isSafeInteger(allocation.allocated) ||
-      draft.generation > allocation.allocated
-    ) {
-      return { saved: false };
+    // Share a write lock with deletion from validation through the returned
+    // snapshot. Another API connection cannot remove the allocation after the
+    // check and before this insert, or resurrect a row after deletion commits.
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      // Only a generation this plan actually issued may be written. Once the
+      // Session/Project delete removed the allocations, a check that was still in
+      // flight cannot insert a row back into an empty table.
+      const allocation = this.database
+        .prepare(
+          `SELECT plan_id, project_id, session_id, allocated
+             FROM science_flow_runtime_check_generations
+            WHERE plan_id = ?`,
+        )
+        .get(draft.check.planId) as GenerationRow | undefined;
+      if (
+        allocation === undefined ||
+        allocation.plan_id !== draft.check.planId ||
+        allocation.project_id !== draft.projectId ||
+        allocation.session_id !== draft.sessionId ||
+        typeof allocation.allocated !== "number" ||
+        !Number.isSafeInteger(allocation.allocated) ||
+        draft.generation > allocation.allocated
+      ) {
+        this.database.exec("COMMIT");
+        return { saved: false };
+      }
+      const record = JSON.stringify(reduceCheck(draft.check));
+      const result = this.database
+        .prepare(
+          `INSERT INTO science_flow_runtime_checks
+             (plan_id, project_id, session_id, generation, checked_at, record_json)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(plan_id) DO UPDATE SET
+             generation = excluded.generation,
+             checked_at = excluded.checked_at,
+             record_json = excluded.record_json
+           WHERE excluded.generation > science_flow_runtime_checks.generation
+             AND science_flow_runtime_checks.project_id = excluded.project_id
+             AND science_flow_runtime_checks.session_id = excluded.session_id`,
+        )
+        .run(
+          draft.check.planId,
+          draft.projectId,
+          draft.sessionId,
+          draft.generation,
+          draft.check.checkedAt,
+          record,
+        );
+      const saved = Number(result.changes) === 1;
+      const row = this.select(draft.projectId, draft.sessionId, draft.check.planId);
+      // Read the winning generation under the same lock. Deletion cannot
+      // change the returned snapshot between the upsert and this read.
+      const outcome = row ? { saved, stored: parseRow(row) } : { saved };
+      this.database.exec("COMMIT");
+      return outcome;
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch { /* Preserve the original failure. */ }
+      throw error;
     }
-    const record = JSON.stringify(reduceCheck(draft.check));
-    const result = this.database
-      .prepare(
-        `INSERT INTO science_flow_runtime_checks
-           (plan_id, project_id, session_id, generation, checked_at, record_json)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(plan_id) DO UPDATE SET
-           generation = excluded.generation,
-           checked_at = excluded.checked_at,
-           record_json = excluded.record_json
-         WHERE excluded.generation > science_flow_runtime_checks.generation
-           AND science_flow_runtime_checks.project_id = excluded.project_id
-           AND science_flow_runtime_checks.session_id = excluded.session_id`,
-      )
-      .run(
-        draft.check.planId,
-        draft.projectId,
-        draft.sessionId,
-        draft.generation,
-        draft.check.checkedAt,
-        record,
-      );
-    const saved = Number(result.changes) === 1;
-    const row = this.select(draft.projectId, draft.sessionId, draft.check.planId);
-    // A missed write can mean a newer check already won, or that the owning
-    // Session was deleted while the check ran. The caller distinguishes them
-    // by whether a row is still there.
-    return row ? { saved, stored: parseRow(row) } : { saved };
   }
 
   deleteSession(sessionId: string): void {

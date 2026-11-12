@@ -125,7 +125,7 @@ Everything outside the subset is refused, never approximated:
 
 | Observed | Refusal code |
 | --- | --- |
-| `.pth` import line, `sitecustomize`, `usercustomize`, venv `pyvenv.cfg` | `startup_hooks=failed` |
+| `.pth` import line, `sitecustomize`/`usercustomize` (source, sourceless bytecode, native extension or package), venv `pyvenv.cfg` | `startup_hooks=failed` |
 | unreadable, linked, non-regular, non-UTF-8, oversized (> 64 KiB), or line-limited `.pth` | `startup_hooks=failed` |
 | relative, missing, non-directory, or out-of-root `sys.path` entry | `startup_hooks=failed` |
 | truncation flag raised by any probe bound | `startup_hooks=failed` |
@@ -180,7 +180,10 @@ reported as truncation rather than silently cut.
   gone.
 - Bounded: fixed probe source (never a request field), 256 KiB output cap,
   discarded stderr, 10 s default / 30 s maximum timeout per phase, one in-flight
-  probe per binding. A malformed, wrong-mode, or wrong-version protocol answer
+  probe per binding and per environment, including the wait for its lease.
+  Different bindings cannot create multiple outstanding owners of one
+  environment. The reservation is checked again after lease acquisition, before
+  either probe phase starts. A malformed, wrong-mode, or wrong-version protocol answer
   is `protocol-error`; a bound hit is refused.
 
 ## 5. What the probe reads without importing ScienceFlow
@@ -255,7 +258,10 @@ GET  /api/projects/:projectId/sessions/:sessionId/scienceflow/plans/:planId/runt
   valid row as history; an older verified result is never presented as a new
   success. Save failure is a 500, distinct from a check that ran and reported
   `blocked`. `deleteSession`/`deleteProject` remove both rows and the
-  allocation, so a late save cannot resurrect a deleted record.
+  allocation. Saving holds one `BEGIN IMMEDIATE` transaction from allocation
+  validation through the result snapshot, so a deletion on another SQLite
+  connection cannot commit between validation and insertion. Failed saves roll
+  back; a late save cannot resurrect a deleted record.
 - Unverified probe termination is not only an in-memory state: the reservation
   in the execution ledger (§4) blocks environment mutation across a Runner
   restart until the boundary is proven empty.

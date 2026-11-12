@@ -15,10 +15,12 @@
 import { createTest } from "../../../test/support/tagged/compat.mjs";
 const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:linux", "arch:amd64", "arch:arm64", "sandbox:bubblewrap"] });
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { chmod, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { createScienceFlowRuntimeCheckService } from "./scienceflow-runtime-check.js";
+import { loadRunnerConfig } from "./server.js";
 
 
 import {
@@ -908,7 +910,6 @@ test("managed provisioner selects pinned Linux and macOS releases", async (conte
   assert.deepEqual(requestedUrls, [arm64.url]);
 });
 
-
 test("runtime pip defaults to the configured mirror and explicit sources still win", async (context) => {
   const old = process.env.SCIENCE_AGENT_PYPI_INDEX;
   process.env.SCIENCE_AGENT_PYPI_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple";
@@ -926,4 +927,57 @@ test("runtime pip defaults to the configured mirror and explicit sources still w
 test("an unresponsive external environment command is terminated within its bounded wait", async () => {
   await assert.rejects(executeEnvironmentCommand(process.execPath, ["-e", "setInterval(() => {}, 1000)"], process.env, 50),
     (error: any) => error.killed === true && error.signal === "SIGTERM");
+});
+
+test("runtime check environment exclusivity retains an unproven real store gate across binding aliases", async context => {
+  const { executor, provisionerPath, root, commands } = await fixture(context);
+  const ledger = resolve(root, "exclusive-runtime.sqlite");
+  const db = new DatabaseSync(ledger);
+  db.exec("CREATE TABLE executions (id TEXT, record TEXT); CREATE TABLE execution_resources (execution TEXT, environment TEXT)");
+  db.close();
+  const store = new EnvironmentStore({
+    allowedChannels: ["conda-forge"], enabled: true, provisionerPath,
+    root: resolve(root, "envs"), runnerVersion: "test", executionLedgerPath: ledger,
+  }, executor);
+  await store.initialize();
+  await store.setupManagedEnvironments();
+  const task = await store.createTask("exclusive-runtime", "python");
+  const hold = Promise.withResolvers<void>();
+  let leases = 0;
+  const revision = "0".repeat(40);
+  const service = createScienceFlowRuntimeCheckService({
+    config: loadRunnerConfig({
+      SCIENCE_AGENT_DATA_DIR: resolve(root, "probe-data"),
+      SCIENCE_AGENT_SANDBOX_PROVIDER: "bubblewrap",
+      SCIENCE_AGENT_RUNNER_TOKEN: randomBytes(24).toString("hex"),
+    }, root),
+    bindings: { bindingFor: bindingId => ({ bindingId, sourceRoot: root, expectedRevision: revision }) },
+    environmentStore: {
+      runtimeCheckBoundary: id => store.runtimeCheckBoundary(id),
+      withRuntime: (id, _operation) => store.withRuntime(id, async () => {
+        leases++;
+        await hold.promise;
+        // The real store records an unproven boundary before releasing its
+        // reader. We do not pretend a synthetic handle proves a live child.
+        store.reserveRuntimeCheck(id, "unproven");
+        throw new Error("synthetic unproven probe");
+      }),
+    },
+  });
+  const request = (bindingId: string) => ({ schemaVersion: 1 as const, requestId: bindingId, bindingId,
+    environmentId: task.id, expectedEnvironmentRevisionId: task.currentRevisionId, expectedRevision: revision });
+  const first = service.check(request("alias-a"));
+  // Yield until the real reader has entered; other aliases must never enter.
+  for (let i = 0; leases === 0 && i < 100; i++) await new Promise(done => setTimeout(done, 1));
+  const others = [service.check(request("alias-b")), service.check(request("alias-c"))];
+  try { assert.equal(leases, 1); }
+  finally { hold.resolve(); await Promise.all([first, ...others]); }
+  assert.equal(leases, 1);
+  assert.equal(store.runtimeCheckBoundary(task.id), "unproven");
+  const before = commands.length;
+  await assert.rejects(store.install(task.id, ["other=1"]), { code: "ENVIRONMENT_EXECUTION_UNVERIFIED" });
+  await assert.rejects(store.deleteTask(task.id), { code: "ENVIRONMENT_EXECUTION_UNVERIFIED" });
+  assert.equal(commands.length, before);
+  assert.equal((await service.check(request("alias-d"))).outcome, "unavailable");
+  assert.equal(leases, 1, "later aliases must not replace the unresolved owner");
 });
