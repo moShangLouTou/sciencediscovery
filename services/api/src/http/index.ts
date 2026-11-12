@@ -346,6 +346,7 @@ import { digest as configurationDigest } from "../configuration/validation.js";
 import { handleScienceFlowRunSnapshotRequest } from "../scienceflow/http.js";
 import { handleScienceFlowRegistrationRequest } from "../scienceflow/registration-http.js";
 import { handleScienceFlowExecutionPlanRequest } from "../scienceflow/execution-plan-http.js";
+import { handleScienceFlowRuntimeCheckRequest } from "../scienceflow/runtime-check-http.js";
 import {
   createPlatformServices,
   initializePlatformServices,
@@ -445,6 +446,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
     scienceFlowExecutionPlans,
     scienceFlowRegistrations,
     scienceFlowRunSnapshot,
+    scienceFlowRuntimeChecks,
     skillCatalog,
     store,
     webBroker,
@@ -1119,6 +1121,9 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       // Immutable execution plans: a frozen contract, a static preflight, and
       // stored metadata. Nothing here starts ScienceFlow or authorizes a start.
       if (await handleScienceFlowExecutionPlanRequest(request, response, url, scienceFlowExecutionPlans)) return;
+      // Explicit runtime identity check: one plan, one administrator binding,
+      // one Runner probe. Never starts ScienceFlow and never a start gate.
+      if (await handleScienceFlowRuntimeCheckRequest(request, response, url, scienceFlowRuntimeChecks)) return;
       if (request.method === "GET" && url.pathname === "/api/error-diagnostics") {
         const ids = diagnosticIds(url.searchParams);
         if (!ids) { sendError(response, 400, "Invalid diagnostic correlation id"); return; }

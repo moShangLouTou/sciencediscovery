@@ -222,6 +222,7 @@ function harness(options: HarnessOptions = {}): Harness {
   const defaultProfiles: ScienceFlowExecutionSettings = {
     profileFor: (profileId: string) =>
       profileId === PROFILE.profileId ? PROFILE : undefined,
+    profiles: [PROFILE],
   };
   const profiles =
     "profiles" in options ? options.profiles : defaultProfiles;
@@ -310,12 +311,15 @@ test("PLAN-C02 a retry returns the stored plan without re-reading files", async 
 });
 
 test("PLAN-C03 reusing a request id with another profile conflicts", async () => {
+  const profiles = ["profile-1", "profile-2"].map((profileId) => ({
+    ...PROFILE,
+    profileId,
+  }));
   const test = harness({
     profiles: {
       profileFor: (profileId) =>
-        profileId === "profile-1" || profileId === "profile-2"
-          ? { ...PROFILE, profileId }
-          : undefined,
+        profiles.find((profile) => profile.profileId === profileId),
+      profiles,
     },
   });
   await test.service.create(IDENTITY, INPUT);
@@ -601,6 +605,7 @@ test("PLAN-P07 preflight is disabled when the feature is off or the profile with
     profiles: {
       profileFor: (profileId: string) =>
         available && profileId === PROFILE.profileId ? PROFILE : undefined,
+      profiles: [PROFILE],
     },
   });
   const created = await test.service.create(IDENTITY, INPUT);

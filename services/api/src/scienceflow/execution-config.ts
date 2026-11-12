@@ -49,6 +49,11 @@ export interface ScienceFlowExecutionProfile {
   readonly taskPackageRoot: string;
   /** Every file the static check reads must resolve inside one of these roots. */
   readonly allowedReadRoots: readonly string[];
+  /**
+   * Names a binding in the separate runtime configuration. Without it the
+   * profile works as before and an explicit runtime check answers disabled.
+   */
+  readonly runtimeBindingId?: string;
 }
 
 /** Validated settings handed to the composition root. */
@@ -57,6 +62,8 @@ export interface ScienceFlowExecutionSettings {
   readonly profileFor: (
     profileId: string,
   ) => ScienceFlowExecutionProfile | undefined;
+  /** Every validated profile, for startup cross-checks against runtime bindings. */
+  readonly profiles: readonly ScienceFlowExecutionProfile[];
 }
 
 /** A configuration problem. Messages are static: no paths, values, or parse errors. */
@@ -122,6 +129,7 @@ function parseConfig(value: unknown): ScienceFlowExecutionSettings {
   const byId = parseProfiles(value.profiles);
   return Object.freeze({
     profileFor: (profileId: string) => byId.get(profileId),
+    profiles: Object.freeze([...byId.values()]),
   });
 }
 
@@ -160,6 +168,7 @@ function parseProfile(
       "manifestPath",
       "taskPackageRoot",
       "allowedReadRoots",
+      "runtimeBindingId",
     ],
     field,
   );
@@ -185,12 +194,18 @@ function parseProfile(
   const allowedReadRoots = roots.map((root, index) =>
     requireAbsolutePath(root, `${field}.allowedReadRoots[${index}]`),
   );
+  const runtimeBindingId =
+    value.runtimeBindingId === undefined
+      ? undefined
+      : requireIdentity(value.runtimeBindingId, `${field}.runtimeBindingId`);
   return Object.freeze({
     profileId,
     scienceFlowRevision: declared,
     manifestPath,
     taskPackageRoot,
     allowedReadRoots: Object.freeze(allowedReadRoots),
+    // Omitted rather than set to undefined so the profile shape stays exact.
+    ...(runtimeBindingId === undefined ? {} : { runtimeBindingId }),
   });
 }
 

@@ -73,6 +73,10 @@ import {
   createScienceFlowExecutionPlanService,
   type ScienceFlowExecutionPlanService,
 } from "../scienceflow/execution-plan.js";
+import {
+  createScienceFlowRuntimeCheckService,
+  type ScienceFlowRuntimeCheckService,
+} from "../scienceflow/runtime-check.js";
 import { createScienceFlowContractBuilder } from "../scienceflow/execution-contract.js";
 
 export interface ApiServerDependencies {
@@ -590,6 +594,49 @@ export function createPlatformServices(
       buildContract: createScienceFlowContractBuilder(),
     });
 
+  // Credentials and trusted host keys live in the store, so the compute client
+  // asks for them per machine instead of inheriting an ambient SSH agent or the
+  // user's known_hosts. Constructed here because the runtime identity check
+  // selects a Runner through the same client.
+  const remoteCompute = dependencies.remoteCompute ?? new RemoteComputeClient(
+    config.sshConfigPath,
+    async (hostId) => store.remoteHostSshAccess(hostId),
+    {
+      logger: apiLog,
+      // Machines on an isolated network cannot fetch the environment
+      // provisioner themselves; this installation keeps one per architecture
+      // and hands it over when it deploys their Runner.
+      provisionerCacheDir: resolve(config.dataDir, "provisioners"),
+    },
+  );
+
+  // The runtime identity check is an explicit control-plane action. It asks the
+  // binding's Runner to resolve ScienceFlow from the selected environment's own
+  // interpreter and reports fixed codes. Without either administrator file the
+  // action answers disabled while stored results stay readable.
+  const scienceFlowRuntimeChecks: ScienceFlowRuntimeCheckService =
+    createScienceFlowRuntimeCheckService({
+      identities: {
+        getProject: (projectId) => store.getProject(projectId),
+        getSession: (sessionId) => store.getSession(sessionId),
+      },
+      requireWritable: (sessionId) => store.assertSessionWritable(sessionId),
+      runnerAllowed: (sessionId, runnerId) => {
+        try {
+          store.assertSessionAllowsRunner(sessionId, runnerId);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      profiles: config.scienceFlowExecution,
+      runtime: config.scienceFlowRuntime,
+      plans: () => store.scienceFlowExecutionPlans,
+      store: () => store.scienceFlowRuntimeChecks,
+      runnerFor: (runnerId) =>
+        runnerId === "local" ? runnerClient : remoteCompute.runnerClient(runnerId),
+    });
+
   return {
     connectorPlugins,
     artifactManager,
@@ -614,24 +661,12 @@ export function createPlatformServices(
     paperService,
     permissionDecisions: new PermissionDecisionQueue(),
     provenanceRecorder,
-    // Credentials and trusted host keys live in the store, so the compute
-    // client asks for them per machine instead of inheriting an ambient SSH
-    // agent or the user's known_hosts.
-    remoteCompute: dependencies.remoteCompute ?? new RemoteComputeClient(
-      config.sshConfigPath,
-      async (hostId) => store.remoteHostSshAccess(hostId),
-      {
-        logger: apiLog,
-        // Machines on an isolated network cannot fetch the environment
-        // provisioner themselves; this installation keeps one per architecture
-        // and hands it over when it deploys their Runner.
-        provisionerCacheDir: resolve(config.dataDir, "provisioners"),
-      },
-    ),
+    remoteCompute,
     runnerClient,
     scienceFlowExecutionPlans,
     scienceFlowRegistrations,
     scienceFlowRunSnapshot,
+    scienceFlowRuntimeChecks,
     skillCatalog,
     store,
     webBroker,
