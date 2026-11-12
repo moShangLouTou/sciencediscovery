@@ -91,7 +91,8 @@ function repository(): ScienceFlowRuntimeCheckRepository {
 test("RT-REPO-01 a stored check reads back with rebuilt descriptions", () => {
   const store = repository();
   assert.equal(store.latest(PROJECT_ID, SESSION_ID, PLAN_ID), undefined);
-  const result = store.save(draft(1), 0);
+  assert.equal(store.allocate(PROJECT_ID, SESSION_ID, PLAN_ID), 1);
+  const result = store.save(draft(1));
   assert.equal(result.saved, true);
   const stored = store.latest(PROJECT_ID, SESSION_ID, PLAN_ID);
   if (!stored) assert.fail("expected a stored check");
@@ -112,7 +113,8 @@ test("RT-REPO-01 a stored check reads back with rebuilt descriptions", () => {
 
 test("RT-REPO-02 the stored record carries no prose or host detail", () => {
   const store = repository();
-  store.save(draft(1), 0);
+  store.allocate(PROJECT_ID, SESSION_ID, PLAN_ID);
+  store.save(draft(1));
   const row = store.database
     .prepare("SELECT record_json FROM science_flow_runtime_checks")
     .get() as { record_json: string };
@@ -128,80 +130,114 @@ test("RT-REPO-02 the stored record carries no prose or host detail", () => {
 
 test("RT-REPO-03 a newer generation replaces an older one", () => {
   const store = repository();
-  assert.equal(store.save(draft(1), 0).saved, true);
-  const next = store.save(draft(2, check({ generation: 2, checkedAt: "2026-11-12T00:01:00.000Z" })), 1);
+  assert.equal(store.allocate(PROJECT_ID, SESSION_ID, PLAN_ID), 1);
+  assert.equal(store.save(draft(1)).saved, true);
+  assert.equal(store.allocate(PROJECT_ID, SESSION_ID, PLAN_ID), 2);
+  const next = store.save(draft(2, check({ generation: 2, checkedAt: "2026-11-12T00:01:00.000Z" })));
   assert.equal(next.saved, true);
   const stored = store.latest(PROJECT_ID, SESSION_ID, PLAN_ID);
   assert.equal(stored?.generation, 2);
   assert.equal(stored?.check.checkedAt, "2026-11-12T00:01:00.000Z");
 });
 
-test("RT-REPO-04 a writer that observed a stale generation loses and sees the winner", () => {
+test("RT-REPO-04 an older check that finishes late never replaces a newer blocked fact", () => {
   const store = repository();
-  store.save(draft(1), 0);
-  // The second writer observed generation 0 before the first one inserted, so
-  // its insert hits the existing row and must not replace it.
-  const late = store.save(draft(1, check({ environmentId: "environment-2" })), 0);
-  assert.equal(late.saved, false);
-  assert.equal(late.stored?.check.environmentId, "environment-1");
-  assert.equal(store.latest(PROJECT_ID, SESSION_ID, PLAN_ID)?.generation, 1);
+  assert.equal(store.allocate(PROJECT_ID, SESSION_ID, PLAN_ID), 1);
+  assert.equal(store.allocate(PROJECT_ID, SESSION_ID, PLAN_ID), 2);
+  // The newer request completes first with a real blocked observation.
+  const newer = store.save(draft(2, check({
+    generation: 2,
+    outcome: "blocked",
+    sourceKind: "installed-distribution",
+    checks: SCIENCE_FLOW_RUNTIME_CHECK_CODES.map((code) => ({
+      code,
+      status: code === "source_root" ? ("failed" as const) : ("passed" as const),
+    })),
+  })));
+  assert.equal(newer.saved, true);
+  // The older request finishes later with a verified observation. It must not
+  // win, and the persisted newer fact is what it sees.
+  const older = store.save(draft(1, check({ environmentId: "environment-2" })));
+  assert.equal(older.saved, false);
+  assert.equal(older.stored?.generation, 2);
+  assert.equal(older.stored?.check.outcome, "blocked");
+  assert.equal(store.latest(PROJECT_ID, SESSION_ID, PLAN_ID)?.generation, 2);
 });
 
-test("RT-REPO-05 delete removes only the owning Session or Project", () => {
+test("RT-REPO-05 delete removes only the owning Session or Project, and its allocations", () => {
   const store = repository();
-  store.save(draft(1), 0);
+  store.allocate(PROJECT_ID, SESSION_ID, PLAN_ID);
+  store.save(draft(1));
   const other = {
     ...draft(1),
     projectId: "project-2",
     sessionId: "session-2",
     check: check({ planId: "plan-2" }),
   };
-  assert.equal(store.save(other, 0).saved, true);
+  store.allocate("project-2", "session-2", "plan-2");
+  assert.equal(store.save(other).saved, true);
 
   store.deleteSession(SESSION_ID);
   assert.equal(store.latest(PROJECT_ID, SESSION_ID, PLAN_ID), undefined);
   assert.notEqual(store.latest("project-2", "session-2", "plan-2"), undefined);
+  // A check still in flight after the delete cannot insert its row back.
+  assert.equal(store.save(draft(1, check({ environmentId: "environment-2" }))).saved, false);
+  assert.equal(store.latest(PROJECT_ID, SESSION_ID, PLAN_ID), undefined);
 
   store.deleteProject("project-2");
   assert.equal(store.latest("project-2", "session-2", "plan-2"), undefined);
 });
 
-test("RT-REPO-06 a check relies on the generation it was given", () => {
+test("RT-REPO-06 a check relies on an allocated generation", () => {
   const store = repository();
   assert.throws(
-    () => store.save(draft(2), 0),
+    () => store.save(draft(0, check({ generation: 0 }))),
     (error: unknown) => error instanceof ScienceFlowRuntimeCheckCorruptError,
   );
   assert.throws(
-    () => store.save(draft(1, check({ planId: "" })), 0),
+    () => store.save(draft(1, check({ generation: 2 }))),
     (error: unknown) => error instanceof ScienceFlowRuntimeCheckCorruptError,
   );
+  assert.throws(
+    () => store.save(draft(1, check({ planId: "" }))),
+    (error: unknown) => error instanceof ScienceFlowRuntimeCheckCorruptError,
+  );
+  // No allocation, no write: a generation is issued before the Runner is asked.
+  assert.equal(store.save(draft(1)).saved, false);
+  store.allocate(PROJECT_ID, SESSION_ID, PLAN_ID);
+  assert.equal(store.save(draft(2)).saved, false, "a generation that was never issued is refused");
 });
 
 test("RT-REPO-07 a corrupt row is refused, never repaired or skipped", () => {
   const store = repository();
-  store.save(draft(1), 0);
+  store.allocate(PROJECT_ID, SESSION_ID, PLAN_ID);
+  store.save(draft(1));
   const target = (record: Record<string, unknown>) => {
     store.database
       .prepare("UPDATE science_flow_runtime_checks SET record_json = ?")
       .run(JSON.stringify(record));
   };
-  const valid = () =>
-    JSON.parse(
-      (
-        store.database
-          .prepare("SELECT record_json FROM science_flow_runtime_checks")
-          .get() as { record_json: string }
-      ).record_json,
-    ) as Record<string, unknown>;
+  const original = JSON.parse(
+    (
+      store.database
+        .prepare("SELECT record_json FROM science_flow_runtime_checks")
+        .get() as { record_json: string }
+    ).record_json,
+  ) as Record<string, unknown>;
 
-  target({ ...valid(), sourceKind: "checkout" });
+  target({ ...original, sourceKind: "checkout" });
   assert.throws(
     () => store.latest(PROJECT_ID, SESSION_ID, PLAN_ID),
     (error: unknown) => error instanceof ScienceFlowRuntimeCheckCorruptError,
   );
 
-  target({ ...valid(), outcome: "verified", checks: passing().map((entry) => (entry.code === "source_revision" ? { ...entry, status: "failed" } : entry)) });
+  target({
+    ...original,
+    outcome: "verified",
+    checks: passing().map((entry) =>
+      entry.code === "source_revision" ? { ...entry, status: "failed" } : entry,
+    ),
+  });
   assert.throws(
     () => store.latest(PROJECT_ID, SESSION_ID, PLAN_ID),
     (error: unknown) => error instanceof ScienceFlowRuntimeCheckCorruptError,
@@ -210,4 +246,28 @@ test("RT-REPO-07 a corrupt row is refused, never repaired or skipped", () => {
   // The plan-level read answer stays available; only the corrupt check refuses.
   const state = runtimeCheckState(PLAN_ID, undefined);
   assert.deepEqual(state, { planId: PLAN_ID, check: null });
+});
+
+test("RT-REPO-08 generations are allocated atomically and survive a restart", () => {
+  const store = repository();
+  assert.equal(store.allocate(PROJECT_ID, SESSION_ID, PLAN_ID), 1);
+  assert.equal(store.allocate(PROJECT_ID, SESSION_ID, PLAN_ID), 2);
+  // A second repository over the same database is the restart case; it must
+  // keep counting rather than reissuing a generation that is still in flight.
+  const restarted = new ScienceFlowRuntimeCheckRepository(store.database);
+  assert.equal(restarted.allocate(PROJECT_ID, SESSION_ID, PLAN_ID), 3);
+  assert.equal(restarted.save(draft(3, check({ generation: 3 }))).saved, true);
+  assert.equal(restarted.latest(PROJECT_ID, SESSION_ID, PLAN_ID)?.generation, 3);
+});
+
+test("RT-REPO-09 an allocation table that predates the stored row still counts past it", () => {
+  const store = repository();
+  assert.equal(store.allocate(PROJECT_ID, SESSION_ID, PLAN_ID), 1);
+  assert.equal(store.save(draft(1)).saved, true);
+  // Simulate an upgrade from the first storage layout: a stored row but no
+  // allocation counter. The next generation is seeded from the stored row.
+  store.database.prepare("DELETE FROM science_flow_runtime_check_generations").run();
+  assert.equal(store.allocate(PROJECT_ID, SESSION_ID, PLAN_ID), 2);
+  assert.equal(store.save(draft(2, check({ generation: 2 }))).saved, true);
+  assert.equal(store.latest(PROJECT_ID, SESSION_ID, PLAN_ID)?.generation, 2);
 });

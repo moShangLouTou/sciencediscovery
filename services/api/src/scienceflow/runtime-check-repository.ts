@@ -20,9 +20,12 @@
  * digests, and the observation time. Host paths, `sys.path` entries, Git output,
  * stderr, and interpreter details never reach this module.
  *
- * A row carries a monotonic generation. A check takes the next generation when
- * it starts and writes conditionally on the generation it observed, so a slower
- * concurrent check can never replace a newer one; the loser reads the winner.
+ * A row carries a monotonic generation. Every check reserves its generation
+ * atomically before it contacts a Runner, then writes conditionally: a row is
+ * only replaced by a strictly newer generation. A slower concurrent check
+ * therefore cannot overwrite a newer fact, and its own result is reported as
+ * superseded rather than saved. A check that fails after reserving leaves the
+ * prior row untouched as history.
  * Every read re-validates the row and rebuilds its descriptions; a corrupt row
  * throws rather than being skipped, repaired, or erased.
  */
@@ -50,6 +53,13 @@ interface RuntimeCheckRow {
   generation: number;
   checked_at: string;
   record_json: string;
+}
+
+interface GenerationRow {
+  plan_id: string;
+  project_id: string;
+  session_id: string;
+  allocated: number;
 }
 
 /** A new check taken at `generation`, already reduced to public evidence. */
@@ -82,14 +92,17 @@ export interface ScienceFlowRuntimeCheckStore {
     planId: string,
   ): ScienceFlowStoredRuntimeCheck | undefined;
   /**
-   * Conditional write: only the caller that observed `expectedGeneration` may
-   * replace it. Returns the row as it stands now, so a losing writer sees the
-   * persisted winner instead of its discarded result.
+   * Reserve the next generation for one check, before any Runner call. Two
+   * overlapping requests get distinct integers; the reservation is durable, so
+   * a restart cannot hand out a generation that is already in flight.
    */
-  save(
-    draft: ScienceFlowRuntimeCheckDraft,
-    expectedGeneration: number,
-  ): {
+  allocate(projectId: string, sessionId: string, planId: string): number;
+  /**
+   * Conditional write: the row is replaced only by a strictly newer
+   * generation. Returns the row as it stands now, so a losing writer sees the
+   * persisted winner instead of its own discarded result.
+   */
+  save(draft: ScienceFlowRuntimeCheckDraft): {
     readonly saved: boolean;
     readonly stored?: ScienceFlowStoredRuntimeCheck;
   };
@@ -116,6 +129,16 @@ export class ScienceFlowRuntimeCheckRepository
         ON science_flow_runtime_checks(session_id);
       CREATE INDEX IF NOT EXISTS science_flow_runtime_checks_project
         ON science_flow_runtime_checks(project_id);
+      CREATE TABLE IF NOT EXISTS science_flow_runtime_check_generations (
+        plan_id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        allocated INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS science_flow_runtime_check_generations_session
+        ON science_flow_runtime_check_generations(session_id);
+      CREATE INDEX IF NOT EXISTS science_flow_runtime_check_generations_project
+        ON science_flow_runtime_check_generations(project_id);
     `);
   }
 
@@ -128,10 +151,78 @@ export class ScienceFlowRuntimeCheckRepository
     return row ? parseRow(row) : undefined;
   }
 
-  save(
-    draft: ScienceFlowRuntimeCheckDraft,
-    expectedGeneration: number,
-  ): {
+  /**
+   * Reserve a generation inside one write transaction.
+   *
+   * The counter is seeded by both the last allocation and the last stored row,
+   * so a row written before this table existed (or a table restored from a
+   * backup) cannot hand out a generation that is not strictly newer. Allocation
+   * happens before the await, so overlapping requests cannot read the same
+   * "latest" and both claim the next integer.
+   */
+  allocate(projectId: string, sessionId: string, planId: string): number {
+    if (
+      !isIdentityText(projectId) ||
+      !isIdentityText(sessionId) ||
+      !isIdentityText(planId)
+    ) {
+      throw new ScienceFlowRuntimeCheckCorruptError();
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const allocation = this.database
+        .prepare(
+          `SELECT plan_id, project_id, session_id, allocated
+             FROM science_flow_runtime_check_generations
+            WHERE plan_id = ?`,
+        )
+        .get(planId) as GenerationRow | undefined;
+      let allocated = 0;
+      if (allocation !== undefined) {
+        // A generation row that names a different owner is corruption, not a
+        // counter to trust.
+        if (
+          allocation.plan_id !== planId ||
+          allocation.project_id !== projectId ||
+          allocation.session_id !== sessionId ||
+          typeof allocation.allocated !== "number" ||
+          !Number.isSafeInteger(allocation.allocated) ||
+          allocation.allocated < 0
+        ) {
+          throw new ScienceFlowRuntimeCheckCorruptError();
+        }
+        allocated = allocation.allocated;
+      }
+      const storedRow = this.select(projectId, sessionId, planId);
+      const storedGeneration = storedRow ? parseRow(storedRow).generation : 0;
+      const generation = Math.max(allocated, storedGeneration) + 1;
+      if (!Number.isSafeInteger(generation)) {
+        throw new ScienceFlowRuntimeCheckCorruptError();
+      }
+      this.database
+        .prepare(
+          `INSERT INTO science_flow_runtime_check_generations
+             (plan_id, project_id, session_id, allocated)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(plan_id) DO UPDATE SET
+             project_id = excluded.project_id,
+             session_id = excluded.session_id,
+             allocated = excluded.allocated`,
+        )
+        .run(planId, projectId, sessionId, generation);
+      this.database.exec("COMMIT");
+      return generation;
+    } catch (error) {
+      try {
+        this.database.exec("ROLLBACK");
+      } catch {
+        /* preserve the original error */
+      }
+      throw error;
+    }
+  }
+
+  save(draft: ScienceFlowRuntimeCheckDraft): {
     readonly saved: boolean;
     readonly stored?: ScienceFlowStoredRuntimeCheck;
   } {
@@ -139,68 +230,100 @@ export class ScienceFlowRuntimeCheckRepository
       draft.check.planId.trim().length === 0 ||
       draft.check.schemaVersion !== SCIENCE_FLOW_RUNTIME_CHECK_DTO_VERSION ||
       draft.generation !== draft.check.generation ||
-      draft.generation !== expectedGeneration + 1
+      !Number.isSafeInteger(draft.generation) ||
+      draft.generation < 1
     ) {
       throw new ScienceFlowRuntimeCheckCorruptError();
     }
-    const record = JSON.stringify(reduceCheck(draft.check));
-    const result =
-      expectedGeneration === 0
-        ? this.database
-            .prepare(
-              `INSERT INTO science_flow_runtime_checks
-                 (plan_id, project_id, session_id, generation, checked_at, record_json)
-               VALUES (?, ?, ?, ?, ?, ?)
-               ON CONFLICT(plan_id) DO NOTHING`,
-            )
-            .run(
-              draft.check.planId,
-              draft.projectId,
-              draft.sessionId,
-              draft.generation,
-              draft.check.checkedAt,
-              record,
-            )
-        : this.database
-            .prepare(
-              `UPDATE science_flow_runtime_checks
-                  SET generation = ?, checked_at = ?, record_json = ?
-                WHERE plan_id = ? AND project_id = ? AND session_id = ?
-                  AND generation = ?`,
-            )
-            .run(
-              draft.generation,
-              draft.check.checkedAt,
-              record,
-              draft.check.planId,
-              draft.projectId,
-              draft.sessionId,
-              expectedGeneration,
-            );
-    const saved = Number(result.changes) === 1;
-    if (expectedGeneration === 0 && !saved) {
-      // A concurrent insert won. The row must be there; a missing one means the
-      // table is unreadable, not that this check failed.
-      const row = this.select(draft.projectId, draft.sessionId, draft.check.planId);
-      if (!row) throw new ScienceFlowRuntimeCheckCorruptError();
-      return { saved: false, stored: parseRow(row) };
+    // Only a generation this plan actually issued may be written. Once the
+    // Session/Project delete removed the allocations, a check that was still in
+    // flight cannot insert a row back into an empty table.
+    const allocation = this.database
+      .prepare(
+        `SELECT plan_id, project_id, session_id, allocated
+           FROM science_flow_runtime_check_generations
+          WHERE plan_id = ?`,
+      )
+      .get(draft.check.planId) as GenerationRow | undefined;
+    if (
+      allocation === undefined ||
+      allocation.plan_id !== draft.check.planId ||
+      allocation.project_id !== draft.projectId ||
+      allocation.session_id !== draft.sessionId ||
+      typeof allocation.allocated !== "number" ||
+      !Number.isSafeInteger(allocation.allocated) ||
+      draft.generation > allocation.allocated
+    ) {
+      return { saved: false };
     }
+    const record = JSON.stringify(reduceCheck(draft.check));
+    const result = this.database
+      .prepare(
+        `INSERT INTO science_flow_runtime_checks
+           (plan_id, project_id, session_id, generation, checked_at, record_json)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(plan_id) DO UPDATE SET
+           generation = excluded.generation,
+           checked_at = excluded.checked_at,
+           record_json = excluded.record_json
+         WHERE excluded.generation > science_flow_runtime_checks.generation
+           AND science_flow_runtime_checks.project_id = excluded.project_id
+           AND science_flow_runtime_checks.session_id = excluded.session_id`,
+      )
+      .run(
+        draft.check.planId,
+        draft.projectId,
+        draft.sessionId,
+        draft.generation,
+        draft.check.checkedAt,
+        record,
+      );
+    const saved = Number(result.changes) === 1;
     const row = this.select(draft.projectId, draft.sessionId, draft.check.planId);
-    // A missed update can mean the owning Session was deleted while the check
-    // ran. That is a discarded result, not a stored one.
+    // A missed write can mean a newer check already won, or that the owning
+    // Session was deleted while the check ran. The caller distinguishes them
+    // by whether a row is still there.
     return row ? { saved, stored: parseRow(row) } : { saved };
   }
 
   deleteSession(sessionId: string): void {
-    this.database
-      .prepare("DELETE FROM science_flow_runtime_checks WHERE session_id = ?")
-      .run(sessionId);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database
+        .prepare("DELETE FROM science_flow_runtime_checks WHERE session_id = ?")
+        .run(sessionId);
+      this.database
+        .prepare("DELETE FROM science_flow_runtime_check_generations WHERE session_id = ?")
+        .run(sessionId);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.database.exec("ROLLBACK");
+      } catch {
+        /* preserve the original error */
+      }
+      throw error;
+    }
   }
 
   deleteProject(projectId: string): void {
-    this.database
-      .prepare("DELETE FROM science_flow_runtime_checks WHERE project_id = ?")
-      .run(projectId);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database
+        .prepare("DELETE FROM science_flow_runtime_checks WHERE project_id = ?")
+        .run(projectId);
+      this.database
+        .prepare("DELETE FROM science_flow_runtime_check_generations WHERE project_id = ?")
+        .run(projectId);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.database.exec("ROLLBACK");
+      } catch {
+        /* preserve the original error */
+      }
+      throw error;
+    }
   }
 
   private select(

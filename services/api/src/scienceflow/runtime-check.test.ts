@@ -473,3 +473,137 @@ test("RT-SVC-11 the stored answer leaks no host path, command, or interpreter de
     assert.equal(serialized.includes(forbidden), false, `leaked ${forbidden}`);
   }
 });
+
+// --- overlapping checks -----------------------------------------------------
+
+interface PendingCall {
+  readonly request: ScienceFlowRuntimeProbeRequest;
+  readonly answer: (overrides?: Partial<ScienceFlowRuntimeProbeResult>) => void;
+  readonly fail: () => void;
+}
+
+/**
+ * A Runner whose calls stay pending until the test settles them, in any order.
+ * Each call records the request it received so the answer can echo it.
+ */
+function overlapping(): { respond: HarnessOptions["respond"]; calls: PendingCall[] } {
+  const calls: PendingCall[] = [];
+  const respond = (
+    request: ScienceFlowRuntimeProbeRequest,
+  ): Promise<ScienceFlowRuntimeProbeResult> =>
+    new Promise<ScienceFlowRuntimeProbeResult>((resolve, reject) => {
+      calls.push({
+        request,
+        answer: (overrides = {}) => resolve(answer(request, overrides)),
+        fail: () => reject(new Error("runner offline")),
+      });
+    });
+  return { respond, calls };
+}
+
+function blockedAnswer(): Partial<ScienceFlowRuntimeProbeResult> {
+  return {
+    outcome: "blocked",
+    sourceKind: "installed-distribution",
+    revision: OTHER_REVISION,
+    checks: SCIENCE_FLOW_RUNTIME_CHECK_CODES.map((code) => ({
+      code,
+      status: code === "source_root" ? ("failed" as const) : ("passed" as const),
+    })),
+  };
+}
+
+function allocated(test: ReturnType<typeof harness>): number {
+  const row = test.store.database
+    .prepare("SELECT allocated FROM science_flow_runtime_check_generations WHERE plan_id = ?")
+    .get(PLAN_ID) as { allocated: number } | undefined;
+  return row?.allocated ?? 0;
+}
+
+test("RT-SVC-12 overlapping checks get distinct generations and the newer fact wins in either order", async () => {
+  for (const order of ["older-first", "newer-first"] as const) {
+    const runner = overlapping();
+    const test = harness({ respond: runner.respond });
+    // Both requests reserve before either Runner call answers.
+    const older = test.service.check(IDENTITY, PLAN_ID);
+    const newer = test.service.check(IDENTITY, PLAN_ID);
+    assert.equal(runner.calls.length, 2, order);
+    assert.equal(allocated(test), 2, `${order}: each request reserved its own generation`);
+
+    const [first, second] =
+      order === "older-first"
+        ? [runner.calls[0], runner.calls[1]]
+        : [runner.calls[1], runner.calls[0]];
+    first.answer(order === "older-first" ? undefined : blockedAnswer());
+    const firstResult = await (order === "older-first" ? older : newer);
+    second.answer(order === "older-first" ? blockedAnswer() : undefined);
+    const olderResult = await older;
+    const newerResult = await newer;
+
+    if (order === "older-first") {
+      if (firstResult.status !== "ok" || olderResult.status !== "ok" || newerResult.status !== "ok") {
+        assert.fail(`${order}: both checks completed`);
+      }
+      assert.equal(olderResult.check.generation, 1);
+      assert.equal(olderResult.check.outcome, "verified");
+      assert.equal(newerResult.check.generation, 2);
+      assert.equal(newerResult.check.outcome, "blocked");
+    } else {
+      // The newer request completes first and stores the blocked fact. The
+      // older request's verified evidence then arrives late: it may not replace
+      // the newer row, and it is never returned as this request's own success.
+      if (firstResult.status !== "ok" || olderResult.status !== "ok" || newerResult.status !== "ok") {
+        assert.fail(`${order}: both checks completed`);
+      }
+      assert.equal(newerResult.check.generation, 2);
+      assert.equal(newerResult.check.outcome, "blocked");
+      assert.equal(olderResult.check.generation, 2);
+      assert.equal(olderResult.check.outcome, "blocked");
+    }
+    const latest = await test.service.latest(IDENTITY, PLAN_ID);
+    if (latest.status !== "ok") assert.fail("expected a stored result");
+    assert.equal(latest.state.check?.generation, 2);
+    assert.equal(latest.state.check?.outcome, "blocked");
+  }
+});
+
+test("RT-SVC-13 a newer check that fails leaves the older evidence as history", async () => {
+  const runner = overlapping();
+  const test = harness({ respond: runner.respond });
+  const older = test.service.check(IDENTITY, PLAN_ID);
+  const newer = test.service.check(IDENTITY, PLAN_ID);
+  assert.equal(allocated(test), 2);
+  // The newer request fails outright, so it records no fact at all.
+  runner.calls[1].fail();
+  assert.deepEqual(await newer, { status: "unavailable" });
+  assert.equal(test.store.latest(IDENTITY.projectId, IDENTITY.sessionId, PLAN_ID), undefined);
+  // The older request still lands. Generation 1 is older than the issued 2, but
+  // no newer fact exists, so it is stored as the latest valid history.
+  runner.calls[0].answer();
+  const olderResult = await older;
+  if (olderResult.status !== "ok") assert.fail(`expected ok, got ${olderResult.status}`);
+  assert.equal(olderResult.check.generation, 1);
+  assert.equal(olderResult.check.outcome, "verified");
+  const latest = await test.service.latest(IDENTITY, PLAN_ID);
+  if (latest.status !== "ok") assert.fail("expected a stored result");
+  assert.equal(latest.state.check?.generation, 1);
+});
+
+test("RT-SVC-14 storage removed during the await is not resurrected by a late save", async () => {
+  let test!: ReturnType<typeof harness>;
+  test = harness({
+    respond: async (request) => {
+      // The Session's rows are removed while the Runner answers, but the
+      // identity read after the await still succeeds.
+      test.store.deleteSession(IDENTITY.sessionId);
+      return answer(request);
+    },
+  });
+  const result = await test.service.check(IDENTITY, PLAN_ID);
+  assert.deepEqual(result, { status: "not-found", resource: "session" });
+  assert.equal(test.store.latest(IDENTITY.projectId, IDENTITY.sessionId, PLAN_ID), undefined);
+  const remaining = test.store.database
+    .prepare("SELECT COUNT(*) AS count FROM science_flow_runtime_check_generations")
+    .get() as { count: number };
+  assert.equal(remaining.count, 0);
+});

@@ -23,9 +23,11 @@
  *
  * The stored result is evidence, never an authorization: `canStart` stays false
  * and the check answers only where the selected environment would resolve
- * ScienceFlow from, and at which revision. A later POST replaces it under a
- * monotonically increasing generation, so a slower concurrent check can never
- * overwrite a newer result.
+ * ScienceFlow from, and at which revision. Each request reserves its generation
+ * atomically before contacting the Runner and writes conditionally on it, so
+ * overlapping checks cannot share a generation and an older result can never
+ * replace a newer fact. A check that fails or is superseded leaves the last
+ * valid row intact as history.
  */
 import { createHash, randomUUID } from "node:crypto";
 
@@ -60,7 +62,6 @@ import {
   ScienceFlowRuntimeCheckCorruptError,
   runtimeCheckState,
   type ScienceFlowRuntimeCheckStore,
-  type ScienceFlowStoredRuntimeCheck,
 } from "./runtime-check-repository.js";
 import type { ScienceFlowExecutionSettings } from "./execution-config.js";
 import {
@@ -196,17 +197,17 @@ export function createScienceFlowRuntimeCheckService(
         return { status: "runner-denied" };
       }
 
-      // The generation is taken before the await. A concurrent check that takes
-      // a later one and finishes first wins; the conditional write below keeps
-      // the persisted result monotonic either way.
-      let current: ScienceFlowStoredRuntimeCheck | undefined;
+      // The generation is reserved atomically before the await. Two overlapping
+      // requests therefore get distinct integers, and the conditional write
+      // below only lets the newer one replace the stored row.
+      let generation: number;
       try {
-        current = dependencies.store().latest(query.projectId, query.sessionId, planId);
+        generation = dependencies
+          .store()
+          .allocate(query.projectId, query.sessionId, planId);
       } catch (error) {
         return mapFailure(error);
       }
-      const expectedGeneration = current?.generation ?? 0;
-      const generation = expectedGeneration + 1;
 
       // The frozen plan is the authority on the declared revision. A profile
       // edited later cannot retroactively change what this plan declared.
@@ -269,21 +270,29 @@ export function createScienceFlowRuntimeCheckService(
       try {
         const { saved, stored: persisted } = dependencies
           .store()
-          .save(
-            {
-              projectId: query.projectId,
-              sessionId: query.sessionId,
-              generation,
-              check,
-            },
-            expectedGeneration,
-          );
-        // A concurrent check may have replaced ours; the persisted result is
-        // the one the plan reports, so return it rather than a discarded one.
+          .save({
+            projectId: query.projectId,
+            sessionId: query.sessionId,
+            generation,
+            check,
+          });
         if (saved) return { status: "ok", check };
-        return persisted
-          ? { status: "ok", check: persisted.check }
-          : { status: "not-found", resource: "session" };
+        if (persisted && persisted.generation > generation) {
+          // A strictly newer check already recorded the current fact. Returning
+          // it is honest — the DTO's generation shows it is not this request's
+          // observation. An older row is never returned as this request's
+          // success.
+          return { status: "ok", check: persisted.check };
+        }
+        if (!persisted) {
+          // The Session or Project was deleted while this check ran; nothing is
+          // resurrected.
+          return { status: "not-found", resource: "session" };
+        }
+        // A newer check is in flight (or failed) and no newer fact exists yet.
+        // This request's evidence was discarded rather than presented as the
+        // latest result; the stored row stays as the last valid history.
+        return { status: "unavailable" };
       } catch (error) {
         return mapFailure(error);
       }
