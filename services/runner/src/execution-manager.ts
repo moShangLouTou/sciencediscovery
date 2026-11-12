@@ -141,6 +141,7 @@ export class ExecutionManager {
         CREATE TABLE IF NOT EXISTS execution_publications (id TEXT PRIMARY KEY, record TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS execution_boundaries (execution TEXT PRIMARY KEY, record TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS execution_resources (execution TEXT PRIMARY KEY, environment TEXT);
+        CREATE TABLE IF NOT EXISTS runtime_check_reservations (environment TEXT PRIMARY KEY, record TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS recovery_store (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), id TEXT NOT NULL);`);
       this.db.exec("BEGIN IMMEDIATE");
       this.db.prepare("INSERT OR IGNORE INTO recovery_store VALUES (1, ?)").run(randomUUID());

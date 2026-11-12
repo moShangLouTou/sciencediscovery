@@ -511,7 +511,9 @@ export function createRunnerServer(
   });
   const executorConfig: RunnerConfig = { ...config, npuDeviceProbe: probeRequestedNpuDevices };
   // The runtime identity check leases the selected environment and reuses the
-  // ordinary sandbox launch; it has no execution record and no ledger row.
+  // ordinary sandbox launch. It has no execution record; if a probe cannot be
+  // proven terminated it writes a reservation row into the execution ledger,
+  // which the environment mutation gate reads like an execution resource.
   const scienceFlowRuntime: ScienceFlowRuntimeCheckService | undefined = environmentStore
     ? createScienceFlowRuntimeCheckService({
         config: executorConfig,

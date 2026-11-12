@@ -37,7 +37,14 @@ import {
 
 import micromambaManifest from "./micromamba-releases.json" with { type: "json" };
 import { EnvironmentAccess } from "./environment-access.js";
-import { assertEnvironmentMutationAllowed } from "./execution-resource-fences.js";
+import {
+  assertEnvironmentMutationAllowed,
+  deleteRuntimeCheckReservation,
+  environmentExecutionUnverifiedError,
+  readRuntimeCheckReservation,
+  writeRuntimeCheckReservation,
+  type RuntimeCheckBoundary,
+} from "./execution-resource-fences.js";
 // [windows-desktop] win-64 binary name (.exe), conda interpreter layout
 // and rename retry live in the platform adaptation layer ().
 import { environmentInterpreterPath, environmentShellPath, environmentShellUtilityPath, micromambaBinaryName, packageInstallGuidance, renameReplace, starterPackages } from "./platform/index.js";
@@ -354,6 +361,10 @@ export class EnvironmentStore {
   private setupPromise?: Promise<ScientificEnvironmentSetup>;
   private mutationTail: Promise<void> = Promise.resolve();
   private readonly runtimeAccess: EnvironmentAccess;
+  private readonly runtimeCheckReservations = new Map<string, {
+    readonly reservation: { readonly id: string; readonly boundary: RuntimeCheckBoundary };
+    record: string | null;
+  }>();
   private lastSetupError?: string;
 
   constructor(
@@ -900,7 +911,58 @@ export class EnvironmentStore {
   }
 
   private assertMutationAllowed(id: string): void {
+    // A runtime probe whose boundary is unverified fences its environment in
+    // this process even when persisting the reservation failed, so a broken
+    // ledger can only widen the gap across a Runner restart, never within it.
+    if (this.runtimeCheckReservations.has(id)) throw environmentExecutionUnverifiedError();
     if (this.config.executionLedgerPath) assertEnvironmentMutationAllowed(this.config.executionLedgerPath, id);
+  }
+
+  /**
+   * Record that a ScienceFlow runtime probe could not prove its sandbox ended.
+   *
+   * The in-memory entry is installed first: it is what the mutation gate checks,
+   * and it must exist before the durable write can fail. The ledger row is the
+   * part a Runner restart still sees; a failed write is reported to the caller,
+   * which keeps this process fenced either way.
+   */
+  reserveRuntimeCheck(environmentId: string, boundary: RuntimeCheckBoundary): void {
+    const reservation = { boundary, id: randomUUID() };
+    const entry = { record: null as string | null, reservation };
+    this.runtimeCheckReservations.set(environmentId, entry);
+    if (!this.config.executionLedgerPath) return;
+    const written = writeRuntimeCheckReservation(this.config.executionLedgerPath, environmentId, reservation);
+    if (this.runtimeCheckReservations.get(environmentId) === entry) entry.record = written.record;
+  }
+
+  /**
+   * The boundary currently fencing one environment, from this process or from
+   * the ledger. `"corrupt"` means a row exists but cannot say which boundary it
+   * names; it still blocks, because the process may still be alive.
+   */
+  runtimeCheckBoundary(environmentId: string): RuntimeCheckBoundary | "corrupt" | undefined {
+    const local = this.runtimeCheckReservations.get(environmentId);
+    if (local) return local.reservation.boundary;
+    if (!this.config.executionLedgerPath) return undefined;
+    const stored = readRuntimeCheckReservation(this.config.executionLedgerPath, environmentId);
+    if (stored === undefined || stored === "corrupt") return stored;
+    return stored.reservation.boundary;
+  }
+
+  /**
+   * Release this environment's reservation. The caller only calls this after
+   * the boundary it read was proven empty; a row this process did not write (or
+   * could not persist) is left untouched, and a corrupt row is never deleted
+   * blindly.
+   */
+  releaseRuntimeCheckReservation(environmentId: string): void {
+    const local = this.runtimeCheckReservations.get(environmentId);
+    this.runtimeCheckReservations.delete(environmentId);
+    if (!this.config.executionLedgerPath) return;
+    const stored = readRuntimeCheckReservation(this.config.executionLedgerPath, environmentId);
+    if (stored === undefined || stored === "corrupt") return;
+    if (local && local.record !== stored.record) return;
+    deleteRuntimeCheckReservation(this.config.executionLedgerPath, environmentId, stored.record);
   }
 
   private async bootstrapStarter(language: ScientificLanguage): Promise<void> {
