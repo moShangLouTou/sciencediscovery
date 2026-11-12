@@ -102,6 +102,17 @@ export type ScienceFlowSnapshotReadResult =
  * after the child has been reaped (or after a spawn error shows there is no
  * child), so a timeout or over-limit read never leaves a process behind.
  */
+export {
+  checkEngineRevision,
+  DEFAULT_REVISION_MAX_OUTPUT_BYTES,
+  DEFAULT_REVISION_TIMEOUT_MS,
+  parsePorcelain,
+  type EngineRevisionCheckOptions,
+  type EngineRevisionCheckResult,
+  type EngineRevisionReason,
+  type EngineRevisionStatus,
+} from "./source-revision.js";
+
 export async function readScienceFlowRunSnapshot(
   options: ReadScienceFlowRunSnapshotOptions,
 ): Promise<ScienceFlowSnapshotReadResult> {

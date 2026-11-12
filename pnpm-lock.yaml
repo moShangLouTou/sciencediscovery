@@ -915,6 +915,9 @@ importers:
       '@sciencediscovery/schema':
         specifier: workspace:*
         version: link:../../packages/schema
+      '@sciencediscovery/scienceflow-reader':
+        specifier: workspace:*
+        version: link:../../packages/scienceflow-reader
     devDependencies:
       '@types/node':
         specifier: 26.1.1

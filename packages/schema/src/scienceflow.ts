@@ -373,6 +373,134 @@ export interface ScienceFlowExecutionPlanContractDto {
   readonly unknowns: ScienceFlowExecutionUnknownsDto;
 }
 
+/**
+ * Version of the Runner-side runtime identity probe.
+ *
+ * The probe answers one question: which ScienceFlow package source would the
+ * selected environment's interpreter resolve, and is that source the trusted
+ * checkout at the declared revision? It never imports ScienceFlow and never
+ * starts it.
+ */
+export const SCIENCE_FLOW_RUNTIME_PROBE_VERSION = 1;
+/** Version of one persisted runtime check, bound to a plan and its binding. */
+export const SCIENCE_FLOW_RUNTIME_CHECK_DTO_VERSION = 1;
+
+/**
+ * Fixed diagnostic codes a runtime identity check may carry.
+ *
+ * Each code names a fact the Runner either established or could not. Codes are
+ * the only detail that leaves the Runner: no host path, interpreter path,
+ * `sys.path` entry, Git output, or package metadata is ever attached to one.
+ */
+export const SCIENCE_FLOW_RUNTIME_CHECK_CODES = [
+  "binding_identity",
+  "environment_revision",
+  "interpreter_identity",
+  "package_resolution",
+  "source_root",
+  "source_revision",
+  "source_cleanliness",
+  "startup_hooks",
+  "duplicate_distribution",
+] as const;
+export type ScienceFlowRuntimeCheckCode =
+  (typeof SCIENCE_FLOW_RUNTIME_CHECK_CODES)[number];
+
+/** What the resolved package source is; only `git-checkout` can be verified. */
+export const SCIENCE_FLOW_RUNTIME_SOURCE_KINDS = [
+  "git-checkout",
+  "installed-distribution",
+  "unsupported",
+] as const;
+export type ScienceFlowRuntimeSourceKind =
+  (typeof SCIENCE_FLOW_RUNTIME_SOURCE_KINDS)[number];
+
+export interface ScienceFlowRuntimeCheckDtoCheck {
+  readonly code: ScienceFlowRuntimeCheckCode;
+  readonly status: ScienceFlowPlanCheckStatus;
+  /** Fixed server-side description; never probe output. */
+  readonly description: string;
+}
+
+/**
+ * What the Runner accepted. Every field is an identity the API already knows or
+ * an administrator configured; there is no command, path, environment variable,
+ * or interpreter field a caller could supply.
+ */
+export interface ScienceFlowRuntimeProbeRequest {
+  readonly schemaVersion: typeof SCIENCE_FLOW_RUNTIME_PROBE_VERSION;
+  /** Server-generated; echoed back so a mismatched answer is detectable. */
+  readonly requestId: string;
+  /** The Runner-side trusted binding id from the Runner's own configuration. */
+  readonly bindingId: string;
+  readonly environmentId: string;
+  readonly expectedEnvironmentRevisionId: string;
+  /** The frozen plan's declared revision; must equal the Runner binding's. */
+  readonly expectedRevision: string;
+}
+
+/**
+ * What the Runner observed. The Runner's own classification, carrying only
+ * facts it stands behind; `checks` explains every non-passing one.
+ */
+export interface ScienceFlowRuntimeProbeResult {
+  readonly schemaVersion: typeof SCIENCE_FLOW_RUNTIME_PROBE_VERSION;
+  readonly requestId: string;
+  readonly bindingId: string;
+  readonly environmentId: string;
+  readonly environmentRevisionId: string | null;
+  readonly sourceKind: ScienceFlowRuntimeSourceKind;
+  /** The checkout's actual HEAD, only when the Git check could read it. */
+  readonly revision: string | null;
+  readonly checkedAt: string;
+  /** `blocked` means the check ran and did not establish a source binding. */
+  readonly outcome: "verified" | "blocked" | "unavailable";
+  readonly checks: readonly {
+    readonly code: ScienceFlowRuntimeCheckCode;
+    readonly status: ScienceFlowPlanCheckStatus;
+  }[];
+}
+
+/** Capabilities a source binding does not establish. */
+export interface ScienceFlowRuntimeUnknownsDto {
+  readonly dependencyClosure: "incomplete";
+  readonly executionStart: "not-checked";
+  readonly modelGateway: "unknown";
+  readonly evaluator: "not-checked";
+  readonly gpu: "not-checked";
+}
+
+/**
+ * One persisted runtime identity check. It is evidence from `checkedAt`, bound
+ * to the plan, its contract digest, and the exact binding that was checked; it
+ * is never an execution authorization, and a later `POST` replaces it.
+ */
+export interface ScienceFlowRuntimeCheckDto {
+  readonly schemaVersion: typeof SCIENCE_FLOW_RUNTIME_CHECK_DTO_VERSION;
+  readonly planId: string;
+  readonly contractDigest: string;
+  /** Digest over plan, profile, runner, environment, and expected revisions. */
+  readonly bindingDigest: string;
+  readonly runnerId: string;
+  readonly environmentId: string;
+  readonly environmentRevisionId: string | null;
+  readonly checkedAt: string;
+  readonly outcome: "verified" | "blocked";
+  readonly canStart: false;
+  readonly sourceKind: ScienceFlowRuntimeSourceKind;
+  readonly sourceRevision: string | null;
+  readonly checks: readonly ScienceFlowRuntimeCheckDtoCheck[];
+  readonly unknowns: ScienceFlowRuntimeUnknownsDto;
+  /** Monotonic per plan; a larger generation supersedes an older result. */
+  readonly generation: number;
+}
+
+/** The read answer: the latest stored check, or none performed yet. */
+export interface ScienceFlowRuntimeCheckStateDto {
+  readonly planId: string;
+  readonly check: ScienceFlowRuntimeCheckDto | null;
+}
+
 /** One immutable plan plus the most recent stored preflight result. */
 export interface ScienceFlowExecutionPlanDto {
   readonly schemaVersion: typeof SCIENCE_FLOW_EXECUTION_PLAN_DTO_VERSION;
