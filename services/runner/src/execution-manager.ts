@@ -20,12 +20,23 @@ import {
   type ExecutionLifecycle,
   type SpawnedExecution,
 } from "./execution-boundary.js";
-import type { ExecutionLogPage, ExecutionOwner, ManagedExecution, ShellExecutionRequest, ShellExecutionResult } from "@sciencediscovery/schema";
+import { ResearchRunError, parseResearchRunRequest, researchExecutionState, researchPublishable, researchRefusalMessage, type ResearchRunExecutor } from "./research-run.js";
+import type { ExecutionLogPage, ExecutionOwner, ManagedExecution, ResearchRunRequest, ResearchRunStatus, ShellExecutionRequest, ShellExecutionResult } from "@sciencediscovery/schema";
 
 export type ExecutionLogSink = (stream: "stdout" | "stderr", chunk: Buffer) => void;
+/**
+ * What an operation resolves to. A shell operation resolves to its process
+ * result; a research workload additionally states the research facts, which
+ * are never derived from the process result.
+ */
+export interface ResearchOperationResult {
+  readonly research: ResearchRunStatus;
+  readonly result: ShellExecutionResult;
+}
+type OperationResult = ShellExecutionResult | ResearchOperationResult;
 /** Resolving or rejecting must join every launched child, including cancellation. */
 type Operation = (signal: AbortSignal, log: ExecutionLogSink, expectedEnvironmentRevisionId?: string,
-  lifecycle?: ExecutionLifecycle) => Promise<ShellExecutionResult>;
+  lifecycle?: ExecutionLifecycle) => Promise<OperationResult>;
 /** Rejecting here records a deterministic pre-admission failure; no process is launched. */
 type Preflight = (signal: AbortSignal) => Promise<void>;
 const terminal = (state: ManagedExecution["state"]) => state !== "queued" && state !== "running";
@@ -52,6 +63,25 @@ interface PublicationJournal {
 const sameRef = (left: AgentStateRef | null | undefined, right: AgentStateRef | null | undefined) => canonicalJson(left ?? null) === canonicalJson(right ?? null);
 const conflict = () => new ExecutionManagerError("EXECUTION_ID_CONFLICT", "Execution ID conflicts with an existing submission", 409);
 
+/**
+ * A research request is the only shape with a workload kind. A shell request
+ * has no `kind` field, so every record and request written before research
+ * runs existed keeps its original meaning.
+ */
+function isResearchRequest(request: ShellExecutionRequest | ResearchRunRequest): request is ResearchRunRequest {
+  return (request as { kind?: unknown }).kind === "research";
+}
+
+/**
+ * What a research record publishes as its "code" object. The request carries
+ * no shell text, so the published record describes the fixed workload instead
+ * of inventing an empty program that could be mistaken for one.
+ */
+const RESEARCH_WORKLOAD_CODE_MARKER = [
+  "# research workload: scienceflow-fixed",
+  "# The program is Runner code, not submitted shell text.",
+].join("\n");
+
 export interface ExecutionQuarantineDiagnostic {
   phase: "startup" | "runtime" | "publication-recovery";
   executionId: string;
@@ -69,6 +99,14 @@ export interface ExecutionManagerOptions {
   captureBoundary?: (executionId: string, spawned: SpawnedExecution) => BoundaryCaptureOutcome;
   /** Test-only pause after the durable fence, before the final abort check. */
   afterFence?: () => Promise<void>;
+  /**
+   * The Runner-side fixed research workload. This is a constructor dependency:
+   * no route, config value, environment variable or request can supply or
+   * replace it. While it is absent — which is every production wiring in this
+   * round — a research submission is refused outright instead of falling back
+   * to a shell run or the system interpreter.
+   */
+  research?: ResearchRunExecutor;
 }
 
 /** The Runner owns process lifetime; an HTTP request only submits or observes it. */
@@ -82,6 +120,9 @@ export class ExecutionManager {
   private readonly afterFence: (() => Promise<void>) | undefined;
   private readonly resources = new Map<string, Map<() => Promise<void>, string>>();
   private readonly controllers = new Map<string, AbortController>();
+  /** Graceful stop registered by a running workload, before any kill exists. */
+  private readonly stopHandlers = new Map<string, () => Promise<void>>();
+  private readonly research: ResearchRunExecutor | undefined;
   /** Whether the sandbox of one in-flight execution promised a durable boundary. */
   private readonly boundaryExpectations = new Map<string, "required" | "not-applicable" | "ended">();
   private readonly queues = new Map<string, Promise<void>>();
@@ -101,6 +142,7 @@ export class ExecutionManager {
     options: ExecutionManagerOptions = {}) {
     this.captureBoundary = options.captureBoundary ?? captureExecutionBoundaryOutcome;
     this.afterFence = options.afterFence;
+    this.research = options.research;
     const root = resolve(dataDir, "runner-executions");
     const ledgerPath = resolve(root, "executions.sqlite");
     const existingLedger = existsSync(ledgerPath);
@@ -220,17 +262,52 @@ export class ExecutionManager {
   }
 
   submit(request: ShellExecutionRequest, operation: Operation, preflight?: Preflight): { execution: ManagedExecution; accepted: boolean } {
+    return this.submitInternal(request, operation, preflight);
+  }
+
+  /**
+   * Accept one trusted internal research run.
+   *
+   * The caller supplies a research request, never an operation: the workload
+   * program and its launcher are the Runner's own constructor dependencies, so
+   * there is no parameter through which a caller could name a program, a path
+   * or a fallback interpreter. A Runner without that dependency refuses before
+   * anything is written to the ledger.
+   */
+  submitResearch(value: unknown): { execution: ManagedExecution; accepted: boolean } {
+    const executor = this.research;
+    if (!executor) {
+      throw new ExecutionManagerError("RESEARCH_RUN_NOT_CONFIGURED",
+        researchRefusalMessage("RESEARCH_RUN_NOT_CONFIGURED"), 409);
+    }
+    let request: ResearchRunRequest;
+    try {
+      request = parseResearchRunRequest(value);
+    } catch (error) {
+      if (error instanceof ResearchRunError) throw new ExecutionManagerError(error.code, error.message, 400);
+      throw error;
+    }
+    return this.submitInternal(request, (signal, _log, expectedEnvironmentRevisionId, lifecycle) =>
+      executor.run(request, { expectedEnvironmentRevisionId, lifecycle, signal }));
+  }
+
+  private submitInternal(request: ShellExecutionRequest | ResearchRunRequest, operation: Operation,
+    preflight?: Preflight): { execution: ManagedExecution; accepted: boolean } {
     if (this.closing) throw new ExecutionManagerError("RUNNER_SHUTTING_DOWN", "Runner is shutting down", 503);
     if (!this.storageHealthy) throw new ExecutionManagerError("EXECUTION_LEDGER_UNAVAILABLE", "Execution ledger cannot be trusted; new submissions are disabled", 503);
     if (!/^[A-Za-z0-9_:.-]{1,160}$/.test(request.executionId)) throw new Error("Invalid Execution ID");
     // Bind the deferred admission and the digest to one immutable request snapshot.
     request = structuredClone(request);
+    // Identity and time fields are shared; recovery, handoff and shell text
+    // exist only on a shell request and are never invented for a research one.
+    const shell = isResearchRequest(request) ? undefined : request;
+    const researchRequest = isResearchRequest(request) ? request : undefined;
     if (request.environmentId !== undefined && (typeof request.environmentId !== "string"
       || request.environmentId.length === 0 || request.environmentId.trim() !== request.environmentId)) {
       throw new Error("Invalid environment ID");
     }
-    if (request.recoveryContext) assertRecoveryContext(request.recoveryContext);
-    if (request.recoveryMetadataPath !== undefined && !recoveryRelativePath(request.recoveryMetadataPath)) throw new Error("UNSAFE_RECOVERY_PATH");
+    if (shell?.recoveryContext) assertRecoveryContext(shell.recoveryContext);
+    if (shell?.recoveryMetadataPath !== undefined && !recoveryRelativePath(shell.recoveryMetadataPath)) throw new Error("UNSAFE_RECOVERY_PATH");
     const owner = { agentId: request.agentId, sessionId: request.permissionEpoch.sessionId };
     const requestDigest = digest(request);
     const key = request.workspaceRoot; // already canonicalized by the authenticated endpoint
@@ -239,7 +316,17 @@ export class ExecutionManager {
     const acceptedAt = new Date().toISOString();
     const execution: ManagedExecution = { ...owner, id: request.executionId, state: "queued", queuedAt: acceptedAt,
       workspaceKey: key, npuDevices: [...npuDevices],
-      ...(request.recoveryContext ? { recoveryContext: request.recoveryContext } : {}),
+      // Acceptance itself is a research fact: the record exists and nothing has
+      // been launched. `not_started` here is positive evidence about the record,
+      // not an inference from a missing report, and the operation replaces it
+      // as soon as the workload is actually spawned.
+      ...(researchRequest ? { workload: "research" as const, research: {
+        workload: researchRequest.workload, schemaVersion: researchRequest.schemaVersion,
+        phase: "unknown" as const, outcome: null, process: "not_started" as const,
+        stop: "none" as const, deadlineViolated: false,
+        verificationWindowMs: researchRequest.schedule.verificationWindowMs, observedAt: acceptedAt,
+      } } : {}),
+      ...(shell?.recoveryContext ? { recoveryContext: shell.recoveryContext } : {}),
       receipt: { ...this.identity, revision: 1, requestDigest, acceptedAt } };
     // Duplicate lookup and insert share the transaction. No operation is scheduled until COMMIT.
     this.db.exec("BEGIN IMMEDIATE");
@@ -284,7 +371,7 @@ export class ExecutionManager {
         }
       }
       return withWorkspaceAdmission(this.versions, key, () => withWorkspaceLease(key, async () => {
-      if (!request.explicitHandoff) await ensureWorkspaceBaseline(this.versions, key);
+      if (!shell?.explicitHandoff) await ensureWorkspaceBaseline(this.versions, key);
       let changed = false;
       let resourcesRecorded = false;
       let cursor = 0;
@@ -318,10 +405,10 @@ export class ExecutionManager {
         }
         if (this.failedWorkspaces.has(key)) throw new Error("Workspace version commit failed; repair storage before restarting the Runner");
         if (controller.signal.aborted) throw new Error("Execution cancelled before start");
-        const expectedEnvironmentRevisionId = request.recoveryContext
-          ? await validateExecutionRecovery(this.versions, this.recoveryStoreId, request,
-              this.get(request.recoveryContext.parentExecutionId, owner)) : undefined;
-        if (request.recoveryContext && this.db.prepare("SELECT record FROM executions").all()
+        const expectedEnvironmentRevisionId = shell?.recoveryContext
+          ? await validateExecutionRecovery(this.versions, this.recoveryStoreId, shell,
+              this.get(shell.recoveryContext.parentExecutionId, owner)) : undefined;
+        if (shell?.recoveryContext && this.db.prepare("SELECT record FROM executions").all()
           .some(row => (JSON.parse(String(row.record)) as ManagedExecution).state === "unknown")) {
           // Older records have no reliable workspace binding. A restarted Runner
           // may still have an orphan writer, so do not guess which workspace is safe.
@@ -348,8 +435,21 @@ export class ExecutionManager {
         execution.startedAt = new Date().toISOString();
         this.save(execution);
         changed = true;
-        execution.result = await operation(controller.signal, log, expectedEnvironmentRevisionId, this.lifecycleFor(execution.id));
-        execution.state = controller.signal.aborted ? "cancelled" : execution.result.exitCode === 0 && !execution.result.networkDeniedHosts?.length ? "completed" : "failed";
+        const returned = await operation(controller.signal, log, expectedEnvironmentRevisionId, this.lifecycleFor(execution.id));
+        if ("research" in returned) {
+          // Research facts are recorded next to, never derived from, the process
+          // result. Workload output was never forwarded to the log sink.
+          execution.result = returned.result;
+          execution.research = returned.research;
+          execution.state = researchExecutionState(returned.research, controller.signal.aborted);
+          if (returned.research.refusal) execution.error = researchRefusalMessage(returned.research.refusal);
+          else if (returned.research.outcome === "failed") {
+            execution.error = "The research workload reported a failed outcome";
+          }
+        } else {
+          execution.result = returned;
+          execution.state = controller.signal.aborted ? "cancelled" : execution.result.exitCode === 0 && !execution.result.networkDeniedHosts?.length ? "completed" : "failed";
+        }
       } catch (error) {
         if (!changed && resourcesRecorded) {
           this.db.prepare("DELETE FROM execution_resources WHERE execution = ?").run(execution.id);
@@ -397,10 +497,30 @@ export class ExecutionManager {
         await this.releaseResources(execution.id, new ProcessTerminationUnverifiedError(execution.error));
         return;
       }
+      // A research run publishes only when both facts hold: the namespace is
+      // proven empty (above) and the workload reported a terminal business
+      // state. A missing, late or unreadable record is `unknown`; this path
+      // keeps the workspace, environment and device fences exactly like an
+      // unverified process would.
+      if (changed && researchRequest && !researchPublishable(execution.research)) {
+        execution.state = "unknown";
+        delete execution.finishedAt;
+        delete execution.result;
+        execution.error = "Research workload ended without a terminal research record; its business state is unknown and its resources stay fenced";
+        this.quarantine(execution);
+        this.save(execution);
+        await this.releaseResources(execution.id, new ProcessTerminationUnverifiedError(execution.error));
+        return;
+      }
       await this.releaseResources(execution.id);
       const endedState = execution.state;
+      // A research refusal that happened before the sandbox was created is the
+      // one path whose process fact is a positive "nothing ran", so the exit
+      // evidence names it instead of the generic post-join wording.
+      const unlaunched = execution.research?.process === "not_started";
       execution.evidence = { ...this.identity, revision: execution.receipt!.revision, processTerminated: true,
-        terminationReason: changed ? controller.signal.aborted ? "cancelled" : execution.result ? "exited" : "operation_rejected_after_join" : "not_started" };
+        terminationReason: !changed || unlaunched ? "not_started"
+          : controller.signal.aborted ? "cancelled" : execution.result ? "exited" : "operation_rejected_after_join" };
       // Journal process exit before asynchronous result publication. A crash here remains
       // unknown with truthful exit evidence, not a fabricated committed terminal result.
       // Nothing was launched when `changed` is false, so there is no journal to write
@@ -412,19 +532,21 @@ export class ExecutionManager {
       }
       try {
         if (changed) {
-          const workspace = request.explicitHandoff ? undefined : await snapshotWorkspace(this.versions, request.workspaceRoot);
+          const workspace = shell?.explicitHandoff ? undefined : await snapshotWorkspace(this.versions, request.workspaceRoot);
           const readLog = (stream: string) => this.db.prepare("SELECT text FROM logs WHERE execution = ? AND stream = ? ORDER BY cursor")
             .all(execution.id, stream).map((row) => String(row.text)).join("");
           const stdout = await this.versions.put("agent-state", readLog("stdout") || execution.result?.stdout || "");
           const stderr = await this.versions.put("agent-state", readLog("stderr") || execution.result?.stderr || execution.error || "");
-          const code = await this.versions.put("agent-state", request.code);
-          const collected = await collectExecutionRecovery(this.versions, this.recoveryStoreId, request, execution);
+          const code = await this.versions.put("agent-state", shell?.code ?? RESEARCH_WORKLOAD_CODE_MARKER);
+          const collected = shell
+            ? await collectExecutionRecovery(this.versions, this.recoveryStoreId, shell, execution)
+            : { recovery: unknownRecovery() };
           const version = await this.versions.putRecord("WorkspaceExecution", {
             executionId: execution.id, ...owner, ...(workspace ? { workspace } : {}), code, stdout, stderr,
             environmentRevisionId: execution.result?.environmentRevisionId ?? null,
             state: execution.state,
             ...(collected.ref ? { recoveryManifest: collected.ref } : {}),
-            ...(request.recoveryContext ? { recoveryContext: request.recoveryContext } : {}),
+            ...(shell?.recoveryContext ? { recoveryContext: shell.recoveryContext } : {}),
           });
           const refs = await RefStore.open(this.versions);
           try {
@@ -499,6 +621,10 @@ export class ExecutionManager {
         "Execution cleanup remains fenced because termination was not durably verified"));
       this.boundaryExpectations.delete(execution.id);
       this.controllers.delete(execution.id);
+      // The graceful stop belongs to this operation's lifetime only. A cancel
+      // after it ends must fall back to the terminal-state rules, never call
+      // into a completed run's control channel.
+      this.stopHandlers.delete(execution.id);
       if (this.queues.get(key) === work) this.queues.delete(key);
     });
     // Avoid unhandled rejections from storage failure; subsequent jobs must not overtake a failed commit.
@@ -555,6 +681,20 @@ export class ExecutionManager {
    */
   private lifecycleFor(id: string): ExecutionLifecycle {
     return {
+      boundary: () => {
+        const expectation = this.boundaryExpectations.get(id);
+        // A sandbox the kernel already showed gone in its own spawn turn makes
+        // no promise that needs a second proof; it is the same answer the
+        // post-run check will give.
+        if (expectation === "ended" || expectation === "not-applicable") return { state: "ended" };
+        const handle = this.loadBoundary(id);
+        return handle !== undefined && handle !== "invalid"
+          ? { handle, state: "captured" }
+          : { state: "unavailable" };
+      },
+      requestStop: (handler) => {
+        this.stopHandlers.set(id, handler);
+      },
       retainResource: (cleanup, label) => {
         let owned = this.resources.get(id);
         if (!owned) { owned = new Map(); this.resources.set(id, owned); }
@@ -632,8 +772,13 @@ export class ExecutionManager {
     }
     // Kernel teardown of a PID namespace is complete once its init exits, but
     // the monitor's own close can be delivered a tick later: re-read within a
-    // small bound instead of quarantining a correct record.
-    const deadline = Date.now() + 100;
+    // small bound instead of quarantining a correct record. A research run
+    // states the verification window it reserved for exactly this check; the
+    // bound stays small so one stuck teardown cannot wedge the workspace queue.
+    const window = execution.workload === "research"
+      ? Math.max(100, Math.min(execution.research?.verificationWindowMs ?? 100, 5_000))
+      : 100;
+    const deadline = Date.now() + window;
     for (;;) {
       const status = observeExecutionBoundary(handle, stop);
       execution.boundary = status;
@@ -696,6 +841,12 @@ export class ExecutionManager {
       execution.state = "cancelled";
       execution.error = "Execution cancelled before start";
       execution.finishedAt = new Date().toISOString();
+      if (execution.workload === "research" && execution.research) {
+        // A positive record, correlated by execution id: the stop was accepted
+        // and nothing was ever launched. It is not inferred from a missing one.
+        execution.research = { ...execution.research, observedAt: execution.finishedAt,
+          outcome: "not-started", phase: "finished", stop: "requested" };
+      }
       if (execution.receipt) execution.evidence = { ...this.identity, revision: execution.receipt.revision,
         processTerminated: true, terminationReason: "not_started" };
       this.save(execution);
@@ -712,7 +863,26 @@ export class ExecutionManager {
         observedAt: new Date().toISOString(), state: execution.boundary?.state ?? "not-recorded",
         terminationConfirmed: execution.boundary?.terminationConfirmed ?? false,
         stopRequestedAt: execution.boundary?.stopRequestedAt ?? new Date().toISOString() };
+      if (execution.workload === "research" && execution.research) {
+        execution.research = { ...execution.research, observedAt: execution.boundary.observedAt,
+          stop: execution.research.stop === "none" ? "requested" : execution.research.stop };
+      }
       this.save(execution);
+      // Intent is durable before anything reaches the workload. A workload that
+      // registered a graceful stop is asked first; only a run that never did
+      // (a shell execution, or a research run already past its operation) is
+      // reduced to the immediate abort.
+      const handler = this.stopHandlers.get(id);
+      if (handler) {
+        try {
+          await handler();
+        } catch {
+          // The handler is bounded and reports its own refusal through the
+          // research record; a failed request must not skip the forced reclaim.
+          this.controllers.get(id)?.abort();
+        }
+        return this.get(id, owner);
+      }
       this.controllers.get(id)?.abort();
       return this.get(id, owner);
     }

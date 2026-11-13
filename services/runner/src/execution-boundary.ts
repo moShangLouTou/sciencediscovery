@@ -52,6 +52,18 @@ export interface SpawnedExecution {
 }
 
 /**
+ * What the ledger already established about a just-spawned sandbox. A caller
+ * that needs to escalate or prove the same process tree reads it back here
+ * instead of capturing a second, competing identity.
+ */
+export type SpawnBoundaryReport =
+  | { readonly state: "captured"; readonly handle: ExecutionBoundaryHandle }
+  /** The sandbox already ended inside its own spawn turn. */
+  | { readonly state: "ended" }
+  /** No durable identity exists; nothing may be signaled or proven from here. */
+  | { readonly state: "unavailable" };
+
+/**
  * What the executor hands to the ledger while it still runs synchronously
  * after spawn(). Nothing here may await: a short-lived sandbox can exit before
  * the first /proc read of the next microtask.
@@ -60,6 +72,15 @@ export interface ExecutionLifecycle {
   spawned(execution: SpawnedExecution): void;
   /** Transfer cleanup to the manager before spawn; release only after proof. */
   retainResource?(cleanup: () => Promise<void>, label: string): void;
+  /**
+   * Register the graceful stop for a running execution. The manager persists
+   * the stop intent first and then calls this instead of aborting the
+   * controller, so a workload that can stop itself is asked before it is
+   * killed. The handler must be bounded by its own deadline.
+   */
+  requestStop?(handler: () => Promise<void>): void;
+  /** Read back the identity the ledger captured in the spawn turn. */
+  boundary?(): SpawnBoundaryReport;
 }
 
 /** Exactly what the Runner persists; unknown fields are rejected on load. */
