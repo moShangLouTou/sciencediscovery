@@ -18,10 +18,11 @@ import {
   type BoundaryCaptureOutcome,
   type ExecutionBoundaryHandle,
   type ExecutionLifecycle,
+  type ExecutionObservation,
   type SpawnedExecution,
 } from "./execution-boundary.js";
-import { ResearchRunError, parseResearchRunRequest, researchExecutionState, researchPublishable, researchRefusalMessage, type ResearchRunExecutor } from "./research-run.js";
-import type { ExecutionLogPage, ExecutionOwner, ManagedExecution, ResearchRunRequest, ResearchRunStatus, ShellExecutionRequest, ShellExecutionResult } from "@sciencediscovery/schema";
+import { ResearchRunError, parseResearchRunRequest, researchExecutionState, researchPublishable, researchRefusalMessage, researchRunDeadlines, researchStopId, type ResearchRunExecutor } from "./research-run.js";
+import type { ExecutionLogPage, ExecutionOwner, ManagedExecution, ResearchPhase, ResearchReportOutcome, ResearchRunRequest, ResearchRunStatus, ResearchStopState, ShellExecutionRequest, ShellExecutionResult } from "@sciencediscovery/schema";
 
 export type ExecutionLogSink = (stream: "stdout" | "stderr", chunk: Buffer) => void;
 /**
@@ -62,6 +63,15 @@ interface PublicationJournal {
 }
 const sameRef = (left: AgentStateRef | null | undefined, right: AgentStateRef | null | undefined) => canonicalJson(left ?? null) === canonicalJson(right ?? null);
 const conflict = () => new ExecutionManagerError("EXECUTION_ID_CONFLICT", "Execution ID conflicts with an existing submission", 409);
+
+/**
+ * Ordering used when a durable fact and an in-flight copy disagree. Only the
+ * stronger value survives a merge, so a late operation save can never downgrade
+ * a stop the manager already persisted, or a fact the ledger already recorded.
+ */
+const PHASE_RANK: Readonly<Record<ResearchPhase | "unknown", number>> = { unknown: 0, research: 1, reporting: 2, finished: 3 };
+const REPORT_RANK: Readonly<Record<ResearchReportOutcome, number>> = { none: 0, unknown: 0, generating: 1, incomplete: 2, failed: 2, ready: 3 };
+const STOP_RANK: Readonly<Record<ResearchStopState, number>> = { none: 0, requested: 1, unconfirmed: 2, consumed: 2 };
 
 /**
  * A research request is the only shape with a workload kind. A shell request
@@ -121,7 +131,7 @@ export class ExecutionManager {
   private readonly resources = new Map<string, Map<() => Promise<void>, string>>();
   private readonly controllers = new Map<string, AbortController>();
   /** Graceful stop registered by a running workload, before any kill exists. */
-  private readonly stopHandlers = new Map<string, () => Promise<void>>();
+  private readonly stopHandlers = new Map<string, (stopId: string) => Promise<void>>();
   private readonly research: ResearchRunExecutor | undefined;
   /** Whether the sandbox of one in-flight execution promised a durable boundary. */
   private readonly boundaryExpectations = new Map<string, "required" | "not-applicable" | "ended">();
@@ -322,8 +332,9 @@ export class ExecutionManager {
       // as soon as the workload is actually spawned.
       ...(researchRequest ? { workload: "research" as const, research: {
         workload: researchRequest.workload, schemaVersion: researchRequest.schemaVersion,
-        phase: "unknown" as const, outcome: null, process: "not_started" as const,
-        stop: "none" as const, deadlineViolated: false,
+        phase: "unknown" as const, outcome: null, report: "none" as const, process: "not_started" as const,
+        stop: "none" as const, schedule: researchRequest.schedule,
+        forceReclaimRequested: false, deadlineViolated: false,
         verificationWindowMs: researchRequest.schedule.verificationWindowMs, observedAt: acceptedAt,
       } } : {}),
       ...(shell?.recoveryContext ? { recoveryContext: shell.recoveryContext } : {}),
@@ -695,6 +706,8 @@ export class ExecutionManager {
       requestStop: (handler) => {
         this.stopHandlers.set(id, handler);
       },
+      persistStopIntent: (cause) => this.persistStopIntent(id, cause),
+      observed: (facts) => this.observeExecutionFacts(id, facts),
       retainResource: (cleanup, label) => {
         let owned = this.resources.get(id);
         if (!owned) { owned = new Map(); this.resources.set(id, owned); }
@@ -725,6 +738,78 @@ export class ExecutionManager {
         }
       },
     };
+  }
+
+  /**
+   * Persist a stop intent before anything may act on it.
+   *
+   * The returned identity is derived from the execution and the instant the
+   * intent was first recorded, so the workload, the ledger and a restarted
+   * Runner all name the same stop without keeping a UUID in memory. A failed
+   * write throws: the caller must not then write the control channel, abort or
+   * send a signal for an intent that does not exist.
+   */
+  private async persistStopIntent(id: string, cause: "user" | "budget"): Promise<string> {
+    const stored = this.db.prepare("SELECT record FROM executions WHERE id = ?").get(id);
+    if (!stored) throw new Error("Execution record is missing; the stop intent cannot be persisted");
+    const execution = JSON.parse(String(stored.record)) as ManagedExecution;
+    if (terminal(execution.state)) throw new Error("Execution already ended; no stop intent can be persisted");
+    const observedAt = new Date().toISOString();
+    const stopRequestedAt = execution.boundary?.stopRequestedAt ?? observedAt;
+    const stopId = researchStopId(id, stopRequestedAt);
+    execution.boundary = { ...execution.boundary, observedAt,
+      state: execution.boundary?.state ?? "not-recorded",
+      terminationConfirmed: execution.boundary?.terminationConfirmed ?? false, stopRequestedAt };
+    if (execution.workload === "research" && execution.research) {
+      const research = execution.research;
+      execution.research = { ...research, observedAt,
+        stop: research.stop === "none" ? "requested" : research.stop,
+        ...(research.stopCause !== undefined ? {} : { stopCause: cause }) };
+    }
+    this.save(execution);
+    return stopId;
+  }
+
+  /**
+   * Persist whitelisted facts a running operation observed. The record read here
+   * is the durable row, not the operation's in-memory copy, so a concurrent
+   * cancel intent is never overwritten by a later observation. A write failure
+   * throws: the operation still owns the child and follows its exception
+   * contract instead of keeping facts the ledger does not have.
+   */
+  private observeExecutionFacts(id: string, facts: ExecutionObservation): void {
+    const stored = this.db.prepare("SELECT record FROM executions WHERE id = ?").get(id);
+    if (!stored) throw new Error("Execution record is missing; the observation cannot be persisted");
+    const execution = JSON.parse(String(stored.record)) as ManagedExecution;
+    if (terminal(execution.state)) throw new Error("Execution already ended; the observation is refused");
+    const current = execution.research;
+    if (!current) return;
+    let research: ResearchRunStatus = { ...current, observedAt: new Date().toISOString() };
+    if (facts.process === "spawned" && research.process === "not_started") {
+      research = { ...research, process: "spawned" };
+    }
+    if (facts.spawnedAt !== undefined && research.spawnedAt === undefined) {
+      research = { ...research, spawnedAt: facts.spawnedAt };
+    }
+    const observed = facts.research;
+    const phase = observed?.phase;
+    if (phase !== undefined && PHASE_RANK[phase] > PHASE_RANK[research.phase]) {
+      research = { ...research, phase };
+    }
+    const outcome = observed?.outcome;
+    if (outcome !== undefined && outcome !== null) {
+      research = { ...research, outcome };
+    }
+    const report = observed?.report;
+    if (report !== undefined && REPORT_RANK[report] > REPORT_RANK[research.report]) {
+      research = { ...research, report };
+    }
+    const stop = observed?.stop;
+    if (stop !== undefined && STOP_RANK[stop] > STOP_RANK[research.stop]) {
+      research = { ...research, stop };
+    }
+    execution.research = research;
+    this.save(execution);
   }
 
   private async releaseResources(id: string, error?: unknown): Promise<void> {
@@ -774,10 +859,17 @@ export class ExecutionManager {
     // the monitor's own close can be delivered a tick later: re-read within a
     // small bound instead of quarantining a correct record. A research run
     // states the verification window it reserved for exactly this check; the
-    // bound stays small so one stuck teardown cannot wedge the workspace queue.
-    const window = execution.workload === "research"
-      ? Math.max(100, Math.min(execution.research?.verificationWindowMs ?? 100, 5_000))
-      : 100;
+    // wait is what is left of that window inside the hard deadline measured
+    // from the persisted spawn instant, so this check never extends the budget
+    // the operation was given.
+    let window = 100;
+    if (execution.workload === "research") {
+      const research = execution.research;
+      const spawnedAt = research?.spawnedAt ? Date.parse(research.spawnedAt) : Number.NaN;
+      const hardDeadlineMs = research ? researchRunDeadlines(research.schedule).hardDeadlineMs : 0;
+      const remaining = Number.isFinite(spawnedAt) ? spawnedAt + hardDeadlineMs - Date.now() : 0;
+      window = Math.max(0, Math.min(research?.verificationWindowMs ?? 0, remaining, 250));
+    }
     const deadline = Date.now() + window;
     for (;;) {
       const status = observeExecutionBoundary(handle, stop);
@@ -857,25 +949,21 @@ export class ExecutionManager {
     }
     if (execution.state === "running") {
       // The operation is in this process image; its own stop path joins the
-      // child. No durable signal is sent here, and the record stays running
-      // until that join and the workspace commit decide the outcome.
-      execution.boundary = { ...execution.boundary,
-        observedAt: new Date().toISOString(), state: execution.boundary?.state ?? "not-recorded",
-        terminationConfirmed: execution.boundary?.terminationConfirmed ?? false,
-        stopRequestedAt: execution.boundary?.stopRequestedAt ?? new Date().toISOString() };
-      if (execution.workload === "research" && execution.research) {
-        execution.research = { ...execution.research, observedAt: execution.boundary.observedAt,
-          stop: execution.research.stop === "none" ? "requested" : execution.research.stop };
-      }
-      this.save(execution);
-      // Intent is durable before anything reaches the workload. A workload that
-      // registered a graceful stop is asked first; only a run that never did
-      // (a shell execution, or a research run already past its operation) is
-      // reduced to the immediate abort.
+      // child. A graceful stop is durable before it reaches the workload: the
+      // manager persists the intent, derives the stable stop identity from the
+      // durable row and hands that identity to the operation. If the save
+      // fails, nothing is written to the control channel, aborted or signaled.
       const handler = this.stopHandlers.get(id);
       if (handler) {
+        let stopId: string;
         try {
-          await handler();
+          stopId = await this.persistStopIntent(id, "user");
+        } catch {
+          throw new ExecutionManagerError("RESEARCH_STOP_NOT_DURABLE",
+            "The stop intent could not be persisted; nothing was sent to the workload and it keeps running", 409);
+        }
+        try {
+          await handler(stopId);
         } catch {
           // The handler is bounded and reports its own refusal through the
           // research record; a failed request must not skip the forced reclaim.
@@ -883,6 +971,19 @@ export class ExecutionManager {
         }
         return this.get(id, owner);
       }
+      // A run with no graceful stop (a shell execution, or a research run whose
+      // operation already returned) keeps the immediate-abort semantics, with
+      // the boundary intent persisted first for the same reason.
+      execution.boundary = { ...execution.boundary,
+        observedAt: new Date().toISOString(), state: execution.boundary?.state ?? "not-recorded",
+        terminationConfirmed: execution.boundary?.terminationConfirmed ?? false,
+        stopRequestedAt: execution.boundary?.stopRequestedAt ?? new Date().toISOString() };
+      if (execution.workload === "research" && execution.research) {
+        execution.research = { ...execution.research, observedAt: execution.boundary.observedAt,
+          stop: execution.research.stop === "none" ? "requested" : execution.research.stop,
+          ...(execution.research.stopCause !== undefined ? {} : { stopCause: "user" as const }) };
+      }
+      this.save(execution);
       this.controllers.get(id)?.abort();
       return this.get(id, owner);
     }
@@ -1068,6 +1169,20 @@ export class ExecutionManager {
         observedAt: execution.boundary?.observedAt ?? new Date().toISOString(),
         state: execution.boundary?.state ?? "not-recorded",
         terminationConfirmed: execution.boundary?.terminationConfirmed ?? false, stopRequestedAt };
+      // A durable stop intent (and the cause that produced it) outranks the
+      // in-flight copy: cancellation reads the record separately and an
+      // operation that finishes later must not erase what was asked of it.
+      if (execution.research && previous?.research) {
+        const durableStop = previous.research.stop;
+        const durableCause = previous.research.stopCause;
+        const stopStronger = STOP_RANK[durableStop] > STOP_RANK[execution.research.stop];
+        const causeMissing = durableCause !== undefined && execution.research.stopCause === undefined;
+        if (stopStronger || causeMissing) {
+          execution.research = { ...execution.research,
+            ...(stopStronger ? { stop: durableStop } : {}),
+            ...(causeMissing ? { stopCause: durableCause } : {}) };
+        }
+      }
       if (execution.receipt) {
         if (previous?.receipt) {
           if (!Number.isSafeInteger(previous.receipt.revision) || previous.receipt.revision < 1

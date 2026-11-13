@@ -17,13 +17,15 @@
  *
  * The tests are split by what each one can honestly prove:
  *
- * - the contract, the record parser, the deadlines and the policy functions are
- *   pure, so they are exercised directly;
+ * - the contract, the record parser, the fold, the deadlines and the policy
+ *   functions are pure, so they are exercised directly;
  * - the control channel runs on a real filesystem, including the cases where a
- *   workload replaces an entry with a link or a device node;
+ *   workload replaces an entry with a link, a FIFO, a socket or a directory;
  * - the manager runs against its real SQLite ledger, workspace lease and
  *   resource rows, with a synthetic executor where the subject is admission,
- *   idempotency, publication or fencing rather than the sandbox;
+ *   idempotency, publication or fencing rather than the sandbox, and with real
+ *   SQLite write faults where the subject is a stop that must be durable before
+ *   anything is asked of the workload;
  * - a few cases run a real bubblewrap with the fixed program, because only the
  *   kernel can answer whether the workload really is an ordinary supervised
  *   process and whether the namespace is really empty afterwards.
@@ -34,7 +36,9 @@
 import { createTest } from "../../../test/support/tagged/compat.mjs";
 const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:linux", "arch:amd64", "arch:arm64", "sandbox:bubblewrap"] });
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -44,22 +48,28 @@ import {
   ResearchControlChannel,
   ResearchRunError,
   createResearchRunExecutor,
+  nextResearchRecordState,
   parseResearchRunRequest,
   parseResearchTimeSchedule,
   parseResearchWorkloadRecord,
+  parseStopMarker,
   researchExecutionState,
   researchPublishable,
+  researchRecordUnusable,
   researchRefusalMessage,
   researchRunDeadlines,
   researchStateRoot,
+  researchStopId,
   type ResearchRunExecutor,
   type ResearchRunLaunch,
   type ResearchRunWiring,
+  type ResearchWorkloadRecord,
 } from "./research-run.js";
 import { ExecutionManager, type ExecutionManagerOptions } from "./execution-manager.js";
 import { assertEnvironmentMutationAllowed } from "./execution-resource-fences.js";
 import {
   EnvironmentStore,
+  type EnvironmentRuntime,
   type ProvisionerExecutor,
 } from "./environment-store.js";
 import type {
@@ -107,16 +117,25 @@ function shellRequest(root: string, id: string): ShellExecutionRequest {
 function status(overrides: Partial<ResearchRunStatus> = {}): ResearchRunStatus {
   return {
     deadlineViolated: false,
+    forceReclaimRequested: false,
     observedAt: new Date().toISOString(),
     outcome: null,
     phase: "unknown",
     process: "not_started",
+    report: "none",
+    schedule: { ...SCHEDULE },
     schemaVersion: 1,
     stop: "none",
-    verificationWindowMs: 1_000,
+    verificationWindowMs: SCHEDULE.verificationWindowMs,
     workload: "scienceflow-fixed",
     ...overrides,
   };
+}
+
+function record(
+  overrides: Partial<ResearchWorkloadRecord> & Pick<ResearchWorkloadRecord, "phase">,
+): ResearchWorkloadRecord {
+  return { execution: "run-1", outcome: null, report: "none", stopId: null, ...overrides };
 }
 
 async function scratch(context: { after: (fn: () => Promise<void>) => void }, label: string) {
@@ -138,19 +157,23 @@ async function scratch(context: { after: (fn: () => Promise<void>) => void }, la
   return { close, dataDir, root, workspace };
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((done) => setTimeout(done, ms));
+}
+
 async function until(check: () => boolean, timeoutMs = 10_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!check()) {
     if (Date.now() > deadline) throw new Error(`condition not reached within ${timeoutMs}ms`);
-    await new Promise((done) => setTimeout(done, 5));
+    await delay(5);
   }
 }
 
-async function waitFor(check: () => Promise<boolean>, timeoutMs = 10_000): Promise<void> {
+async function waitFor(check: () => boolean | Promise<boolean>, timeoutMs = 10_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!await check()) {
     if (Date.now() > deadline) throw new Error(`condition not reached within ${timeoutMs}ms`);
-    await new Promise((done) => setTimeout(done, 10));
+    await delay(10);
   }
 }
 
@@ -163,8 +186,23 @@ async function fileExists(path: string): Promise<boolean> {
   }
 }
 
+/** Existence of any entry, including a directory (the wrapper's marker). */
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function readOnlyLedger(dataDir: string): DatabaseSync {
   return new DatabaseSync(resolve(dataDir, "runner-executions", "executions.sqlite"), { readOnly: true });
+}
+
+/** The manager's own write connection, used to inject a real storage failure. */
+function managerDb(manager: ExecutionManager): DatabaseSync {
+  return (manager as unknown as { db: DatabaseSync }).db;
 }
 
 // ---------------------------------------------------------------------------
@@ -172,101 +210,208 @@ function readOnlyLedger(dataDir: string): DatabaseSync {
 //
 // The workload is test code injected through the executor's constructor seam:
 // it is never reachable from a request. Every scenario below is a property of
-// that fixed program, not something a request can choose.
+// that fixed program, not something a request can choose. It speaks the whole
+// protocol: a pending stop is consumed before research, the stop channel is
+// read and acknowledged exactly once, reporting is a phase of its own, and the
+// natural-exit path runs its own cleanup before the process ends.
 // ---------------------------------------------------------------------------
 
 interface Scenario {
-  /** `complete`: research then finished; `forge`: reporting phase; `hang`: never reports. */
-  readonly behaviour: "complete" | "reporting" | "hang" | "failed";
+  /** `complete`: research then finished; `reporting`: a long report phase;
+   *  `hang`: never reports again; `failed`: a terminal failure; `silent`: no records. */
+  readonly behaviour?: "complete" | "reporting" | "hang" | "failed" | "silent";
   /** Whether the workload reads the stop channel at all. */
-  readonly honourStop: boolean;
+  readonly honourStop?: boolean;
   /** Spawn a descendant that leaves the process group and ignores SIGTERM. */
   readonly escapedDescendant?: boolean;
   /** Write the namespace shape into the workspace before reporting. */
   readonly reportShape?: boolean;
-  /** Seconds before it finishes on its own. */
+  /** How long the research phase stays running before it reports. */
+  readonly researchSeconds?: number;
+  /** How long the reporting phase stays running before it reports ready. */
+  readonly reportingSeconds?: number;
+  /** How long a silent or unresponsive workload stays alive. */
   readonly lifetimeSeconds?: number;
+  /** Await this much cleanup in the natural-exit path. */
+  readonly cleanupSeconds?: number;
+  /** Leave a marker in the control directory after the awaited cleanup. */
+  readonly cleanupMarker?: boolean;
+  /** Replace the terminal record after it was written once (valid → unusable). */
+  readonly corruptAfter?: "malformed" | "oversize" | "foreign";
+  /** Stay alive this much longer after the terminal record. */
+  readonly lingerSeconds?: number;
 }
 
 function fixedProgram(scenario: Scenario): string {
   return `import json, os, signal, subprocess, sys, time
-SCENARIO = json.loads(${JSON.stringify(JSON.stringify(scenario))})
-control = sys.argv[1]
 
-def write(name, payload):
-    tmp = os.path.join(control, "." + name + "." + str(os.getpid()))
+SCENARIO = json.loads(${JSON.stringify(JSON.stringify(scenario))})
+CONTROL = sys.argv[1]
+EXECUTION = sys.argv[2]
+STOP = os.path.join(CONTROL, "stop")
+CONSUMED = os.path.join(CONTROL, "stop.consumed")
+
+def write(name, text):
+    tmp = os.path.join(CONTROL, "." + name + "." + str(os.getpid()))
     with open(tmp, "w") as handle:
-        handle.write(json.dumps(payload) + "\\n")
+        handle.write(text + "\\n")
         handle.flush()
         os.fsync(handle.fileno())
-    os.rename(tmp, os.path.join(control, name))
+    os.replace(tmp, os.path.join(CONTROL, name))
 
-def read(name):
+def record(phase, outcome=None, report=None, stop_id=None):
+    payload = {"version": 1, "execution": EXECUTION, "phase": phase}
+    if outcome is not None:
+        payload["outcome"] = outcome
+    if report is not None:
+        payload["report"] = report
+    if stop_id is not None:
+        payload["stopId"] = stop_id
+    write("status", json.dumps(payload))
+
+def read_json(name):
     try:
-        with open(os.path.join(control, name)) as handle:
+        with open(os.path.join(CONTROL, name)) as handle:
             return json.load(handle)
-    except (FileNotFoundError, ValueError):
+    except (FileNotFoundError, ValueError, OSError):
         return None
 
-if SCENARIO.get("reportShape"):
+def take_stop():
+    # Only the first request is consumed, and the rename is the acknowledgement:
+    # after it there is no stop file left for a second read to find.
+    if not SCENARIO.get("honourStop", True):
+        return None
+    request = read_json("stop")
+    if not isinstance(request, dict) or not isinstance(request.get("stopId"), str):
+        return None
     try:
-        pid1 = open("/proc/1/cmdline", "rb").read().decode("utf-8", "replace").split("\\0")[0]
+        os.replace(STOP, CONSUMED)
     except OSError:
-        pid1 = ""
-    with open("shape.json", "w") as handle:
-        json.dump({"self": os.getpid(), "ppid": os.getppid(), "pid1": pid1}, handle)
+        return None
+    return request["stopId"]
 
-# A stop that predates the research phase is a short-circuit, and it is reported
-# with the sender's own id so the Runner can correlate it to its intent.
-pending = read("stop")
-if pending is not None:
-    os.rename(os.path.join(control, "stop"), os.path.join(control, "stop.consumed"))
-    write("status", {"version": 1, "phase": "finished", "outcome": "not-started", "stopId": pending.get("stopId")})
-    sys.exit(0)
+def poll(seconds):
+    end = time.monotonic() + seconds
+    while True:
+        stop_id = take_stop()
+        if stop_id is not None:
+            return stop_id
+        if time.monotonic() >= end:
+            return None
+        time.sleep(0.02)
 
-if SCENARIO.get("escapedDescendant"):
-    child = subprocess.Popen([sys.executable, "-c",
-        "import os,signal,time; os.setsid(); signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)"])
-    with open("descendant.json", "w") as handle:
-        json.dump({"pid": child.pid, "start": open("/proc/%d/stat" % child.pid).read().split(") ")[1].split()[19]}, handle)
+def body():
+    # A stop that predates the research phase is a correlated short-circuit.
+    stop_id = take_stop()
+    if stop_id is not None:
+        record("finished", "not-started", "none", stop_id)
+        return 0
 
-if SCENARIO["behaviour"] == "failed":
-    write("status", {"version": 1, "phase": "finished", "outcome": "failed"})
-    sys.exit(3)
+    if SCENARIO.get("reportShape"):
+        try:
+            pid1 = open("/proc/1/cmdline", "rb").read().decode("utf-8", "replace").split("\\0")[0]
+        except OSError:
+            pid1 = ""
+        with open("shape.json", "w") as handle:
+            json.dump({"self": os.getpid(), "ppid": os.getppid(), "pid1": pid1}, handle)
 
-write("status", {"version": 1, "phase": "research"})
-if SCENARIO["behaviour"] == "reporting":
-    write("status", {"version": 1, "phase": "reporting"})
+    if SCENARIO.get("escapedDescendant"):
+        child = subprocess.Popen([sys.executable, "-c",
+            "import os,signal,time; os.setsid(); signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)"])
+        with open("descendant.json", "w") as handle:
+            json.dump({"pid": child.pid,
+                       "start": open("/proc/%d/stat" % child.pid).read().split(") ")[1].split()[19]}, handle)
 
-# Without an explicit lifetime a scenario finishes as soon as it has reported;
-# a long lifetime is how the stop scenarios keep the workload alive.
-deadline = time.time() + SCENARIO.get("lifetimeSeconds", 0)
-consumed = None
-while time.time() < deadline:
-    if SCENARIO["honourStop"] and consumed is None:
-        request = read("stop")
-        if request is not None:
-            # Only the first request is consumed, and it is acknowledged with
-            # the same id, which is the only thing the Runner trusts.
-            try:
-                os.rename(os.path.join(control, "stop"), os.path.join(control, "stop.consumed"))
-            except OSError:
-                pass
-            consumed = request.get("stopId")
-            write("status", {"version": 1, "phase": "finished", "outcome": "stopped", "stopId": consumed})
-            sys.exit(0)
-    time.sleep(0.02)
+    behaviour = SCENARIO.get("behaviour", "complete")
+    if behaviour == "failed":
+        record("finished", "failed", "failed")
+        return 3
+    if behaviour == "silent":
+        time.sleep(SCENARIO.get("lifetimeSeconds", 60))
+        return 1
 
-write("status", {"version": 1, "phase": "finished", "outcome": "completed"})
+    record("research")
+    stop_id = poll(SCENARIO.get("researchSeconds", 0))
+    if stop_id is not None:
+        record("finished", "stopped", "incomplete", stop_id)
+        return 0
+    if behaviour == "hang":
+        # It ignores the stop channel by configuration and keeps running.
+        time.sleep(SCENARIO.get("lifetimeSeconds", 60))
+        return 1
+    if behaviour == "reporting":
+        record("reporting", "completed", "generating")
+        stop_id = poll(SCENARIO.get("reportingSeconds", 60))
+        if stop_id is not None:
+            # Research is complete; only the report was stopped.
+            record("finished", "completed", "incomplete", stop_id)
+            return 0
+        record("finished", "completed", "ready")
+        return 0
+
+    # Without a requested lifetime a scenario reports as soon as it is done; a
+    # longer one keeps it alive and still honours a stop arriving meanwhile.
+    wait = SCENARIO.get("lifetimeSeconds", 0) + SCENARIO.get("lingerSeconds", 0)
+    if wait > 0:
+        stop_id = poll(wait)
+        if stop_id is not None:
+            record("finished", "stopped", "incomplete", stop_id)
+            return 0
+
+    record("finished", "completed", "ready")
+    corruption = SCENARIO.get("corruptAfter")
+    if corruption is not None:
+        time.sleep(0.25)
+        if corruption == "malformed":
+            write("status", "{not json")
+        elif corruption == "oversize":
+            write("status", "x" * (${RESEARCH_RECORD_MAX_BYTES} + 16))
+        else:
+            write("status", json.dumps({"version": 1, "execution": EXECUTION + "-other",
+                "phase": "finished", "outcome": "completed", "report": "ready"}))
+        time.sleep(0.6)
+    if SCENARIO.get("lingerSeconds"):
+        time.sleep(SCENARIO["lingerSeconds"])
+    return 0
+
+def main():
+    try:
+        return body()
+    finally:
+        # Natural-exit cleanup: it is part of the process's own lifetime and
+        # completes before the workload exits.
+        time.sleep(SCENARIO.get("cleanupSeconds", 0))
+        if SCENARIO.get("cleanupMarker"):
+            with open(os.path.join(CONTROL, "cleanup"), "w") as handle:
+                handle.write("done\\n")
+
+sys.exit(main())
 `;
 }
 
-function wiring(dataDir: string, scenario: Scenario, extra: Partial<ResearchRunWiring> = {}): ResearchRunWiring {
-  return {
-    config: { bwrapPath: "bwrap", dataDir, execTimeoutMs: 30_000, maxOutputBytes: 4_096, maxWorkspaceBytes: 0, terminationGraceMs: 400 },
-    program: fixedProgram(scenario),
-    ...extra,
-  };
+/** Runtime used by fixtures that do not lease a managed environment. */
+const FIXTURE_RUNTIME = { identity: "fixture-runtime", interpreterPath: "/usr/bin/python3" };
+
+function executorConfig(dataDir: string): ResearchRunWiring["config"] {
+  return { bwrapPath: "bwrap", dataDir, execTimeoutMs: 30_000, maxOutputBytes: 4_096,
+    maxWorkspaceBytes: 0, terminationGraceMs: 400 };
+}
+
+/** No fixture runtime: the shape a production wiring has. */
+function bareWiring(
+  dataDir: string,
+  scenario: Scenario,
+  extra: Partial<ResearchRunWiring> = {},
+): ResearchRunWiring {
+  return { config: executorConfig(dataDir), program: fixedProgram(scenario), ...extra };
+}
+
+function wiring(
+  dataDir: string,
+  scenario: Scenario,
+  extra: Partial<ResearchRunWiring> = {},
+): ResearchRunWiring {
+  return bareWiring(dataDir, scenario, { fixtureRuntime: FIXTURE_RUNTIME, ...extra });
 }
 
 /** True when that exact process (pid plus start time) is gone, not reused. */
@@ -342,22 +487,94 @@ test("the state root is derived from the execution id, so no id text becomes a p
 });
 
 test("the workload record is read against a fixed whitelist and never filtered", () => {
-  assert.deepEqual(parseResearchWorkloadRecord('{"version":1,"phase":"research"}'),
-    { outcome: null, phase: "research", stopId: null });
-  assert.deepEqual(parseResearchWorkloadRecord('{"version":1,"phase":"finished","outcome":"completed","stopId":"s-1"}'),
-    { outcome: "completed", phase: "finished", stopId: "s-1" });
-  const refused = (text: string, code: string) => assert.throws(() => parseResearchWorkloadRecord(text),
+  assert.deepEqual(parseResearchWorkloadRecord('{"version":1,"execution":"run-1","phase":"research"}', "run-1"),
+    { execution: "run-1", outcome: null, phase: "research", report: "none", stopId: null });
+  assert.deepEqual(parseResearchWorkloadRecord(
+    '{"version":1,"execution":"run-1","phase":"finished","outcome":"completed","report":"ready","stopId":"s-1"}', "run-1"),
+  { execution: "run-1", outcome: "completed", phase: "finished", report: "ready", stopId: "s-1" });
+  // The research and report facts are separate: a finished stopped run says so.
+  assert.deepEqual(parseResearchWorkloadRecord(
+    '{"version":1,"execution":"run-1","phase":"finished","outcome":"stopped","report":"incomplete"}', "run-1"),
+  { execution: "run-1", outcome: "stopped", phase: "finished", report: "incomplete", stopId: null });
+  // Entering reporting states what research did; it is never inferred.
+  assert.deepEqual(parseResearchWorkloadRecord(
+    '{"version":1,"execution":"run-1","phase":"reporting","outcome":"completed"}', "run-1"),
+  { execution: "run-1", outcome: "completed", phase: "reporting", report: "generating", stopId: null });
+  const refused = (text: string, code: string) => assert.throws(
+    () => parseResearchWorkloadRecord(text, "run-1"),
     (error: unknown) => error instanceof ResearchRunError && error.code === code, text);
   refused("", "RESEARCH_RECORD_MALFORMED");
   refused("{}", "RESEARCH_RECORD_MALFORMED");
-  refused('{"version":1,"phase":"unknown"}', "RESEARCH_RECORD_MALFORMED");
-  refused('{"version":1,"phase":"research","outcome":"completed"}', "RESEARCH_RECORD_MALFORMED");
-  refused('{"version":1,"phase":"finished"}', "RESEARCH_RECORD_MALFORMED");
-  refused('{"version":1,"phase":"finished","outcome":"unknown"}', "RESEARCH_RECORD_MALFORMED");
-  refused('{"version":1,"phase":"finished","outcome":"completed","stopId":"a b"}', "RESEARCH_RECORD_MALFORMED");
-  refused('{"version":1,"phase":"research","extra":1}', "RESEARCH_RECORD_MALFORMED");
-  refused('{"version":2,"phase":"research"}', "RESEARCH_RECORD_VERSION_UNKNOWN");
-  refused('{"phase":"research"}', "RESEARCH_RECORD_MALFORMED");
+  refused('{"version":1,"phase":"research"}', "RESEARCH_RECORD_MALFORMED");
+  refused('{"version":1,"execution":"run-1","phase":"unknown"}', "RESEARCH_RECORD_MALFORMED");
+  refused('{"version":1,"execution":"run-1","phase":"research","outcome":"completed"}', "RESEARCH_RECORD_MALFORMED");
+  refused('{"version":1,"execution":"run-1","phase":"finished"}', "RESEARCH_RECORD_MALFORMED");
+  refused('{"version":1,"execution":"run-1","phase":"finished","outcome":"unknown"}', "RESEARCH_RECORD_MALFORMED");
+  // A completed research phase without a report fact is not a terminal record.
+  refused('{"version":1,"execution":"run-1","phase":"finished","outcome":"completed"}', "RESEARCH_RECORD_MALFORMED");
+  refused('{"version":1,"execution":"run-1","phase":"finished","outcome":"completed","report":"ready","stopId":"a b"}',
+    "RESEARCH_RECORD_MALFORMED");
+  refused('{"version":1,"execution":"run-1","phase":"research","extra":1}', "RESEARCH_RECORD_MALFORMED");
+  refused('{"version":2,"execution":"run-1","phase":"research"}', "RESEARCH_RECORD_VERSION_UNKNOWN");
+  // A record left by another execution is never this run's result.
+  refused('{"version":1,"execution":"run-2","phase":"finished","outcome":"completed","report":"ready"}',
+    "RESEARCH_RECORD_IDENTITY_MISMATCH");
+});
+
+test("the stop marker is smaller than a record and never a business fact", () => {
+  assert.equal(parseStopMarker('{"version":1,"stopId":"s-1"}'), "s-1");
+  const refused = (text: string, code: string) => assert.throws(() => parseStopMarker(text),
+    (error: unknown) => error instanceof ResearchRunError && error.code === code, text);
+  refused("not json", "RESEARCH_RECORD_MALFORMED");
+  refused('{"version":1}', "RESEARCH_RECORD_MALFORMED");
+  refused('{"version":1,"stopId":"s-1","phase":"finished"}', "RESEARCH_RECORD_MALFORMED");
+  refused('{"version":2,"stopId":"s-1"}', "RESEARCH_RECORD_VERSION_UNKNOWN");
+});
+
+test("the record fold refuses a terminal rewrite, a regression and a foreign stop", () => {
+  const applied = (current: Parameters<typeof nextResearchRecordState>[0], next: ResearchWorkloadRecord,
+    context: { stopId: string | null; stopRequested: boolean } = { stopId: null, stopRequested: false }) =>
+    nextResearchRecordState(current, next, context);
+  // A forward walk applies, and the report only moves forward.
+  const research = applied(null, record({ phase: "research" }));
+  assert.equal(research.status, "applied");
+  const reporting = applied(research.status === "applied" ? research.facts : null,
+    record({ outcome: "completed", phase: "reporting", report: "generating" }));
+  assert.equal(reporting.status, "applied");
+  const finished = applied(reporting.status === "applied" ? reporting.facts : null,
+    record({ outcome: "completed", phase: "finished", report: "ready" }));
+  assert.deepEqual(finished, { status: "applied", facts: { outcome: "completed", phase: "finished", report: "ready", stopId: null } });
+  // Re-reading the same terminal record is not a second transition.
+  assert.deepEqual(applied(finished.status === "applied" ? finished.facts : null,
+    record({ outcome: "completed", phase: "finished", report: "ready" })), finished);
+  // terminal → non-terminal and terminal → a different terminal are refused.
+  for (const next of [
+    record({ phase: "research" }),
+    record({ phase: "reporting", outcome: "completed", report: "generating" }),
+    record({ outcome: "failed", phase: "finished", report: "failed" }),
+    record({ outcome: "completed", phase: "finished", report: "incomplete" }),
+  ]) {
+    assert.equal(applied(finished.status === "applied" ? finished.facts : null, next).status, "refused", JSON.stringify(next));
+  }
+  // A phase may not move backwards while it is not terminal either.
+  const back = applied(reporting.status === "applied" ? reporting.facts : null, record({ phase: "research" }));
+  assert.deepEqual(back, { status: "refused", code: "RESEARCH_RECORD_TRANSITION_INVALID" });
+  // A stop this run did not persist is another attempt's stop, not evidence.
+  assert.deepEqual(applied(null, record({ outcome: "stopped", phase: "finished", report: "incomplete", stopId: "foreign" })),
+    { status: "refused", code: "RESEARCH_RECORD_IDENTITY_MISMATCH" });
+  assert.deepEqual(applied(null, record({ outcome: "stopped", phase: "finished", report: "incomplete" })),
+    { status: "refused", code: "RESEARCH_RECORD_IDENTITY_MISMATCH" });
+  assert.deepEqual(applied(null, record({ outcome: "not-started", phase: "finished", report: "none" })),
+    { status: "refused", code: "RESEARCH_RECORD_IDENTITY_MISMATCH" });
+  // With the durable intent behind it, the same record applies.
+  const stopped = applied(null, record({ outcome: "stopped", phase: "finished", report: "incomplete", stopId: "s-1" }),
+    { stopId: "s-1", stopRequested: true });
+  assert.equal(stopped.status, "applied");
+  // The stable stop identity is derived from the durable intent, not a UUID.
+  assert.equal(researchStopId("run-1", "2026-11-13T00:00:00.000Z"),
+    researchStopId("run-1", "2026-11-13T00:00:00.000Z"));
+  assert.notEqual(researchStopId("run-1", "2026-11-13T00:00:00.000Z"),
+    researchStopId("run-2", "2026-11-13T00:00:00.000Z"));
 });
 
 test("a process fact never becomes a research result by itself", () => {
@@ -373,10 +590,47 @@ test("a process fact never becomes a research result by itself", () => {
   assert.equal(researchExecutionState(status({ process: "spawned-then-terminated", outcome: "unknown" }), false), "unknown");
   assert.equal(researchPublishable(status({ process: "spawned-then-terminated", outcome: "unknown" })), false);
   // The workload's own terminal record decides the business outcome.
-  assert.equal(researchExecutionState(status({ process: "spawned-then-terminated", outcome: "completed" }), false), "completed");
-  assert.equal(researchExecutionState(status({ process: "spawned-then-terminated", outcome: "stopped" }), true), "cancelled");
+  assert.equal(researchExecutionState(status({ process: "spawned-then-terminated", outcome: "completed", report: "ready" }), false), "completed");
+  assert.equal(researchExecutionState(status({ process: "spawned-then-terminated", outcome: "stopped", report: "incomplete" }), true), "cancelled");
   assert.equal(researchExecutionState(status({ process: "spawned-then-terminated", outcome: "not-started" }), true), "cancelled");
-  assert.equal(researchExecutionState(status({ process: "spawned-then-terminated", outcome: "failed" }), false), "failed");
+  assert.equal(researchExecutionState(status({ process: "spawned-then-terminated", outcome: "failed", report: "failed" }), false), "failed");
+  // Research completed while the report did not: the two facts are kept apart.
+  assert.equal(researchExecutionState(status({ process: "spawned-then-terminated", outcome: "completed", report: "incomplete", stop: "consumed" }), false), "cancelled");
+  assert.equal(researchExecutionState(status({ process: "spawned-then-terminated", outcome: "completed", report: "failed" }), false), "failed");
+  assert.equal(researchExecutionState(status({ process: "spawned-then-terminated", outcome: "completed", report: "incomplete" }), true), "cancelled");
+  // A stop outcome without the durable intent behind it is never published.
+  assert.equal(researchPublishable(status({ process: "spawned-then-terminated", outcome: "stopped", report: "incomplete" })), false);
+  assert.equal(researchPublishable(status({ process: "spawned-then-terminated", outcome: "completed", report: "ready", stop: "consumed" })), true);
+});
+
+test("an unusable record and a late proof can never be published from an earlier completion", () => {
+  // The exact shape a valid completion followed by an unreadable record leaves:
+  // the business facts were dropped, the refusal is named, nothing publishes.
+  for (const refusal of [
+    "RESEARCH_RECORD_MALFORMED",
+    "RESEARCH_RECORD_OVERSIZE",
+    "RESEARCH_RECORD_IDENTITY_MISMATCH",
+    "RESEARCH_RECORD_TRANSITION_INVALID",
+    "RESEARCH_RECORD_VERSION_UNKNOWN",
+    "RESEARCH_STATE_SAVE_FAILED",
+  ] as const) {
+    const unusable = status({ outcome: "completed", phase: "finished", process: "spawned-then-terminated",
+      refusal, report: "ready" });
+    assert.equal(researchRecordUnusable(unusable), true, refusal);
+    assert.equal(researchExecutionState(unusable, false), "unknown", refusal);
+    assert.equal(researchPublishable(unusable), false, refusal);
+  }
+  // Proof that completed after the hard deadline is unknown whatever it says.
+  const late = status({ deadlineViolated: true, outcome: "completed",
+    process: "spawned-then-terminated", report: "ready" });
+  assert.equal(researchExecutionState(late, false), "unknown");
+  assert.equal(researchPublishable(late), false);
+  // A reclaim request is not a violation by itself.
+  const reclaimed = status({ forceReclaimRequested: true, outcome: "stopped",
+    process: "spawned-then-terminated", report: "incomplete", stop: "consumed" });
+  assert.equal(reclaimed.deadlineViolated, false);
+  assert.equal(researchExecutionState(reclaimed, false), "cancelled");
+  assert.equal(researchPublishable(reclaimed), true);
 });
 
 test("the deadlines reserve the verification window before the hard deadline", () => {
@@ -415,6 +669,49 @@ test("a replaced control entry is refused rather than followed to another host p
   const written = await channel.read("stop");
   assert.equal(written.status, "text");
   assert.deepEqual(JSON.parse((written as { text: string }).text), { stopId: "stop-1", version: 1 });
+});
+
+test("a FIFO at a control name is refused without waiting for a writer", async (context) => {
+  const { root } = await scratch(context, "fifo");
+  const stateRoot = resolve(root, "state");
+  await mkdir(stateRoot, { mode: 0o700 });
+  const channel = await ResearchControlChannel.open(stateRoot);
+  context.after(async () => { await channel.close(); });
+  const control = resolve(stateRoot, "control");
+
+  // A FIFO is the case a blocking open never settles: the supervision turn
+  // would stop checking deadlines and the reader/manager queue would wedge.
+  execFileSync("mkfifo", [resolve(control, "status")]);
+  let settled = false;
+  const read = channel.read("status").then((value) => { settled = true; return value; });
+  const outcome = await Promise.race([
+    read,
+    delay(1_000).then(() => "timeout" as const),
+  ]);
+  if (outcome === "timeout") {
+    // Release a blocking open from a regression so the failure leaves no
+    // thread parked on the FIFO, then let the read settle before failing.
+    await writeFile(resolve(control, "status"), "").catch(() => undefined);
+    await read.catch(() => undefined);
+  }
+  assert.equal(settled, true, "the read must not wait for a writer");
+  assert.deepEqual(outcome, { status: "refused", code: "RESEARCH_CONTROL_REPLACED" });
+});
+
+test("a socket at a control name is refused as a non-regular entry", async (context) => {
+  const { root } = await scratch(context, "socket");
+  const stateRoot = resolve(root, "state");
+  await mkdir(stateRoot, { mode: 0o700 });
+  const channel = await ResearchControlChannel.open(stateRoot);
+  context.after(async () => { await channel.close(); });
+  const path = resolve(stateRoot, "control", "status");
+  const server = createServer();
+  await new Promise<void>((done, failed) => {
+    server.once("error", failed);
+    server.listen(path, () => done());
+  });
+  context.after(async () => { await new Promise<void>((done) => server.close(() => done())); });
+  assert.deepEqual(await channel.read("status"), { status: "refused", code: "RESEARCH_CONTROL_REPLACED" });
 });
 
 test("an oversized, malformed or non-file record is refused with its own code", async (context) => {
@@ -531,12 +828,14 @@ test("a Runner without the research dependency refuses before anything reaches t
 test("a duplicate submission returns the accepted record and a different digest conflicts without launching", async (context) => {
   const calls: string[] = [];
   const { manager, workspace } = await managerFixture(context, "duplicate",
-    { research: syntheticExecutor(calls, async () => status({ outcome: "completed", phase: "finished", process: "spawned-then-terminated" })) });
+    { research: syntheticExecutor(calls, async () => status({ outcome: "completed", phase: "finished", process: "spawned-then-terminated", report: "ready" })) });
   const request = researchRequest("run-dup", workspace);
   const first = manager.submitResearch(request);
   assert.equal(first.accepted, true);
   assert.equal(first.execution.workload, "research");
   assert.equal(first.execution.research?.process, "not_started", "acceptance is a positive record");
+  assert.deepEqual(first.execution.research?.schedule, SCHEDULE, "the governing schedule is persisted");
+  assert.equal(first.execution.research?.forceReclaimRequested, false);
   const duplicate = manager.submitResearch({ ...request });
   assert.equal(duplicate.accepted, false);
   assert.equal(duplicate.execution.receipt?.requestDigest, first.execution.receipt?.requestDigest);
@@ -558,9 +857,9 @@ test("same-workspace research submissions stay serialized by the execution queue
   const { manager, workspace } = await managerFixture(context, "queue", {
     research: syntheticExecutor([], async (request) => {
       timeline.push([request.executionId, "start"]);
-      await new Promise((done) => setTimeout(done, 40));
+      await delay(40);
       timeline.push([request.executionId, "end"]);
-      return status({ outcome: "completed", phase: "finished", process: "spawned-then-terminated" });
+      return status({ outcome: "completed", phase: "finished", process: "spawned-then-terminated", report: "ready" });
     }),
   });
   const first = manager.submitResearch(researchRequest("run-a", workspace));
@@ -604,7 +903,7 @@ test("a spawned run without a proven boundary or terminal record stays unknown a
         // The launcher stopped the child it could not supervise; nothing may be
         // claimed about the process, so the record is `unverified`.
       }
-      return status({ outcome: "completed", phase: "finished", process: "unverified" });
+      return status({ outcome: "completed", phase: "finished", process: "unverified", report: "ready" });
     }),
   });
   manager.submitResearch(researchRequest("run-unproven", workspace, { environmentId: "task-1" }));
@@ -631,8 +930,6 @@ test("a research run with a proven process but no terminal business fact is quar
   assert.match(record.error!, /terminal research record/);
   // A later execution into the same workspace is refused at admission: the
   // workspace and device fences stay exactly as an unverified process would.
-  // Admission owns this refusal, so it is a synchronous rejection of the
-  // submission rather than a queued execution that fails later.
   assert.throws(() => manager.submitResearch(researchRequest("run-later", workspace)),
     (error: unknown) => (error as { code?: string }).code === "EXECUTION_RESOURCE_QUARANTINED"
       && /unverified process state/.test((error as Error).message));
@@ -649,7 +946,7 @@ test("a research execution cancelled while queued records not-started without la
   const { manager, workspace } = await managerFixture(context, "queued-cancel", {
     research: syntheticExecutor(calls, async (request) => {
       if (request.executionId === "run-blocking") { started.resolve(); await finish.promise; }
-      return status({ outcome: "completed", phase: "finished", process: "spawned-then-terminated" });
+      return status({ outcome: "completed", phase: "finished", process: "spawned-then-terminated", report: "ready" });
     }),
   });
   manager.submitResearch(researchRequest("run-blocking", workspace));
@@ -673,7 +970,7 @@ test("a research execution cancelled while queued records not-started without la
 test("the fixed workload is an ordinary supervised process and publishes only after the namespace is empty", async (context) => {
   const { close, dataDir, workspace } = await scratch(context, "sandbox");
   const manager = new ExecutionManager(dataDir, undefined, { research: createResearchRunExecutor(wiring(dataDir, {
-    behaviour: "complete", honourStop: true, reportShape: true,
+    behaviour: "complete", cleanupMarker: true, cleanupSeconds: 0.1, honourStop: true, reportShape: true,
   })) });
   close(async () => { await manager.close(); });
   manager.submitResearch(researchRequest("run-sandbox", workspace));
@@ -682,7 +979,10 @@ test("the fixed workload is an ordinary supervised process and publishes only af
   assert.equal(record.workload, "research");
   assert.equal(record.research?.outcome, "completed");
   assert.equal(record.research?.phase, "finished");
+  assert.equal(record.research?.report, "ready");
   assert.equal(record.research?.process, "spawned-then-terminated");
+  assert.equal(record.research?.deadlineViolated, false);
+  assert.equal(record.research?.forceReclaimRequested, false);
   assert.equal(record.boundary?.terminationConfirmed, true, "publication follows the namespace proof");
   assert.ok(record.version);
 
@@ -694,10 +994,10 @@ test("the fixed workload is an ordinary supervised process and publishes only af
   assert.equal(shape.ppid, 1);
   assert.ok(shape.self > 1);
   assert.match(shape.pid1, /bwrap/);
+  // The natural-exit path really awaited its cleanup before the process ended.
+  assert.equal(await readFile(resolve(researchStateRoot(dataDir, "run-sandbox"), "control", "cleanup"), "utf8"), "done\n");
 
   // One ledger-held execution, with its identity row and released resources.
-  // The release follows the publish in the same operation turn, so it is
-  // observed rather than assumed to have happened before `completed` was read.
   const db = readOnlyLedger(dataDir);
   context.after(async () => { db.close(); });
   const resourceRows = () => Number(db.prepare("SELECT COUNT(*) AS count FROM execution_resources WHERE execution = ?")
@@ -706,6 +1006,45 @@ test("the fixed workload is an ordinary supervised process and publishes only af
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM execution_boundaries WHERE execution = ?")
     .get("run-sandbox")!.count, 1);
   await until(() => resourceRows() === 0, 10_000);
+});
+
+test("a running execution reports its process and business facts to the ledger, not to memory only", async (context) => {
+  const { close, dataDir, workspace } = await scratch(context, "observed");
+  const manager = new ExecutionManager(dataDir, undefined, { research: createResearchRunExecutor(wiring(dataDir, {
+    behaviour: "complete", honourStop: true, researchSeconds: 2,
+  })) });
+  close(async () => { await manager.close(); });
+  manager.submitResearch(researchRequest("run-observed", workspace));
+  await until(() => manager.get("run-observed", owner).state === "running", 20_000);
+  // The process fact and the business phase must be readable while it runs;
+  // a ledger that still says `not_started` describes a different run.
+  await waitFor(() => {
+    const record = manager.get("run-observed", owner);
+    return record.state === "running" && record.research?.process === "spawned"
+      && record.research?.phase === "research";
+  }, 20_000);
+  const live = manager.get("run-observed", owner);
+  assert.equal(live.research?.process, "spawned");
+  assert.equal(live.research?.phase, "research");
+  assert.equal(live.research?.outcome, null);
+  assert.equal(live.research?.report, "none");
+  assert.equal(live.research?.stop, "none");
+  assert.equal(live.research?.stopCause, undefined);
+  assert.ok(live.research?.spawnedAt, "the spawn instant is durable, not inferred later");
+  // The remembered process identity is durable while the run is live.
+  const db = readOnlyLedger(dataDir);
+  context.after(async () => { db.close(); });
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM execution_boundaries WHERE execution = ?")
+    .get("run-observed")!.count, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM execution_resources WHERE execution = ?")
+    .get("run-observed")!.count, 1);
+
+  await until(() => manager.get("run-observed", owner).state === "completed", 20_000);
+  const record = manager.get("run-observed", owner);
+  assert.equal(record.research?.phase, "finished");
+  assert.equal(record.research?.report, "ready");
+  assert.equal(record.research?.outcome, "completed");
+  assert.equal(record.research?.spawnedAt, live.research?.spawnedAt);
 });
 
 test("a graceful stop after ready is consumed once and does not wait for the run budget", async (context) => {
@@ -728,14 +1067,18 @@ test("a graceful stop after ready is consumed once and does not wait for the run
   const first = await manager.cancel("run-graceful", owner);
   assert.equal(first.boundary?.stopRequestedAt !== undefined, true, "the intent is durable before the workload sees it");
   assert.equal(first.research?.stop, "requested");
+  assert.equal(first.research?.stopCause, "user");
   // A repeated stop is the same intent, not a second control task.
   const second = await manager.cancel("run-graceful", owner);
   assert.equal(second.boundary?.stopRequestedAt, first.boundary?.stopRequestedAt);
   await until(() => manager.get("run-graceful", owner).state === "cancelled", 10_000);
   const record = manager.get("run-graceful", owner);
   assert.equal(record.research?.outcome, "stopped");
+  assert.equal(record.research?.report, "incomplete");
   assert.equal(record.research?.stop, "consumed");
+  assert.equal(record.research?.stopCause, "user");
   assert.equal(record.boundary?.terminationConfirmed, true);
+  assert.ok(record.version, "a stopped run with durable evidence is still publishable");
   assert.ok(Date.now() - requestedAt < SCHEDULE.researchBudgetMs,
     "a user stop is bounded by its own grace, not by the whole run budget");
   const stop = await channel.read("stop");
@@ -745,27 +1088,58 @@ test("a graceful stop after ready is consumed once and does not wait for the run
   assert.equal(stop.status, "missing");
   assert.equal(consumed.status, "text");
   const stopId = JSON.parse((consumed as { text: string }).text).stopId;
-  assert.match(stopId, /^[0-9a-f-]{36}$/);
+  assert.match(stopId, /^[0-9a-f]{32}$/);
   assert.deepEqual(JSON.parse((consumed as { text: string }).text), { stopId, version: 1 });
 });
 
-test("a stop that predates the research phase is a correlated not-started record", async (context) => {
-  const { close, dataDir, workspace } = await scratch(context, "pending");
-  // The fixture plants the stop intent before the run, the way a restart after
-  // a durable intent would. The workload must short-circuit and say so.
-  const stateRoot = researchStateRoot(dataDir, "run-pending");
+test("a stop during reporting keeps research completed and publishes the incomplete report", async (context) => {
+  const { close, dataDir, workspace } = await scratch(context, "reporting");
+  const manager = new ExecutionManager(dataDir, undefined, { research: createResearchRunExecutor(wiring(dataDir, {
+    behaviour: "reporting", honourStop: true, reportingSeconds: 60, researchSeconds: 0,
+  })) });
+  close(async () => { await manager.close(); });
+  manager.submitResearch(researchRequest("run-reporting", workspace));
+  await until(() => manager.get("run-reporting", owner).state === "running", 20_000);
+  await waitFor(() => manager.get("run-reporting", owner).research?.phase === "reporting", 20_000);
+  await manager.cancel("run-reporting", owner);
+  await until(() => manager.get("run-reporting", owner).state === "cancelled", 15_000);
+  const record = manager.get("run-reporting", owner);
+  // The two business facts are independent: research finished, the report was
+  // stopped. Neither is collapsed into the other or into the process state.
+  assert.equal(record.research?.outcome, "completed");
+  assert.equal(record.research?.report, "incomplete");
+  assert.equal(record.research?.phase, "finished");
+  assert.equal(record.research?.stop, "consumed");
+  assert.equal(record.research?.stopCause, "user");
+  assert.ok(record.version);
+});
+
+test("a planted stop and a stale acknowledgement are refused, not published", async (context) => {
+  const { close, dataDir, workspace } = await scratch(context, "stale-stop");
+  // A stop file nobody in this Runner persisted, plus an acknowledgement left
+  // by another attempt. Neither is evidence: the workload may consume the first
+  // and report `not-started` with an id this run never issued.
+  const stateRoot = researchStateRoot(dataDir, "run-stale");
   await mkdir(resolve(stateRoot, "control"), { recursive: true, mode: 0o700 });
   await writeFile(resolve(stateRoot, "control", "stop"), JSON.stringify({ stopId: "planted", version: 1 }) + "\n");
+  await writeFile(resolve(stateRoot, "control", "stop.consumed"), JSON.stringify({ stopId: "old", version: 1 }) + "\n");
   const manager = new ExecutionManager(dataDir, undefined, { research: createResearchRunExecutor(wiring(dataDir, {
     behaviour: "complete", honourStop: true,
   })) });
   close(async () => { await manager.close(); });
-  manager.submitResearch(researchRequest("run-pending", workspace));
-  await until(() => manager.get("run-pending", owner).state === "cancelled", 20_000);
-  const record = manager.get("run-pending", owner);
-  assert.equal(record.research?.outcome, "not-started");
+  manager.submitResearch(researchRequest("run-stale", workspace));
+  await until(() => ["unknown", "failed", "cancelled", "completed"].includes(manager.get("run-stale", owner).state), 20_000);
+  const record = manager.get("run-stale", owner);
+  assert.equal(record.state, "unknown", "a stop without a durable intent is not a stop");
+  assert.equal(record.research?.refusal, "RESEARCH_RECORD_IDENTITY_MISMATCH");
+  assert.equal(record.research?.outcome, "unknown");
+  assert.equal(record.research?.phase, "unknown");
+  assert.equal(record.research?.stop, "none", "the stale acknowledgement never flips the channel state");
+  assert.equal(record.version, undefined);
   assert.equal(record.research?.process, "spawned-then-terminated");
-  assert.equal(record.boundary?.terminationConfirmed, true);
+  // The fence is retained, so the workspace cannot accept new work.
+  assert.throws(() => manager.submitResearch(researchRequest("run-after-stale", workspace)),
+    (error: unknown) => (error as { code?: string }).code === "EXECUTION_RESOURCE_QUARANTINED");
 });
 
 test("an unresponsive workload is reclaimed by its stop grace and nothing escapes the namespace", async (context) => {
@@ -786,7 +1160,8 @@ test("an unresponsive workload is reclaimed by its stop grace and nothing escape
   assert.equal(record.boundary?.terminationConfirmed, true);
   assert.equal(record.research?.process, "spawned-then-terminated");
   assert.equal(record.research?.outcome, "unknown", "no terminal record is unknown, never completed");
-  assert.equal(record.research?.deadlineViolated, false, "a user stop is not a deadline violation");
+  assert.equal(record.research?.deadlineViolated, false, "a user stop proven on time is not a deadline violation");
+  assert.equal(record.research?.stopCause, "user");
   assert.equal(record.version, undefined);
   assert.ok(Date.now() - requestedAt < SCHEDULE.researchBudgetMs);
   const descendant = JSON.parse(await readFile(resolve(workspace, "descendant.json"), "utf8")) as
@@ -795,25 +1170,269 @@ test("an unresponsive workload is reclaimed by its stop grace and nothing escape
     "the escaped descendant is gone, not merely out of its process group");
 });
 
-test("the whole-run deadline reclaims the namespace and marks the deadline violated", async (context) => {
-  const { close, dataDir, workspace } = await scratch(context, "deadline");
-  const short: ResearchTimeSchedule = {
-    drainGraceMs: 0, reportBudgetMs: 100, researchBudgetMs: 500, stopGraceMs: 200, verificationWindowMs: 800,
-  };
+test("a valid completion followed by an unusable record is never published", async (context) => {
+  for (const corruption of ["malformed", "oversize", "foreign"] as const) {
+    const { close, dataDir, workspace } = await scratch(context, `corrupt-${corruption}`);
+    const manager = new ExecutionManager(dataDir, undefined, { research: createResearchRunExecutor(wiring(dataDir, {
+      behaviour: "complete", corruptAfter: corruption, honourStop: true,
+    })) });
+    close(async () => { await manager.close(); });
+    const id = `run-corrupt-${corruption}`;
+    manager.submitResearch(researchRequest(id, workspace));
+    await until(() => ["unknown", "failed", "completed"].includes(manager.get(id, owner).state), 20_000);
+    const stored = manager.get(id, owner);
+    // The first read was a valid `completed`/`ready`; the later record is not
+    // evidence, and the earlier value is not a cache to fall back on.
+    assert.equal(stored.state, "unknown", corruption);
+    assert.equal(stored.research?.phase, "unknown", corruption);
+    assert.equal(stored.research?.outcome, "unknown", corruption);
+    assert.equal(stored.research?.report, "none", corruption);
+    assert.equal(stored.research?.refusal, corruption === "malformed" ? "RESEARCH_RECORD_MALFORMED"
+      : corruption === "oversize" ? "RESEARCH_RECORD_OVERSIZE"
+        : "RESEARCH_RECORD_IDENTITY_MISMATCH", corruption);
+    assert.equal(stored.version, undefined, corruption);
+    assert.equal(stored.research?.process, "spawned-then-terminated", corruption);
+    // Fences are retained exactly as for an unproven process.
+    assert.throws(() => manager.submitResearch(researchRequest(`${id}-later`, workspace)),
+      (error: unknown) => (error as { code?: string }).code === "EXECUTION_RESOURCE_QUARANTINED", corruption);
+  }
+});
+
+test("a FIFO placed on the live record stops the operation instead of parking it", async (context) => {
+  const { close, dataDir, workspace } = await scratch(context, "fifo-run");
   const manager = new ExecutionManager(dataDir, undefined, { research: createResearchRunExecutor(wiring(dataDir, {
-    behaviour: "complete", honourStop: false, lifetimeSeconds: 60,
+    behaviour: "hang", honourStop: true, lifetimeSeconds: 60,
   })) });
   close(async () => { await manager.close(); });
+  manager.submitResearch(researchRequest("run-fifo", workspace));
+  const statusPath = resolve(researchStateRoot(dataDir, "run-fifo"), "control", "status");
+  // Wait for the workload's own first record, so the process is definitely
+  // spawned before the channel is replaced.
+  await waitFor(async () => {
+    try {
+      return JSON.parse(await readFile(statusPath, "utf8")).phase === "research";
+    } catch { return false; }
+  }, 20_000);
   const requestedAt = Date.now();
-  manager.submitResearch(researchRequest("run-deadline", workspace, { schedule: short }));
-  await until(() => ["unknown", "failed", "completed", "cancelled"].includes(manager.get("run-deadline", owner).state), 20_000);
-  const elapsed = Date.now() - requestedAt;
-  const record = manager.get("run-deadline", owner);
+  await rm(statusPath);
+  execFileSync("mkfifo", [statusPath]);
+  await until(() => ["unknown", "failed"].includes(manager.get("run-fifo", owner).state), 10_000);
+  const record = manager.get("run-fifo", owner);
+  assert.ok(Date.now() - requestedAt < 10_000, "a replaced channel does not wait for the deadline");
   assert.equal(record.state, "unknown");
+  assert.equal(record.research?.refusal, "RESEARCH_CONTROL_REPLACED");
+  assert.equal(record.research?.process, "spawned-then-terminated");
+  assert.equal(record.version, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// The durable stop intent under a real storage fault
+// ---------------------------------------------------------------------------
+
+const BUDGET_SCHEDULE: ResearchTimeSchedule = {
+  drainGraceMs: 0, reportBudgetMs: 2_000, researchBudgetMs: 500, stopGraceMs: 500, verificationWindowMs: 1_000,
+};
+
+test("a budget stop is durable before any control write, and a failed save writes nothing", async (context) => {
+  const { close, dataDir, workspace } = await scratch(context, "budget-fault");
+  const manager = new ExecutionManager(dataDir, undefined, { research: createResearchRunExecutor(wiring(dataDir, {
+    behaviour: "complete", honourStop: true, lifetimeSeconds: 30,
+  })) });
+  close(async () => { await manager.close(); });
+  const control = resolve(researchStateRoot(dataDir, "run-budget"), "control");
+  manager.submitResearch(researchRequest("run-budget", workspace, { schedule: BUDGET_SCHEDULE }));
+  await until(() => manager.get("run-budget", owner).state === "running", 20_000);
+  await waitFor(() => manager.get("run-budget", owner).research?.phase === "research", 20_000);
+
+  const db = managerDb(manager);
+  db.exec("PRAGMA query_only = ON");
+  try {
+    // Past the research budget with the retry throttle active: the persist
+    // fails, so there must be no control file, no abort and no stop in memory.
+    await delay(900);
+    assert.equal(await fileExists(resolve(control, "stop")), false, "no control write without a durable intent");
+    const stuck = manager.get("run-budget", owner);
+    assert.equal(stuck.state, "running");
+    assert.equal(stuck.research?.stop, "none");
+    assert.equal(stuck.research?.stopCause, undefined);
+    assert.equal(stuck.boundary?.stopRequestedAt, undefined);
+  } finally {
+    db.exec("PRAGMA query_only = OFF");
+  }
+  // Once storage works again the next tick persists the same intent and the
+  // workload is asked to stop. It is recorded as a budget stop, not a user one.
+  await until(() => manager.get("run-budget", owner).state === "cancelled", 15_000);
+  const record = manager.get("run-budget", owner);
+  assert.equal(record.research?.stopCause, "budget");
+  assert.equal(record.research?.stop, "consumed");
+  assert.equal(record.research?.outcome, "stopped");
+  assert.equal(record.research?.report, "incomplete");
+  assert.equal(record.boundary?.terminationConfirmed, true);
+});
+
+test("a user stop that cannot be persisted sends nothing and says so", async (context) => {
+  const { close, dataDir, workspace } = await scratch(context, "user-fault");
+  const long: ResearchTimeSchedule = {
+    drainGraceMs: 0, reportBudgetMs: 2_000, researchBudgetMs: 5_000, stopGraceMs: 500, verificationWindowMs: 1_000,
+  };
+  const manager = new ExecutionManager(dataDir, undefined, { research: createResearchRunExecutor(wiring(dataDir, {
+    behaviour: "complete", honourStop: true, lifetimeSeconds: 30,
+  })) });
+  close(async () => { await manager.close(); });
+  const control = resolve(researchStateRoot(dataDir, "run-user-fault"), "control");
+  manager.submitResearch(researchRequest("run-user-fault", workspace, { schedule: long }));
+  await until(() => manager.get("run-user-fault", owner).state === "running", 20_000);
+  await waitFor(() => manager.get("run-user-fault", owner).research?.phase === "research", 20_000);
+
+  const db = managerDb(manager);
+  db.exec("PRAGMA query_only = ON");
+  try {
+    await assert.rejects(manager.cancel("run-user-fault", owner),
+      (error: unknown) => (error as { code?: string }).code === "RESEARCH_STOP_NOT_DURABLE");
+    assert.equal(await fileExists(resolve(control, "stop")), false);
+    const stuck = manager.get("run-user-fault", owner);
+    assert.equal(stuck.state, "running");
+    assert.equal(stuck.research?.stop, "none");
+    assert.equal(stuck.boundary?.stopRequestedAt, undefined);
+  } finally {
+    db.exec("PRAGMA query_only = OFF");
+  }
+  // The caller can retry once the ledger accepts writes; the same durable
+  // identity then reaches the workload and the run stops as a user stop.
+  await manager.cancel("run-user-fault", owner);
+  await until(() => manager.get("run-user-fault", owner).state === "cancelled", 15_000);
+  const record = manager.get("run-user-fault", owner);
+  assert.equal(record.research?.stopCause, "user");
+  assert.equal(record.research?.stop, "consumed");
+  assert.equal(record.research?.outcome, "stopped");
+});
+
+// ---------------------------------------------------------------------------
+// The schedule starts at the spawn instant
+// ---------------------------------------------------------------------------
+
+test("waiting for the environment lease does not consume the run budget", async (context) => {
+  const { close, dataDir, workspace } = await scratch(context, "lease-wait");
+  const { store } = await environmentFixture(context, dataDir);
+  await store.initialize();
+  await store.setupManagedEnvironments();
+  const task = await store.createTask("lease", "python");
+  await store.withRuntime(task.id, async (runtime) => {
+    await copyFile("/usr/bin/python3", runtime.interpreterPath);
+    await chmod(runtime.interpreterPath, 0o755);
+  });
+  // The queue/lease wait is deliberately longer than the whole run budget; it
+  // happens strictly before the spawn the schedule is counted from.
+  const delayed: Pick<EnvironmentStore, "withRuntime"> = {
+    withRuntime: async <T>(environmentId: string, operation: (runtime: EnvironmentRuntime) => Promise<T>): Promise<T> => {
+      await delay(600);
+      return await store.withRuntime(environmentId, operation);
+    },
+  };
+  const short: ResearchTimeSchedule = {
+    drainGraceMs: 0, reportBudgetMs: 100, researchBudgetMs: 400, stopGraceMs: 300, verificationWindowMs: 400,
+  };
+  const manager = new ExecutionManager(dataDir, undefined, {
+    research: createResearchRunExecutor(bareWiring(dataDir, { behaviour: "complete", honourStop: true },
+      { environmentStore: delayed })),
+  });
+  close(async () => { await manager.close(); });
+  manager.submitResearch(researchRequest("run-lease", workspace, { environmentId: task.id, schedule: short }));
+  await until(() => !["running", "queued"].includes(manager.get("run-lease", owner).state), 20_000);
+  const record = manager.get("run-lease", owner);
+  assert.equal(record.state, "completed");
+  assert.equal(record.research?.process, "spawned-then-terminated");
+  assert.equal(record.research?.outcome, "completed");
+  assert.equal(record.research?.report, "ready");
+  assert.equal(record.research?.forceReclaimRequested, false);
+  assert.equal(record.research?.deadlineViolated, false, "a pre-spawn lease wait is outside the schedule");
+});
+
+test("a pre-spawn preparation delay does not shorten the run budget", async (context) => {
+  const { close, dataDir, workspace } = await scratch(context, "prep-wait");
+  // The wrapper sleeps only on its first invocation, which is the capability
+  // probe during sandbox preparation — strictly before any process is spawned.
+  const wrapper = resolve(dataDir, "slow-bwrap");
+  await writeFile(wrapper, `#!/bin/sh
+if mkdir "${dataDir}/prepared" 2>/dev/null; then
+  sleep 0.6
+fi
+exec bwrap "$@"
+`);
+  await chmod(wrapper, 0o755);
+  const short: ResearchTimeSchedule = {
+    drainGraceMs: 0, reportBudgetMs: 100, researchBudgetMs: 400, stopGraceMs: 300, verificationWindowMs: 400,
+  };
+  const manager = new ExecutionManager(dataDir, undefined, {
+    research: createResearchRunExecutor(wiring(dataDir, { behaviour: "complete", honourStop: true },
+      { config: { ...executorConfig(dataDir), bwrapPath: wrapper } })),
+  });
+  close(async () => { await manager.close(); });
+  const startedAt = Date.now();
+  manager.submitResearch(researchRequest("run-prep", workspace, { schedule: short }));
+  await until(() => !["running", "queued"].includes(manager.get("run-prep", owner).state), 20_000);
+  const record = manager.get("run-prep", owner);
+  assert.ok(await pathExists(resolve(dataDir, "prepared")), "the wrapper's slow path really ran");
+  assert.equal(record.state, "completed");
+  assert.equal(record.research?.process, "spawned-then-terminated");
+  assert.equal(record.research?.report, "ready");
+  assert.equal(record.research?.deadlineViolated, false,
+    "preparation happens before the spawn instant the schedule is counted from");
+  assert.ok(Date.now() - startedAt > 600, "the delayed preparation was not skipped");
+});
+
+test("a force reclaim proven inside the deadline is not a deadline violation", async (context) => {
+  const { close, dataDir, workspace } = await scratch(context, "force-on-time");
+  const short: ResearchTimeSchedule = {
+    drainGraceMs: 0, reportBudgetMs: 500, researchBudgetMs: 500, stopGraceMs: 300, verificationWindowMs: 1_000,
+  };
+  const manager = new ExecutionManager(dataDir, undefined, { research: createResearchRunExecutor(wiring(dataDir, {
+    behaviour: "hang", honourStop: false, lifetimeSeconds: 60,
+  })) });
+  close(async () => { await manager.close(); });
+  const startedAt = Date.now();
+  manager.submitResearch(researchRequest("run-force", workspace, { schedule: short }));
+  await until(() => manager.get("run-force", owner).state !== "running"
+    && manager.get("run-force", owner).state !== "queued", 20_000);
+  const record = manager.get("run-force", owner);
+  assert.equal(record.research?.forceReclaimRequested, true, "the namespace was reclaimed uninvited");
+  assert.equal(record.research?.deadlineViolated, false, "termination was proven before the hard deadline");
+  assert.equal(record.research?.process, "spawned-then-terminated");
+  assert.equal(record.boundary?.terminationConfirmed, true);
+  assert.equal(record.research?.outcome, "unknown");
+  // The reclaim is bounded by the schedule, not by the case's own patience.
+  assert.ok(Date.now() - startedAt < 10_000);
+});
+
+test("a proof that only lands after the hard deadline is recorded as a violation", async (context) => {
+  const { close, dataDir, workspace } = await scratch(context, "late-proof");
+  // The stop grace is longer than the whole schedule, so the budget stop cannot
+  // pre-empt the reclaim; only the force-kill instant does, and it sits one
+  // millisecond before the hard deadline. The workload ignores the stop and the
+  // namespace is still populated, so the reclaim itself, not an idle run, is
+  // what lands after the deadline. Evidence strength: this is the real kernel
+  // path with a real boundary; the outcome is decided by the measured proof
+  // instant, and the on-time case is covered by the previous test.
+  const short: ResearchTimeSchedule = {
+    drainGraceMs: 0, reportBudgetMs: 300, researchBudgetMs: 300, stopGraceMs: 5_000, verificationWindowMs: 1,
+  };
+  const manager = new ExecutionManager(dataDir, undefined, { research: createResearchRunExecutor(wiring(dataDir, {
+    behaviour: "hang", honourStop: false, lifetimeSeconds: 60,
+  })) });
+  close(async () => { await manager.close(); });
+  const startedAt = Date.now();
+  manager.submitResearch(researchRequest("run-late", workspace, { schedule: short }));
+  await until(() => !["running", "queued"].includes(manager.get("run-late", owner).state), 20_000);
+  const record = manager.get("run-late", owner);
+  assert.equal(record.research?.forceReclaimRequested, true, "the reclaim was requested, not an idle exit");
   assert.equal(record.research?.deadlineViolated, true);
-  assert.equal(record.boundary?.terminationConfirmed, true, "the reclaim still emptied the namespace");
+  // The kernel did prove the namespace empty — after the hard deadline. The
+  // proof instant, not the outcome of the proof, is what marks the violation.
+  assert.equal(record.research?.process, "spawned-then-terminated");
+  assert.equal(record.state, "unknown");
+  assert.equal(record.version, undefined, "a late proof never publishes");
   assert.equal(record.finishedAt, undefined);
-  assert.ok(elapsed < 15_000, `the run did not outlive its budget (${elapsed}ms)`);
+  assert.ok(Date.now() - startedAt >= 600, "the proof really happened at or after the force-kill instant");
 });
 
 // ---------------------------------------------------------------------------
@@ -830,7 +1449,7 @@ test("a rebuilt manager neither replays nor publishes an unknown research record
   const options: ExecutionManagerOptions = {
     research: syntheticExecutor(calls, async (request) => {
       if (request.executionId === "run-unknown") return status({ outcome: "unknown", phase: "research", process: "unverified" });
-      return status({ outcome: "completed", phase: "finished", process: "spawned-then-terminated" });
+      return status({ outcome: "completed", phase: "finished", process: "spawned-then-terminated", report: "ready" });
     }),
   };
   const first = new ExecutionManager(dataDir, undefined, options);
@@ -924,12 +1543,86 @@ test("an environment writer waits for the run's reader and proceeds after a norm
   const install = store.install(task.id, ["added=1"]);
   let settled = false;
   void install.finally(() => { settled = true; });
-  await new Promise((done) => setTimeout(done, 100));
+  await delay(100);
   assert.equal(settled, false, "no mutation may run while the run reads the prefix");
   finish.resolve();
   await reading;
   const revision = await install;
   assert.ok(revision.packages.length >= 0);
+});
+
+test("a managed environment without an environment binding is refused before launch", async (context) => {
+  const { dataDir, workspace } = await scratch(context, "env-required");
+  const { store } = await environmentFixture(context, dataDir);
+  await store.initialize();
+  await store.setupManagedEnvironments();
+  const task = await store.createTask("required", "python");
+  // A production wiring has no fixture runtime: omitting the environment is
+  // refused instead of falling back to the host interpreter, and a revision
+  // without an environment has nothing to compare against.
+  const executor = createResearchRunExecutor(bareWiring(dataDir, { behaviour: "complete", honourStop: true }));
+  for (const overrides of [
+    {},
+    { expectedEnvironmentRevisionId: task.currentRevisionId },
+  ]) {
+    const outcome = await executor.run(researchRequest("run-required", workspace, overrides),
+      { signal: new AbortController().signal });
+    assert.equal(outcome.research.refusal, "RESEARCH_ENVIRONMENT_REQUIRED", JSON.stringify(overrides));
+    assert.equal(outcome.research.process, "not_started");
+    assert.equal(outcome.result.exitCode, 1);
+  }
+  // An environment id with no store cannot be leased either.
+  const noStore = await createResearchRunExecutor(bareWiring(dataDir, { behaviour: "complete", honourStop: true }))
+    .run(researchRequest("run-no-store", workspace, { environmentId: task.id }),
+      { signal: new AbortController().signal });
+  assert.equal(noStore.research.refusal, "RESEARCH_ENVIRONMENT_UNAVAILABLE");
+  assert.equal(noStore.research.process, "not_started");
+});
+
+test("a revision that does not match the leased environment is refused, never re-pointed", async (context) => {
+  const { dataDir, workspace } = await scratch(context, "env-revision");
+  const { store } = await environmentFixture(context, dataDir);
+  await store.initialize();
+  await store.setupManagedEnvironments();
+  const task = await store.createTask("revision", "python");
+  const executor = createResearchRunExecutor(bareWiring(dataDir, { behaviour: "complete", honourStop: true },
+    { environmentStore: store }));
+  const outcome = await executor.run(researchRequest("run-revision", workspace, {
+    environmentId: task.id, expectedEnvironmentRevisionId: "revision-that-is-not-current",
+  }), { signal: new AbortController().signal });
+  assert.equal(outcome.research.refusal, "RESEARCH_ENVIRONMENT_REVISION_MISMATCH");
+  assert.equal(outcome.research.process, "not_started");
+});
+
+test("a real managed environment is leased through the executor and recorded on the result", async (context) => {
+  const { close, dataDir, workspace } = await scratch(context, "env-real");
+  const { store } = await environmentFixture(context, dataDir);
+  await store.initialize();
+  await store.setupManagedEnvironments();
+  const task = await store.createTask("real", "python");
+  // A real interpreter staged in the fixture prefix: the run must reach it
+  // through the environment lease, not through a fixture or the host default.
+  await store.withRuntime(task.id, async (runtime) => {
+    await copyFile("/usr/bin/python3", runtime.interpreterPath);
+    await chmod(runtime.interpreterPath, 0o755);
+  });
+  // Production-shaped wiring: no fixture runtime at all.
+  const manager = new ExecutionManager(dataDir, undefined, {
+    research: createResearchRunExecutor(bareWiring(dataDir, { behaviour: "complete", honourStop: true },
+      { environmentStore: store })),
+  });
+  close(async () => { await manager.close(); });
+  manager.submitResearch(researchRequest("run-env", workspace, {
+    environmentId: task.id, expectedEnvironmentRevisionId: task.currentRevisionId,
+  }));
+  await until(() => ["completed", "failed", "unknown"].includes(manager.get("run-env", owner).state), 20_000);
+  const record = manager.get("run-env", owner);
+  assert.equal(record.state, "completed");
+  assert.equal(record.research?.outcome, "completed");
+  assert.equal(record.research?.report, "ready");
+  assert.equal(record.result?.environmentRevisionId, task.currentRevisionId,
+    "the leased revision is the one the result names");
+  assert.ok(record.version);
 });
 
 test("an environment change is refused while an unknown research run still owns it", async (context) => {

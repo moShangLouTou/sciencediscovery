@@ -44,7 +44,7 @@
  * workload's self-reports; nothing is published and no fence is released until
  * the full PID namespace is proven empty by the ledger's own boundary check.
  */
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { constants as FS } from "node:fs";
 import { mkdir, open, rename, unlink, type FileHandle } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -56,6 +56,7 @@ import {
   type ResearchPhase,
   type ResearchProcessEvidence,
   type ResearchRefusalCode,
+  type ResearchReportOutcome,
   type ResearchRunRequest,
   type ResearchRunStatus,
   type ResearchStopState,
@@ -70,6 +71,7 @@ import {
   terminateExecutionBoundary,
   type ExecutionBoundaryHandle,
   type ExecutionLifecycle,
+  type ExecutionObservation,
 } from "./execution-boundary.js";
 import {
   environmentPrefixBindArguments,
@@ -100,6 +102,12 @@ const STOP_PENDING_FILE = "stop.pending";
 const STATE_DIRECTORY = "runner-research";
 /** Observation cadence; the deadline checks run on the same turn. */
 const POLL_MS = 25;
+/**
+ * Bound on the spawn handshake before the monotonic schedule exists. It is not
+ * part of the run budget; it only prevents a spawn that never returns (a hung
+ * sandbox preparation) from parking the operation forever.
+ */
+const SPAWN_HANDSHAKE_BOUND_MS = 10_000;
 /** Upper bound for any single schedule field. */
 const MAX_SCHEDULE_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -115,6 +123,11 @@ const REFUSAL_MESSAGES: Readonly<Record<ResearchRefusalCode, string>> = {
   RESEARCH_RECORD_OVERSIZE: "The research workload record exceeds its fixed size bound",
   RESEARCH_RECORD_MALFORMED: "The research workload record is not valid fixed-vocabulary JSON",
   RESEARCH_RECORD_VERSION_UNKNOWN: "The research workload record names an unknown protocol version",
+  RESEARCH_RECORD_IDENTITY_MISMATCH: "The research workload record names another execution, attempt or stop",
+  RESEARCH_RECORD_TRANSITION_INVALID: "The research workload record made an illegal phase or terminal transition",
+  RESEARCH_STOP_NOT_DURABLE: "The research stop intent could not be persisted, so no stop was requested",
+  RESEARCH_ENVIRONMENT_REQUIRED: "A research run requires an explicit managed environment binding",
+  RESEARCH_STATE_SAVE_FAILED: "A research lifecycle fact could not be persisted to the execution ledger",
   RESEARCH_ENVIRONMENT_UNAVAILABLE: "The managed environment for this research run could not be leased",
   RESEARCH_ENVIRONMENT_REVISION_MISMATCH: "The managed environment is no longer at the revision the caller expected",
   RESEARCH_SANDBOX_UNSUPPORTED: "The research workload requires the bubblewrap sandbox",
@@ -279,19 +292,25 @@ export const RESEARCH_SYSTEM_ENVIRONMENT_REVISION_ID = SYSTEM_SHELL_ENVIRONMENT_
 
 /** What the Runner reads back from the workload's own record. */
 export interface ResearchWorkloadRecord {
+  readonly execution: string;
   readonly phase: ResearchPhase;
   readonly outcome: ResearchOutcome | null;
+  readonly report: ResearchReportOutcome;
   readonly stopId: string | null;
 }
 
 /**
- * Parse the workload's record against a fixed whitelist.
+ * Parse the workload's record against a fixed whitelist and bind it to this
+ * execution.
  *
  * Every branch that does not match is a named refusal. A bad field is never
  * dropped to make the rest readable: a record that cannot be understood is not
- * evidence about the run.
+ * evidence about the run. Each record names the execution it belongs to, so a
+ * record left by another attempt can never be read as this run's result, and
+ * the research and report facts are stated separately instead of being folded
+ * into one outcome.
  */
-export function parseResearchWorkloadRecord(text: string): ResearchWorkloadRecord {
+export function parseResearchWorkloadRecord(text: string, executionId: string): ResearchWorkloadRecord {
   let value: unknown;
   try {
     value = JSON.parse(text);
@@ -299,7 +318,7 @@ export function parseResearchWorkloadRecord(text: string): ResearchWorkloadRecor
     throw new ResearchRunError("RESEARCH_RECORD_MALFORMED");
   }
   if (!isRecord(value)) throw new ResearchRunError("RESEARCH_RECORD_MALFORMED");
-  const allowed = ["outcome", "phase", "stopId", "version"];
+  const allowed = ["execution", "outcome", "phase", "report", "stopId", "version"];
   if (Object.keys(value).some((key) => !allowed.includes(key))) {
     throw new ResearchRunError("RESEARCH_RECORD_MALFORMED");
   }
@@ -307,23 +326,168 @@ export function parseResearchWorkloadRecord(text: string): ResearchWorkloadRecor
   if (value.version !== RESEARCH_CONTROL_PROTOCOL_VERSION) {
     throw new ResearchRunError("RESEARCH_RECORD_VERSION_UNKNOWN");
   }
+  if (typeof value.execution !== "string") throw new ResearchRunError("RESEARCH_RECORD_MALFORMED");
+  if (value.execution !== executionId) throw new ResearchRunError("RESEARCH_RECORD_IDENTITY_MISMATCH");
   const phase = value.phase;
   if (phase !== "research" && phase !== "reporting" && phase !== "finished") {
     throw new ResearchRunError("RESEARCH_RECORD_MALFORMED");
   }
   const outcome = value.outcome;
-  if (phase === "finished") {
-    if (outcome !== "not-started" && outcome !== "completed" && outcome !== "stopped" && outcome !== "failed") {
+  const report = value.report;
+  const terminal = (entry: unknown): entry is ResearchOutcome =>
+    entry === "not-started" || entry === "completed" || entry === "stopped" || entry === "failed";
+  if (phase === "research") {
+    // Research is in progress: neither fact is known yet.
+    if (outcome !== undefined || report !== undefined) throw new ResearchRunError("RESEARCH_RECORD_MALFORMED");
+  } else if (phase === "reporting") {
+    // Entering reporting states what the research phase did; it is never
+    // inferred from the phase alone.
+    if (!terminal(outcome) || outcome === "not-started") throw new ResearchRunError("RESEARCH_RECORD_MALFORMED");
+    if (report !== undefined && report !== "generating") throw new ResearchRunError("RESEARCH_RECORD_MALFORMED");
+  } else {
+    if (!terminal(outcome)) throw new ResearchRunError("RESEARCH_RECORD_MALFORMED");
+    // A finished record states the report fact too. A run that stopped before
+    // any reporting says `none`; every other terminal outcome says how the
+    // report ended, so a completed research phase is never read as a successful
+    // run without a ready report.
+    if (outcome === "not-started") {
+      if (report !== undefined && report !== "none") throw new ResearchRunError("RESEARCH_RECORD_MALFORMED");
+    } else if (report !== "ready" && report !== "incomplete" && report !== "failed") {
       throw new ResearchRunError("RESEARCH_RECORD_MALFORMED");
     }
-  } else if (outcome !== undefined) {
-    throw new ResearchRunError("RESEARCH_RECORD_MALFORMED");
   }
   const stopId = value.stopId;
   if (stopId !== undefined && (typeof stopId !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(stopId))) {
     throw new ResearchRunError("RESEARCH_RECORD_MALFORMED");
   }
-  return { outcome: phase === "finished" ? outcome as ResearchOutcome : null, phase, stopId: stopId ?? null };
+  return {
+    execution: executionId,
+    outcome: phase === "research" ? null : outcome as ResearchOutcome,
+    phase,
+    report: phase === "research" ? "none"
+      : phase === "reporting" ? (report ?? "generating") as ResearchReportOutcome
+        : (report ?? "none") as ResearchReportOutcome,
+    stopId: stopId ?? null,
+  };
+}
+
+/**
+ * Parse the workload's acknowledgement that it consumed a stop.
+ *
+ * The marker is deliberately smaller than a status record: it names the
+ * protocol version and the stop only. Anything else at that name is not an
+ * acknowledgement and is ignored by the caller.
+ */
+export function parseStopMarker(text: string): string {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw new ResearchRunError("RESEARCH_RECORD_MALFORMED");
+  }
+  if (!isRecord(value)) throw new ResearchRunError("RESEARCH_RECORD_MALFORMED");
+  if (Object.keys(value).some((key) => key !== "stopId" && key !== "version")) {
+    throw new ResearchRunError("RESEARCH_RECORD_MALFORMED");
+  }
+  if (value.version !== RESEARCH_CONTROL_PROTOCOL_VERSION) {
+    throw new ResearchRunError("RESEARCH_RECORD_VERSION_UNKNOWN");
+  }
+  const stopId = value.stopId;
+  if (typeof stopId !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(stopId)) {
+    throw new ResearchRunError("RESEARCH_RECORD_MALFORMED");
+  }
+  return stopId;
+}
+
+/** The business facts one run has established so far. */
+export interface ResearchRecordFacts {
+  readonly phase: ResearchPhase;
+  /** Terminal-by-definition for the fold; `unknown` until a record states one. */
+  readonly outcome: ResearchOutcome;
+  readonly report: ResearchReportOutcome;
+  readonly stopId: string | null;
+}
+
+export type ResearchRecordUpdate =
+  | { readonly status: "applied"; readonly facts: ResearchRecordFacts }
+  | { readonly status: "refused"; readonly code: ResearchRefusalCode };
+
+const PHASE_RANK = { finished: 2, reporting: 1, research: 0 } as const satisfies Record<ResearchPhase, number>;
+
+/**
+ * Fold one record into the run's business facts.
+ *
+ * Identity is checked first: a record naming a stop this run did not persist is
+ * another attempt's record, not evidence. The phase only moves forward, a
+ * terminal record is final (terminal → non-terminal and terminal → a different
+ * terminal are both refused), and a stop outcome requires the stop this run
+ * actually persisted. Anything else is a named refusal, never a silent repair.
+ */
+export function nextResearchRecordState(
+  current: ResearchRecordFacts | null,
+  record: ResearchWorkloadRecord,
+  context: { readonly stopId: string | null; readonly stopRequested: boolean },
+): ResearchRecordUpdate {
+  if (record.stopId !== null && record.stopId !== context.stopId) {
+    return { status: "refused", code: "RESEARCH_RECORD_IDENTITY_MISMATCH" };
+  }
+  if ((record.outcome === "stopped" || record.outcome === "not-started") && !context.stopRequested) {
+    // Nothing asked this run to stop, so a record that claims it was stopped is
+    // not a stop: it is a claim without an intent behind it.
+    return { status: "refused", code: "RESEARCH_RECORD_IDENTITY_MISMATCH" };
+  }
+  if (current === null) {
+    return {
+      status: "applied",
+      facts: {
+        outcome: record.outcome ?? "unknown",
+        phase: record.phase,
+        report: record.report,
+        stopId: record.stopId,
+      },
+    };
+  }
+  if (PHASE_RANK[record.phase] < PHASE_RANK[current.phase]) {
+    return { status: "refused", code: "RESEARCH_RECORD_TRANSITION_INVALID" };
+  }
+  if (current.phase === "finished") {
+    // The operation re-reads the file after the join; the same terminal record
+    // is not a second transition, but a different one would rewrite history.
+    const same = record.phase === "finished" && record.outcome === current.outcome
+      && record.report === current.report;
+    return same ? { status: "applied", facts: current }
+      : { status: "refused", code: "RESEARCH_RECORD_TRANSITION_INVALID" };
+  }
+  if (record.phase === "reporting" && current.phase === "reporting"
+    && current.outcome !== "unknown" && record.outcome !== current.outcome) {
+    return { status: "refused", code: "RESEARCH_RECORD_TRANSITION_INVALID" };
+  }
+  // A stated report only moves forward: `generating` may become a terminal
+  // report, never the reverse, and two different terminal reports conflict.
+  if (record.report !== "none" && current.report !== "none" && record.report !== current.report
+    && current.report !== "generating") {
+    return { status: "refused", code: "RESEARCH_RECORD_TRANSITION_INVALID" };
+  }
+  return {
+    status: "applied",
+    facts: {
+      outcome: record.outcome ?? current.outcome,
+      phase: record.phase,
+      report: record.report === "none" ? current.report : record.report,
+      stopId: record.stopId ?? current.stopId,
+    },
+  };
+}
+
+/**
+ * Stable stop identity for one durable intent. It is derived from the execution
+ * and the instant the intent was persisted, so the manager can recompute the
+ * same id from the durable row and nothing depends on an in-memory UUID. The
+ * alphabet is the record's stop-id alphabet.
+ */
+export function researchStopId(executionId: string, stopRequestedAt: string): string {
+  return createHash("sha256").update(`research-stop\n${executionId}\n${stopRequestedAt}`, "utf8")
+    .digest("hex").slice(0, 32);
 }
 
 /** One read from the control channel, already classified. */
@@ -380,10 +544,23 @@ export class ResearchControlChannel {
     return `/proc/self/fd/${this.directory.fd}/${name}`;
   }
 
+  /**
+   * Read one control entry without ever blocking the supervision turn.
+   *
+   * `O_NONBLOCK` matters as much as `O_NOFOLLOW` here: a FIFO at a fixed name
+   * would otherwise park the open until a writer appeared, which stops the
+   * deadline checks and wedges the manager queue. The open is therefore
+   * non-blocking and the *descriptor* decides the type (`fstat`); a FIFO,
+   * device or directory is refused immediately instead of being read.
+   *
+   * A regular file is read through a limit+1 buffer and must reach EOF: the
+   * buffer is never sized from an earlier `stat` and a record that grew past
+   * the bound is refused rather than published truncated.
+   */
   async read(name: string): Promise<ControlRead> {
     let handle: FileHandle;
     try {
-      handle = await open(this.entry(name), FS.O_RDONLY | FS.O_NOFOLLOW);
+      handle = await open(this.entry(name), FS.O_RDONLY | FS.O_NOFOLLOW | FS.O_NONBLOCK);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return { status: "missing" };
       return { status: "refused", code: "RESEARCH_CONTROL_REPLACED" };
@@ -392,9 +569,10 @@ export class ResearchControlChannel {
       const info = await handle.stat();
       if (!info.isFile()) return { status: "refused", code: "RESEARCH_CONTROL_REPLACED" };
       if (info.size > RESEARCH_RECORD_MAX_BYTES) return { status: "refused", code: "RESEARCH_RECORD_OVERSIZE" };
-      const buffer = Buffer.alloc(info.size);
+      const buffer = Buffer.alloc(RESEARCH_RECORD_MAX_BYTES + 1);
       let offset = 0;
-      while (offset < buffer.length) {
+      for (;;) {
+        if (offset >= buffer.length) return { status: "refused", code: "RESEARCH_RECORD_OVERSIZE" };
         const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
         if (bytesRead === 0) break;
         offset += bytesRead;
@@ -467,9 +645,17 @@ export interface ResearchRunWiring {
   readonly config: ExecutorConfig;
   /**
    * The real store leases the environment and keeps its mutation gate for the
-   * whole workload. Absent means only the fixed base sandbox can be used.
+   * whole workload. A production wiring always sets it; a request without an
+   * environment is refused rather than falling back to the host interpreter.
    */
   readonly environmentStore?: Pick<EnvironmentStore, "withRuntime">;
+  /**
+   * Test-only host runtime for fixtures that do not lease a managed
+   * environment. Production never sets it: the run then records this fixture
+   * identity in its result instead of pretending a managed revision was leased,
+   * and the choice is made by Runner construction, never by a request field.
+   */
+  readonly fixtureRuntime?: { readonly identity: string; readonly interpreterPath: string };
   /** Test seam: a synthetic `/proc` root for boundary observation. */
   readonly procRoot?: string;
   readonly onDiagnostic?: (event: string, detail?: Record<string, unknown>) => void;
@@ -508,28 +694,61 @@ export function createResearchRunExecutor(wiring: ResearchRunWiring): ResearchRu
   };
 }
 
+/** Refusals that mean the business evidence itself is unusable. */
+const RECORD_INTEGRITY_REFUSALS: ReadonlySet<ResearchRefusalCode> = new Set([
+  "RESEARCH_CONTROL_REPLACED",
+  "RESEARCH_RECORD_OVERSIZE",
+  "RESEARCH_RECORD_MALFORMED",
+  "RESEARCH_RECORD_VERSION_UNKNOWN",
+  "RESEARCH_RECORD_IDENTITY_MISMATCH",
+  "RESEARCH_RECORD_TRANSITION_INVALID",
+  "RESEARCH_STATE_SAVE_FAILED",
+]);
+
+/**
+ * A record this Runner could not read or could not trust is not evidence, even
+ * when an earlier read looked like a completion. This is the policy gate the
+ * ledger applies; the operation already replaces such facts with `unknown`.
+ */
+export function researchRecordUnusable(status: ResearchRunStatus): boolean {
+  return status.refusal !== undefined && RECORD_INTEGRITY_REFUSALS.has(status.refusal);
+}
+
 /**
  * What the ledger state may become after a research operation returned.
  *
  * An unproven process or an unknown research outcome is `unknown`: it is
- * terminal for the control plane and keeps every fence. A completion comes
- * only from the workload's own terminal record, never from an exit code.
+ * terminal for the control plane and keeps every fence. A completion comes only
+ * from the workload's own terminal record, never from an exit code, and it
+ * needs a ready report: research completed while reporting was stopped is a
+ * cancelled run that keeps both facts.
  */
 export function researchExecutionState(
   status: ResearchRunStatus,
   aborted: boolean,
 ): "queued" | "running" | "completed" | "failed" | "cancelled" | "unknown" {
-  if (status.process === "unverified") return "unknown";
-  if (status.outcome === "completed") return "completed";
+  if (status.process === "not_started") return status.refusal !== undefined ? "failed" : "unknown";
+  if (status.process !== "spawned-then-terminated") return "unknown";
+  // §5.6: proof that does not complete inside the hard deadline is `unknown`,
+  // whatever the business record says. The fact of a late proof is never
+  // rewritten as an on-time completion.
+  if (status.deadlineViolated) return "unknown";
+  if (researchRecordUnusable(status)) return "unknown";
+  if (status.outcome === null || status.outcome === "unknown") return "unknown";
   if (status.outcome === "stopped" || status.outcome === "not-started") return "cancelled";
-  if (status.outcome === "unknown") return "unknown";
-  if (status.outcome === "failed" || status.refusal !== undefined) return "failed";
+  if (status.outcome === "failed") return "failed";
+  // Research completed. The report is a separate fact: only a ready report is a
+  // completed execution. A report stopped by a durable stop is cancelled; a
+  // report that failed or never finished on its own is a failed run.
+  if (status.report === "ready") return "completed";
+  if (status.stop !== "none") return "cancelled";
   return aborted ? "cancelled" : "failed";
 }
 
 /**
- * Publication needs both a proven process boundary and a terminal research
- * fact. A missing record is `unknown`, so nothing is published from it.
+ * Publication needs a proven process boundary and business evidence that is
+ * valid, complete and correlated. A missing, unreadable or foreign record is
+ * `unknown`, so nothing is published from it.
  */
 export function researchPublishable(status: ResearchRunStatus | undefined): boolean {
   if (!status) return false;
@@ -540,18 +759,32 @@ export function researchPublishable(status: ResearchRunStatus | undefined): bool
     return status.refusal !== undefined;
   }
   if (status.process !== "spawned-then-terminated") return false;
-  return status.outcome !== null && status.outcome !== "unknown";
+  if (status.deadlineViolated) return false;
+  if (researchRecordUnusable(status)) return false;
+  if (status.outcome === null || status.outcome === "unknown") return false;
+  // A stop outcome without the durable intent behind it is a claim, not a fact.
+  if ((status.outcome === "stopped" || status.outcome === "not-started") && status.stop === "none") return false;
+  return true;
 }
 
 /** Mutable observation state for one run, so failures keep their owner. */
-interface RunState {  stopState: ResearchStopState;
+interface RunState {
+  stopState: ResearchStopState;
   stopId: string | null;
+  stopCause: "user" | "budget" | null;
   stopRequestedAtMs: number | null;
   phase: ResearchPhase | "unknown";
   outcome: ResearchOutcome | null;
+  report: ResearchReportOutcome;
+  /** The folded business facts; `null` until a valid record exists. */
+  facts: ResearchRecordFacts | null;
   refusal: ResearchRefusalCode | undefined;
+  /** A record was unusable, so no earlier business value may be published. */
+  invalid: boolean;
   consumed: boolean;
+  forceReclaimRequested: boolean;
   deadlineViolated: boolean;
+  spawnedAt: string | undefined;
 }
 
 function runResearchWorkload(
@@ -560,16 +793,31 @@ function runResearchWorkload(
   launch: ResearchRunLaunch,
 ): Promise<ResearchRunOutcome> {
   const startedAt = new Date().toISOString();
-  const t0 = process.hrtime.bigint();
-  const elapsedMs = (): number => Number((process.hrtime.bigint() - t0) / 1_000_000n);
   const schedule = request.schedule;
   const deadlines = researchRunDeadlines(schedule);
+  // The time base is the spawn instant (§5.6), so it stays unset until the
+  // sandbox really exists: environment lease and sandbox preparation never
+  // consume the schedule, and no stop/kill can fire before the spawn turn.
+  let spawnedAtNs: bigint | null = null;
+  const elapsedMs = (): number =>
+    spawnedAtNs === null ? 0 : Number((process.hrtime.bigint() - spawnedAtNs) / 1_000_000n);
+  const startClock = (): string => {
+    spawnedAtNs = process.hrtime.bigint();
+    state.spawnedAt = new Date().toISOString();
+    return state.spawnedAt;
+  };
   const state: RunState = {
     consumed: false,
     deadlineViolated: false,
+    facts: null,
+    forceReclaimRequested: false,
+    invalid: false,
     outcome: null,
     phase: "unknown",
     refusal: undefined,
+    report: "none",
+    spawnedAt: undefined,
+    stopCause: null,
     stopId: null,
     stopRequestedAtMs: null,
     stopState: "none",
@@ -577,11 +825,28 @@ function runResearchWorkload(
   const diagnose = (event: string, detail?: Record<string, unknown>) => {
     wiring.onDiagnostic?.(event, detail);
   };
+  /**
+   * Persist a whitelisted fact in the ledger. In the spawn turn a failure must
+   * reach the launcher (it still owns the child); later in the run it turns the
+   * record into `unknown` and the namespace is reclaimed instead of leaving the
+   * operation and the ledger describing different things.
+   */
+  const observe = (facts: ExecutionObservation, required: boolean): void => {
+    try {
+      launch.lifecycle?.observed?.(facts);
+    } catch (error) {
+      state.refusal ??= "RESEARCH_STATE_SAVE_FAILED";
+      diagnose("research_state_save_failed");
+      if (required) throw error;
+    }
+  };
 
   const emptyResult = (exitCode: number, environment?: EnvironmentRuntime): ShellExecutionResult => ({
     cgroupMode: "none",
     createdFiles: [],
-    environmentRevisionId: environment?.revision.id ?? RESEARCH_SYSTEM_ENVIRONMENT_REVISION_ID,
+    environmentRevisionId: environment?.revision.id
+      ?? wiring.fixtureRuntime?.identity
+      ?? RESEARCH_SYSTEM_ENVIRONMENT_REVISION_ID,
     environmentVariables: {},
     executionId: request.executionId,
     exitCode,
@@ -601,16 +866,21 @@ function runResearchWorkload(
 
   const statusOf = (
     process: ResearchProcessEvidence,
-    overrides: Partial<Pick<ResearchRunStatus, "phase" | "outcome" | "refusal">> = {},
+    overrides: Partial<Pick<ResearchRunStatus, "phase" | "outcome" | "report" | "refusal">> = {},
   ): ResearchRunStatus => ({
     deadlineViolated: state.deadlineViolated,
+    forceReclaimRequested: state.forceReclaimRequested,
     observedAt: new Date().toISOString(),
     outcome: overrides.outcome !== undefined ? overrides.outcome : state.outcome,
     phase: overrides.phase ?? state.phase,
     process,
     refusal: overrides.refusal ?? state.refusal,
+    report: overrides.report ?? state.report,
+    schedule,
     schemaVersion: RESEARCH_RUN_SCHEMA_VERSION,
+    ...(state.spawnedAt !== undefined ? { spawnedAt: state.spawnedAt } : {}),
     stop: state.stopState,
+    ...(state.stopCause !== null ? { stopCause: state.stopCause } : {}),
     verificationWindowMs: schedule.verificationWindowMs,
     workload: request.workload,
   });
@@ -622,6 +892,21 @@ function runResearchWorkload(
       result: emptyResult(1),
     };
   };
+
+  // A research run must be bound to an explicit environment. Production never
+  // falls back to the host interpreter; a test wiring may name a fixture
+  // runtime, and that identity is what the result records. This is a typed
+  // pre-spawn refusal: no channel is opened and no process exists.
+  const fixture = wiring.fixtureRuntime;
+  if (request.environmentId === undefined
+    && (request.expectedEnvironmentRevisionId !== undefined || fixture === undefined
+      || fixture.identity.length === 0 || !fixture.interpreterPath.startsWith("/"))) {
+    return Promise.resolve(refused("RESEARCH_ENVIRONMENT_REQUIRED"));
+  }
+  if (request.environmentId !== undefined && wiring.environmentStore === undefined) {
+    return Promise.resolve(refused("RESEARCH_ENVIRONMENT_UNAVAILABLE"));
+  }
+  const environmentStore = wiring.environmentStore;
 
   // The state root is derived here, never supplied: no caller names this path.
   const channelPromise = (async (): Promise<ResearchControlChannel> => {
@@ -637,35 +922,73 @@ function runResearchWorkload(
   // Register the graceful stop before any await: a cancellation that arrives
   // between the ledger write and the sandbox launch must still be able to ask
   // the workload to stop instead of being reduced to an immediate abort.
+  //
+  // Every stop, user or budget, first obtains a durable identity from the
+  // manager and only then writes the control file. A failed save therefore
+  // leaves no channel write, no abort and no signal behind: the intent does not
+  // exist, so nothing may act as if it did, and the hard deadline stays the
+  // only reclaim until a later tick can persist the intent.
   let stopApplied = false;
-  let stopCause: "user" | "budget" | null = null;
   let stopTask: Promise<void> = Promise.resolve();
-  const requestStop = (cause: "user" | "budget" = "user"): Promise<void> => {
-    stopCause ??= cause;
-    if (stopApplied) return stopTask;
-    stopApplied = true;
+  let lastPersistAttemptMs = Number.NEGATIVE_INFINITY;
+
+  const applyStop = async (stopId: string, cause: "user" | "budget"): Promise<void> => {
+    state.stopCause ??= cause;
+    state.stopId = stopId;
     state.stopState = "requested";
-    state.stopId = randomUUID();
     state.stopRequestedAtMs = elapsedMs();
+    observe({ research: { stop: "requested" } }, false);
+    const channel = await channelPromise.catch(() => undefined);
+    if (!channel) {
+      state.stopState = "unconfirmed";
+      return;
+    }
+    try {
+      await channel.writeStop(stopId);
+    } catch (error) {
+      // The intent is durable in the ledger; the channel is not. Nothing is
+      // trusted from it afterwards and the run is reclaimed by the deadline.
+      state.stopState = "unconfirmed";
+      state.refusal ??= error instanceof ResearchRunError ? error.code : "RESEARCH_CONTROL_WRITE_FAILED";
+      diagnose("research_stop_channel_unconfirmed");
+      observe({ research: { stop: "unconfirmed" } }, false);
+    }
+  };
+
+  const requestStop = (cause: "user" | "budget" = "user", durableId?: string): Promise<void> => {
+    if (stopApplied) return stopTask;
+    if (durableId !== undefined) {
+      // The manager already persisted this intent and handed back its identity.
+      stopApplied = true;
+      stopTask = applyStop(durableId, cause);
+      return stopTask;
+    }
+    // Retrying a failed persist is bounded but must never become an unrecorded
+    // stop: the throttle only limits SQLite attempts, not the deadline checks.
+    const now = elapsedMs();
+    if (now - lastPersistAttemptMs < 250) return stopTask;
+    lastPersistAttemptMs = now;
+    stopApplied = true;
     stopTask = (async () => {
-      const channel = await channelPromise.catch(() => undefined);
-      if (!channel) {
-        state.stopState = "unconfirmed";
+      let durableId: string;
+      try {
+        const persist = launch.lifecycle?.persistStopIntent;
+        if (!persist) throw new Error("no durable stop-intent path");
+        durableId = await persist(cause);
+      } catch {
+        // No durable intent exists, so no stop exists: nothing was written to
+        // the control channel, nothing was aborted and no signal was sent. A
+        // later tick retries under the same throttle; the hard deadline stays
+        // the only unconditional reclaim until then.
+        diagnose("research_stop_intent_unpersisted");
+        stopApplied = false;
         return;
       }
-      try {
-        await channel.writeStop(state.stopId!);
-      } catch (error) {
-        // The intent is durable in the ledger; the channel is not. Nothing is
-        // trusted from it afterwards and the run is reclaimed by the deadline.
-        state.stopState = "unconfirmed";
-        state.refusal ??= error instanceof ResearchRunError ? error.code : "RESEARCH_CONTROL_WRITE_FAILED";
-        diagnose("research_stop_channel_unconfirmed");
-      }
+      await applyStop(durableId, cause);
     })();
     return stopTask;
   };
-  launch.lifecycle?.requestStop?.(() => requestStop("user"));
+  launch.lifecycle?.requestStop?.((stopId) => requestStop("user", stopId));
   if (launch.signal.aborted) void requestStop();
   else launch.signal.addEventListener("abort", () => { void requestStop(); }, { once: true });
 
@@ -694,18 +1017,18 @@ function runResearchWorkload(
         emptyResult,
         environment,
         launch,
+        observe,
         request,
         requestStop: () => requestStop("budget"),
         schedule,
+        startClock,
         state,
         statusOf,
-        stopCause: () => stopCause,
         wiring,
       });
-      if (!request.environmentId) return await run();
-      if (!wiring.environmentStore) return refused("RESEARCH_ENVIRONMENT_UNAVAILABLE");
+      if (!request.environmentId || environmentStore === undefined) return await run();
       try {
-        return await wiring.environmentStore.withRuntime(request.environmentId, async (environment) => {
+        return await environmentStore.withRuntime(request.environmentId, async (environment) => {
           if (request.expectedEnvironmentRevisionId !== undefined
             && environment.revision.id !== request.expectedEnvironmentRevisionId) {
             return refused("RESEARCH_ENVIRONMENT_REVISION_MISMATCH");
@@ -732,17 +1055,19 @@ interface LaunchOptions {
   readonly emptyResult: (exitCode: number, environment?: EnvironmentRuntime) => ShellExecutionResult;
   readonly environment: EnvironmentRuntime | undefined;
   readonly launch: ResearchRunLaunch;
+  /** Persist one whitelisted lifecycle fact; throws when `required`. */
+  readonly observe: (facts: ExecutionObservation, required: boolean) => void;
   readonly request: ResearchRunRequest;
   /** Ask the workload to stop because its research phase budget is spent. */
   readonly requestStop: () => Promise<void>;
   readonly schedule: ResearchTimeSchedule;
+  /** Start the monotonic base inside the spawn turn; returns the wall clock. */
+  readonly startClock: () => string;
   readonly state: RunState;
   readonly statusOf: (
     process: ResearchProcessEvidence,
-    overrides?: Partial<Pick<ResearchRunStatus, "phase" | "outcome" | "refusal">>,
+    overrides?: Partial<Pick<ResearchRunStatus, "phase" | "outcome" | "report" | "refusal">>,
   ) => ResearchRunStatus;
-  /** Why a stop was requested, so a reclaim is attributed honestly. */
-  readonly stopCause: () => "user" | "budget" | null;
   readonly wiring: ResearchRunWiring;
 }
 
@@ -756,6 +1081,16 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
       result: options.emptyResult(1, environment),
     };
   }
+  const fixture = wiring.fixtureRuntime;
+  if (!environment && !fixture) {
+    // The request guard refuses this shape before the channel is opened. The
+    // engine keeps the same refusal here so no future caller can reach a host
+    // interpreter by omitting the binding: there is no fallback path at all.
+    return {
+      research: statusOf("not_started", { phase: "unknown", outcome: null, refusal: "RESEARCH_ENVIRONMENT_REQUIRED" }),
+      result: options.emptyResult(1),
+    };
+  }
   const workspaceBinds = workspaceBindArguments(request.workspaceRoot, undefined);
   let prepared: SandboxLaunch;
   try {
@@ -765,7 +1100,7 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
       environmentPaths: environment ? [environment.prefixPath] : [],
       // Mask the host interpreters only when a managed environment supplies the
       // interpreter: masking them unconditionally would bind /dev/null over the
-      // very `/usr/bin/python3` the no-environment path executes.
+      // very host interpreter a fixture runtime was explicitly wired to use.
       hostInterpreterMasks: environment ? await hostInterpreterMaskArguments() : [],
       hostRuntimeSupport: await resolveHostRuntimeSupport(config.dataDir),
       language: "python",
@@ -783,61 +1118,134 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
     };
   }
 
+  // The interpreter is the leased environment's or the explicitly wired
+  // fixture runtime's. The execution id is passed as argv, so every business
+  // record is bound to this execution by the Runner itself rather than by a
+  // value the workload could choose.
   const interpreter = environment
     ? sandboxCommandPath(prepared, "/opt/science-env/bin/python", environment.interpreterPath)
-    : sandboxCommandPath(prepared, "/usr/bin/python3", "/usr/bin/python3");
-  const commandArguments = [interpreter, "-I", "-B", "-", RESEARCH_CONTROL_MOUNT];
+    : sandboxCommandPath(prepared, fixture!.interpreterPath, fixture!.interpreterPath);
+  const commandArguments = [interpreter, "-I", "-B", "-", RESEARCH_CONTROL_MOUNT, request.executionId];
 
   let spawned = false;
   let boundary: ExecutionBoundaryHandle | "ended" | "unavailable" | undefined;
   let exitCode = 1;
   let settled = false;
   let forced = false;
+  let lastObserved = "";
+  let deadlineTimer: NodeJS.Timeout | undefined;
   const controller = new AbortController();
 
+  /**
+   * Drop every business value this run has read so far. A record that cannot be
+   * understood, that names another execution or stop, or that makes an illegal
+   * transition is not evidence, and an earlier read is not a cache to fall back
+   * on: nothing may be published from a run whose record became untrustworthy.
+   */
+  const invalidate = (code: ResearchRefusalCode): void => {
+    if (state.invalid) return;
+    state.invalid = true;
+    state.refusal ??= code;
+    state.facts = null;
+    state.phase = "unknown";
+    state.outcome = null;
+    state.report = "none";
+    options.diagnose("research_record_invalid", { code });
+  };
+
   const recordState = (text: string): void => {
-    let record;
+    if (state.invalid) return;
+    let record: ResearchWorkloadRecord;
     try {
-      record = parseResearchWorkloadRecord(text);
+      record = parseResearchWorkloadRecord(text, request.executionId);
     } catch (error) {
-      // A record this Runner cannot read is not evidence; keep the first named
-      // refusal and stop treating later values as trustworthy.
-      state.refusal ??= error instanceof ResearchRunError ? error.code : "RESEARCH_RECORD_MALFORMED";
+      invalidate(error instanceof ResearchRunError ? error.code : "RESEARCH_RECORD_MALFORMED");
       return;
     }
-    state.phase = record.phase;
-    if (record.outcome !== null) state.outcome = record.outcome;
-    if (record.stopId !== null && record.stopId === state.stopId) {
+    const update = nextResearchRecordState(state.facts, record, {
+      stopId: state.stopId,
+      stopRequested: state.stopState !== "none",
+    });
+    if (update.status === "refused") {
+      invalidate(update.code);
+      return;
+    }
+    state.facts = update.facts;
+    state.phase = update.facts.phase;
+    state.outcome = update.facts.outcome === "unknown" ? null : update.facts.outcome;
+    state.report = update.facts.report;
+    if (record.stopId !== null && record.stopId === state.stopId && state.stopState !== "consumed") {
       state.consumed = true;
       state.stopState = "consumed";
     }
+    // Persist what the read established, so a ledger reader during the run sees
+    // the same facts the operation holds. A failed write is named and leaves the
+    // run unpublishable; the child stays with this operation either way.
+    const facts = {
+      phase: state.phase as ResearchPhase,
+      outcome: state.outcome,
+      report: state.report,
+      ...(state.consumed ? { stop: "consumed" as const } : {}),
+    };
+    const signature = JSON.stringify(facts);
+    if (signature !== lastObserved) {
+      lastObserved = signature;
+      options.observe({ research: facts }, false);
+    }
   };
 
-  const forceReclaim = async (byDeadline: boolean): Promise<void> => {
+  /**
+   * Reclaim the namespace. Every grace is drawn from the remaining budget, so
+   * neither the stop grace nor the two termination phases can extend the hard
+   * deadline. This records a *request*; `deadlineViolated` is decided later by
+   * the instant termination was proven.
+   */
+  const forceReclaim = async (): Promise<void> => {
     if (forced) return;
     forced = true;
-    if (byDeadline) state.deadlineViolated = true;
+    state.forceReclaimRequested = true;
     options.diagnose("research_run_force_reclaim");
-    // A requested kill is a request, not proof: the namespace check below is
-    // what decides, and the manager checks again from the durable row.
+    const remaining = Math.max(0, deadlines.hardDeadlineMs - options.elapsedMs());
+    const termGraceMs = Math.max(0, Math.min(remaining, Math.min(1_000, schedule.verificationWindowMs)));
+    const killGraceMs = Math.max(0, remaining - termGraceMs);
+    const pollMs = Math.max(1, Math.min(POLL_MS, termGraceMs || killGraceMs || 1));
+    // A requested kill is a request, not proof: the namespace check is what
+    // decides, and the manager checks again from the durable row.
     controller.abort();
     if (boundary !== undefined && boundary !== "unavailable" && boundary !== "ended") {
-      const grace = Math.max(50, Math.min(1_000, schedule.verificationWindowMs));
       await terminateExecutionBoundary(boundary, {
-        killGraceMs: grace,
-        pollMs: Math.min(POLL_MS, grace),
+        killGraceMs,
+        pollMs,
         procRoot: wiring.procRoot,
-        termGraceMs: grace,
+        termGraceMs,
       }).catch(() => undefined);
     }
   };
+
+  /**
+   * Arm one absolute watchdog. Before the spawn it covers only a spawn handshake
+   * that never returns; the moment the process exists it is re-armed from the
+   * spawn instant, so no later phase can extend what §5.6 fixed.
+   */
+  const armDeadline = (ms: number): void => {
+    if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+    deadlineTimer = setTimeout(() => { void forceReclaim(); }, Math.max(0, ms));
+    deadlineTimer.unref?.();
+  };
+  // The spawn handshake is not part of the run budget. This bound only stops a
+  // spawn that never completes from parking the operation forever.
+  armDeadline(deadlines.hardDeadlineMs + SPAWN_HANDSHAKE_BOUND_MS);
 
   const runPromise = runSandboxed(
     config,
     prepared,
     commandArguments,
     `${wiring.program}\n`,
-    deadlines.hardDeadlineMs,
+    // The schedule is enforced by the spawn-based timer below, so the
+    // executor's own timer is disabled here. It starts before the process
+    // exists, and a full budget counted from there would shorten a run by its
+    // sandbox setup time, which §5.6 does not allow.
+    0,
     request.workspaceRoot,
     controller.signal,
     "Research workload",
@@ -846,7 +1254,16 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
     "baseline",
     undefined,
     (child, sandbox) => {
+      // §5.6: the schedule starts at the spawn instant, not at submission,
+      // environment lease or sandbox preparation.
+      const spawnedAt = options.startClock();
+      armDeadline(deadlines.hardDeadlineMs);
       spawned = true;
+      // The positive process fact is persisted before anything else is said
+      // about this run: a reader must never see `not_started` for a process
+      // that exists. A ledger failure throws inside the spawn turn, where the
+      // executor still owns the child and must stop it.
+      options.observe({ process: "spawned", spawnedAt }, true);
       // The manager captures and persists the identity in this same turn; ours
       // is only the read-back used for escalation and proof.
       launch.lifecycle?.spawned({
@@ -866,6 +1283,7 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
     void error;
   }).finally(() => {
     settled = true;
+    if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
   });
 
   // Observe on the same turn as the deadline checks. Nothing here infers a
@@ -876,22 +1294,31 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
     // is asked to stop gracefully; a workload that already reported the
     // reporting phase keeps the rest of the budget. Only the hard deadline
     // (less the verification window) reclaims the namespace uninvited.
-    if (state.phase === "research" && now >= deadlines.stopAtMs) void options.requestStop();
+    if ((state.phase === "research" || state.phase === "unknown") && now >= deadlines.stopAtMs) {
+      void options.requestStop();
+    }
     if (now >= deadlines.forceKillAtMs) {
-      await forceReclaim(options.stopCause() !== "user");
+      await forceReclaim();
     } else if (state.stopRequestedAtMs !== null
       && now >= Math.min(state.stopRequestedAtMs + schedule.stopGraceMs, deadlines.forceKillAtMs)) {
-      await forceReclaim(options.stopCause() !== "user");
+      await forceReclaim();
     }
     const record = await channel.read(RECORD_FILE);
-    if (record.status === "text") recordState(record.text);
-    else if (record.status === "refused") state.refusal ??= record.code;
-    if (!state.consumed) {
+    if (record.status === "text") {
+      recordState(record.text);
+    } else if (record.status === "refused") {
+      invalidate(record.code);
+      // A replaced channel can never be observed again; clean up now instead
+      // of polling a suspect path until the deadline. Every other refusal is
+      // business evidence: the workload keeps running and is stopped on time.
+      if (record.code === "RESEARCH_CONTROL_REPLACED") await forceReclaim();
+    }
+    if (!state.consumed && !state.invalid) {
       const consumed = await channel.read(STOP_CONSUMED_FILE);
       if (consumed.status === "text") {
         try {
-          const marker = parseResearchWorkloadRecord(consumed.text);
-          if (marker.stopId !== null && marker.stopId === state.stopId) {
+          const marker = parseStopMarker(consumed.text);
+          if (marker === state.stopId) {
             state.consumed = true;
             state.stopState = "consumed";
           }
@@ -908,7 +1335,7 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
   // its exit; read once more before deciding it never reported.
   const finalRecord = await channel.read(RECORD_FILE);
   if (finalRecord.status === "text") recordState(finalRecord.text);
-  else if (finalRecord.status === "refused") state.refusal ??= finalRecord.code;
+  else if (finalRecord.status === "refused") invalidate(finalRecord.code);
 
   if (!spawned) {
     // No process was created. Only here may the run be described as
@@ -921,14 +1348,24 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
     };
   }
 
-  const proven = await waitForBoundary(boundary, verificationWindowFor(schedule, deadlines, options.elapsedMs()), wiring.procRoot);
+  const proven = await waitForBoundary(
+    boundary,
+    verificationWindowFor(schedule, deadlines, options.elapsedMs()),
+    wiring.procRoot,
+  );
+  const provedAtMs = options.elapsedMs();
+  // §5.6: the violation is a fact about the proof instant. A user-caused
+  // reclaim proven late is still late, and a budget reclaim proven on time is
+  // not a violation; neither cause may override the measurement.
+  state.deadlineViolated = !proven || provedAtMs > deadlines.hardDeadlineMs;
   const processFact: ResearchProcessEvidence = proven ? "spawned-then-terminated" : "unverified";
   if (!proven) options.diagnose("research_run_boundary_unverified");
   // A record must say the run finished; anything else (missing, late, corrupt)
   // is `unknown`, never "nothing ran". An unknown research outcome keeps every
   // fence because neither publication nor release is justified.
-  const reported = state.phase === "finished" && state.outcome !== null;
-  const outcome: ResearchOutcome | null = reported ? state.outcome : "unknown";
+  const reported = state.facts !== null && state.facts.phase === "finished"
+    && state.facts.outcome !== "unknown";
+  const outcome: ResearchOutcome | null = reported ? state.facts!.outcome : "unknown";
   return {
     research: statusOf(processFact, { outcome }),
     result: options.emptyResult(exitCode, environment),
@@ -948,7 +1385,14 @@ function verificationWindowFor(
   return Math.max(0, Math.min(schedule.verificationWindowMs, deadlines.hardDeadlineMs - elapsedMs));
 }
 
-/** Poll until the namespace is empty or the verification window is spent. */
+/**
+ * Poll until the namespace is empty or the verification window is spent.
+ *
+ * A zero window still performs one observation: after the hard deadline the
+ * Runner may keep observing and cleaning up conservatively, but the proof
+ * instant is what the caller records, so a late proof is never rewritten as an
+ * on-time one.
+ */
 async function waitForBoundary(
   boundary: ExecutionBoundaryHandle | "ended" | "unavailable" | undefined,
   windowMs: number,

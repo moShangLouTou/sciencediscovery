@@ -77,9 +77,19 @@ export interface ResearchRunRequest {
   readonly permissionEpoch: PermissionEpoch;
   readonly workspaceRoot: string;
   readonly runnerWorkspaceKey?: string;
-  /** Managed environment leased for the whole workload; absent means system Python. */
+  /**
+   * Managed environment leased for the whole workload. The production internal
+   * contract requires it: a request without one is refused before any process
+   * exists, and the system interpreter is never used as a fallback. A test
+   * wiring may name a fixture runtime instead, and the run then records that
+   * fixture identity instead of pretending a managed revision was leased.
+   */
   readonly environmentId?: string;
-  /** Revision the caller believes is current; a mismatch is refused, never re-pointed. */
+  /**
+   * Revision the caller believes is current; a mismatch is refused, never
+   * re-pointed. Supplying it without an `environmentId` is a refusal too: there
+   * is no revision to compare against and no fallback interpreter is chosen.
+   */
   readonly expectedEnvironmentRevisionId?: string;
   readonly npuDevices?: number[];
   readonly maxOutputBytes?: number;
@@ -87,11 +97,26 @@ export interface ResearchRunRequest {
   readonly schedule: ResearchTimeSchedule;
 }
 
-/** Operating-system facts about the workload process, never a business result. */
-export type ResearchProcessEvidence = "not_started" | "spawned-then-terminated" | "unverified";
+/**
+ * Operating-system facts about the workload process, never a business result.
+ *
+ * `spawned` is the live fact: the process exists and its termination is not yet
+ * proven. It is recorded as soon as the sandbox is created and is replaced by
+ * `spawned-then-terminated` or `unverified` when the operation returns. It is
+ * never publishable, so a record read mid-run cannot be mistaken for a result.
+ */
+export type ResearchProcessEvidence = "not_started" | "spawned" | "spawned-then-terminated" | "unverified";
 
 /** Business phases the fixed workload may report about itself. */
 export type ResearchPhase = "research" | "reporting" | "finished";
+
+/**
+ * What the workload reported about its reporting phase, kept apart from the
+ * research outcome. A stopped or failed report never erases a completed
+ * research phase: `research: completed` + `report: incomplete` is the truthful
+ * description of a run that finished research and was stopped while writing.
+ */
+export type ResearchReportOutcome = "none" | "generating" | "ready" | "incomplete" | "failed" | "unknown";
 
 /**
  * Research outcomes. `not-started` requires a positive pre-research record:
@@ -116,6 +141,11 @@ export const RESEARCH_REFUSAL_CODES = [
   "RESEARCH_RECORD_OVERSIZE",
   "RESEARCH_RECORD_MALFORMED",
   "RESEARCH_RECORD_VERSION_UNKNOWN",
+  "RESEARCH_RECORD_IDENTITY_MISMATCH",
+  "RESEARCH_RECORD_TRANSITION_INVALID",
+  "RESEARCH_STOP_NOT_DURABLE",
+  "RESEARCH_ENVIRONMENT_REQUIRED",
+  "RESEARCH_STATE_SAVE_FAILED",
   "RESEARCH_ENVIRONMENT_UNAVAILABLE",
   "RESEARCH_ENVIRONMENT_REVISION_MISMATCH",
   "RESEARCH_SANDBOX_UNSUPPORTED",
@@ -134,13 +164,36 @@ export interface ResearchRunStatus {
   readonly workload: ResearchWorkloadKind;
   readonly schemaVersion: typeof RESEARCH_RUN_SCHEMA_VERSION;
   readonly phase: ResearchPhase | "unknown";
+  /** What the research phase itself reported; independent of `report`. */
   readonly outcome: ResearchOutcome | null;
+  /** What the reporting phase reported; independent of `outcome`. */
+  readonly report: ResearchReportOutcome;
   readonly process: ResearchProcessEvidence;
   readonly stop: ResearchStopState;
   /**
-   * True when the run's budget was spent and the namespace had to be
-   * force-reclaimed instead of the workload stopping itself. It records what
-   * actually happened, not merely that a deadline existed.
+   * Why the first durable stop intent was persisted. It is stored with the
+   * intent, so a record rebuilt after a restart still says whether a person or
+   * the schedule asked for the stop; it never overrides the termination facts.
+   */
+  readonly stopCause?: "user" | "budget";
+  /**
+   * The schedule that actually governed the run, persisted with the record so
+   * an observer never has to reconstruct the deadlines from a request it does
+   * not hold. It is the validated schedule, never a clamped one.
+   */
+  readonly schedule: ResearchTimeSchedule;
+  /** Wall-clock spawn instant; the monotonic base is `t0` inside the run. */
+  readonly spawnedAt?: string;
+  /**
+   * True when the budget was spent and the namespace had to be force-reclaimed
+   * instead of the workload stopping itself. It records that a reclaim was
+   * *requested*; it is not by itself a deadline violation.
+   */
+  readonly forceReclaimRequested: boolean;
+  /**
+   * True only when termination was **not proven inside the hard deadline**. It
+   * is decided by the proof instant, so a user-caused reclaim that is proven on
+   * time is false and a budget reclaim proven on time is false too.
    */
   readonly deadlineViolated: boolean;
   /** Poll bound the Runner used before declaring the boundary unproven. */

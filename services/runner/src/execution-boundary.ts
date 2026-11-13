@@ -32,7 +32,13 @@ import {
   scanNamespaceMembersSync,
   sendSignal,
 } from "@sciencediscovery/sandbox-capability";
-import type { ExecutionBoundaryStatus } from "@sciencediscovery/schema";
+import type {
+  ExecutionBoundaryStatus,
+  ResearchOutcome,
+  ResearchPhase,
+  ResearchReportOutcome,
+  ResearchStopState,
+} from "@sciencediscovery/schema";
 
 export const EXECUTION_BOUNDARY_SCHEMA_VERSION = 1;
 /** Bounded wait for a TERM to empty the namespace before escalating to KILL. */
@@ -64,6 +70,26 @@ export type SpawnBoundaryReport =
   | { readonly state: "unavailable" };
 
 /**
+ * Whitelisted lifecycle facts a running operation may persist as it observes
+ * them. Nothing here is inferred: every field is something the operation itself
+ * established, and the ledger keeps the same values, so a record read during
+ * the run never disagrees with what the operation knows.
+ */
+export interface ExecutionObservation {
+  /** Positive process fact: the sandbox was created and is not yet proven gone. */
+  readonly process?: "spawned";
+  /** Wall-clock spawn instant; the scheduler's monotonic base is measured from it. */
+  readonly spawnedAt?: string;
+  /** Business facts the fixed workload reported, forwarded unchanged. */
+  readonly research?: {
+    readonly phase?: ResearchPhase;
+    readonly outcome?: ResearchOutcome | null;
+    readonly report?: ResearchReportOutcome;
+    readonly stop?: ResearchStopState;
+  };
+}
+
+/**
  * What the executor hands to the ledger while it still runs synchronously
  * after spawn(). Nothing here may await: a short-lived sandbox can exit before
  * the first /proc read of the next microtask.
@@ -73,14 +99,27 @@ export interface ExecutionLifecycle {
   /** Transfer cleanup to the manager before spawn; release only after proof. */
   retainResource?(cleanup: () => Promise<void>, label: string): void;
   /**
-   * Register the graceful stop for a running execution. The manager persists
-   * the stop intent first and then calls this instead of aborting the
-   * controller, so a workload that can stop itself is asked before it is
-   * killed. The handler must be bounded by its own deadline.
+   * Persist a stop intent for this execution and resolve to its stable stop
+   * identity. It is the only way a stop may reach the workload: the identity is
+   * durable before any control request exists, and a failed save rejects
+   * instead of leaving a stop that exists only in memory.
    */
-  requestStop?(handler: () => Promise<void>): void;
+  persistStopIntent?(cause: "user" | "budget"): Promise<string>;
+  /**
+   * Register the graceful stop for a running execution. The manager persists
+   * the stop intent first and then calls this with the durable identity instead
+   * of aborting the controller, so a workload that can stop itself is asked
+   * before it is killed. The handler must be bounded by its own deadline.
+   */
+  requestStop?(handler: (stopId: string) => Promise<void>): void;
   /** Read back the identity the ledger captured in the spawn turn. */
   boundary?(): SpawnBoundaryReport;
+  /**
+   * Record whitelisted lifecycle facts before the operation returns. A write
+   * failure throws to the caller: the operation still owns the child and must
+   * follow its exception contract rather than keep unpersisted facts.
+   */
+  observed?(facts: ExecutionObservation): void;
 }
 
 /** Exactly what the Runner persists; unknown fields are rejected on load. */
