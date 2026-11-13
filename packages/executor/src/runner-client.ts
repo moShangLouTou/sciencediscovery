@@ -20,6 +20,14 @@ import {
   EXECUTION_SIGNATURE_HEADER,
   EXECUTION_TIMESTAMP_HEADER,
 } from "@sciencediscovery/runner";
+import {
+  canonicalScienceFlowInputBundleManifest,
+  SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
+  type ScienceFlowInputBundleManifest,
+  type ScienceFlowInputBundlePublication,
+  type ScienceFlowInputBundleRequest,
+  type ScienceFlowInputBundleStatusDto,
+} from "@sciencediscovery/schema";
 import type {
   CreateEnvironmentRequest,
   Environment,
@@ -69,6 +77,9 @@ const RUNNER_ERROR_CODE_MESSAGES: Readonly<Record<string, string>> = {
   EXECUTION_ID_CONFLICT: "Runner execution identity conflict",
   SCIENCEFLOW_RUNTIME_CHECK_DISABLED: "ScienceFlow runtime identity checks are not configured on the Runner",
   SCIENCEFLOW_RUNTIME_BINDING_UNKNOWN: "ScienceFlow runtime binding is not configured on the Runner",
+  SCIENCEFLOW_INPUT_BUNDLE_INVALID: "ScienceFlow input bundle was refused by the Runner",
+  SCIENCEFLOW_INPUT_BUNDLE_CORRUPT: "Stored ScienceFlow input bundle on the Runner is corrupt",
+  SCIENCEFLOW_INPUT_BUNDLE_UNAVAILABLE: "ScienceFlow input bundle storage on the Runner is unavailable",
 };
 
 /** HTTP adapter for the isolated execution service. */
@@ -183,6 +194,98 @@ export class RunnerClient {
       // that selected Skills must not silently run without them.
       throw new Error(`Remote Skill preparation failed: ${(error as Error).message}`, { cause: error });
     }
+  }
+
+  /**
+   * Make this Runner hold one frozen ScienceFlow task-input bundle.
+   *
+   * The identity is derived here from the manifest, so a request whose claimed
+   * digest does not describe its own entries is refused before anything is
+   * sent. The Runner is asked by digest first: a bundle it already verified is
+   * reused without shipping a byte, while `missing` uploads and `corrupt`
+   * fails instead of overwriting content the Runner did not write. The returned
+   * publication must echo this exact identity; anything else is a protocol
+   * difference, never a success.
+   */
+  async prepareScienceFlowInputBundle(
+    request: ScienceFlowInputBundleRequest,
+    signal?: AbortSignal,
+  ): Promise<ScienceFlowInputBundlePublication> {
+    const manifest: ScienceFlowInputBundleManifest = {
+      schemaVersion: request.schemaVersion,
+      contractDigest: request.contractDigest,
+      files: request.entries.map(({ content: _content, ...file }) => file),
+    };
+    const digest = createHash("sha256")
+      .update(canonicalScienceFlowInputBundleManifest(manifest), "utf8")
+      .digest("hex");
+    const totalBytes = manifest.files.reduce(
+      (total, file) => total + file.size,
+      0,
+    );
+    if (digest !== request.bundleDigest) {
+      throw new Error("ScienceFlow input bundle identity does not match its manifest");
+    }
+
+    const status = await this.request<ScienceFlowInputBundleStatusDto>(
+      `/scienceflow/input-bundles/${digest}`,
+      { signal },
+    );
+    if (status.status === "ready") {
+      if (
+        status.bundleDigest !== digest ||
+        status.contractDigest !== request.contractDigest ||
+        status.fileCount !== manifest.files.length ||
+        status.totalBytes !== totalBytes
+      ) {
+        throw new Error("Runner answered for a different ScienceFlow input bundle");
+      }
+      return {
+        schemaVersion: SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
+        bundleDigest: digest,
+        contractDigest: request.contractDigest,
+        status: "ready",
+        fileCount: manifest.files.length,
+        totalBytes,
+      };
+    }
+    if (status.status === "corrupt") {
+      throw new Error(
+        RUNNER_ERROR_CODE_MESSAGES.SCIENCEFLOW_INPUT_BUNDLE_CORRUPT,
+      );
+    }
+
+    const body = JSON.stringify(request);
+    const timestamp = this.signingTimestamp();
+    const answer = await this.request<ScienceFlowInputBundlePublication>(
+      "/scienceflow/input-bundles",
+      {
+        method: "POST",
+        body,
+        signal,
+        headers: {
+          [EXECUTION_SIGNATURE_HEADER]: createExecutionSignature(
+            this.token,
+            timestamp,
+            body,
+          ),
+          [EXECUTION_TIMESTAMP_HEADER]: timestamp,
+        },
+      },
+    );
+    if (
+      answer === null ||
+      typeof answer !== "object" ||
+      answer.schemaVersion !== SCIENCE_FLOW_INPUT_BUNDLE_VERSION ||
+      answer.bundleDigest !== digest ||
+      answer.contractDigest !== request.contractDigest ||
+      answer.status !== "ready" ||
+      answer.fileCount !== manifest.files.length ||
+      answer.totalBytes !== totalBytes
+    ) {
+      throw new Error("Runner did not confirm ScienceFlow input bundle publication");
+    }
+    return answer;
   }
 
   async health(): Promise<RunnerHealth> {

@@ -21,6 +21,10 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { RunnerSkillPackages } from "./skill-packages.js";
+import {
+  RunnerScienceFlowInputBundles,
+  ScienceFlowInputBundleError,
+} from "./scienceflow-input-bundles.js";
 
 import { createOperationalLogger, shortErrorMessage } from "@sciencediscovery/operational-logging";
 // [windows-desktop] Owner-only (0600) semantics go through the platform facade (win32: icacls). See #477.
@@ -46,6 +50,7 @@ import type {
   ShellExecutionRequest,
   UninstallEnvironmentRequest,
 } from "@sciencediscovery/schema";
+import { SCIENCE_FLOW_INPUT_BUNDLE_LIMITS } from "@sciencediscovery/schema";
 
 import {
   DEFAULT_EXECUTION_TIMEOUT_MS,
@@ -479,6 +484,10 @@ export function createRunnerServer(
 ): Server {
   const sandbox = executorSandboxKind(config);
   const skillPackages = new RunnerSkillPackages(config.dataDir);
+  // Input evidence bundles are opaque frozen task files addressed by content.
+  // They never become a mount or an execution input; storing them needs no
+  // external configuration, so the capability is always present.
+  const inputBundles = new RunnerScienceFlowInputBundles(config.dataDir);
   const logger = createOperationalLogger({ category: "runner", dataDir: config.dataDir, service: "runner" });
   const profiles = envProfiles ?? new SessionEnvProfileStore();
   const gateways = egressGateways ?? new EgressGatewayRegistry(config.dataDir, (event, detail) => {
@@ -1066,6 +1075,54 @@ export function createRunnerServer(
           sendJson(response, 202, await managedExecutions.cancel(id, owner));
           return;
         }
+      }
+      const inputBundleMatch = /^\/scienceflow\/input-bundles\/([a-f0-9]{64})$/.exec(url.pathname);
+      if (request.method === "GET" && inputBundleMatch) {
+        // A read verifies the stored tree again and answers one fixed state:
+        // ready, missing, or corrupt. It publishes nothing and names no path.
+        try {
+          sendJson(response, 200, await inputBundles.status(inputBundleMatch[1]!));
+        } catch {
+          sendJson(response, 500, {
+            error: "ScienceFlow input bundle storage is unavailable",
+            code: "SCIENCEFLOW_INPUT_BUNDLE_UNAVAILABLE",
+          } satisfies ApiError);
+        }
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/scienceflow/input-bundles") {
+        const bytes = await readBytes(request, SCIENCE_FLOW_INPUT_BUNDLE_LIMITS.maxBodyBytes);
+        const body = bytes.toString("utf8");
+        if (!verifyExecutionSignature(config.authToken, request.headers[EXECUTION_TIMESTAMP_HEADER] as string | undefined,
+          body, request.headers[EXECUTION_SIGNATURE_HEADER] as string | undefined)) {
+          sendJson(response, 401, { error: "Invalid or expired execution signature" } satisfies ApiError);
+          return;
+        }
+        let bundle: unknown;
+        try {
+          bundle = JSON.parse(body);
+        } catch {
+          sendJson(response, 400, {
+            error: "ScienceFlow input bundle body is not valid JSON",
+            code: "SCIENCEFLOW_INPUT_BUNDLE_INVALID",
+          } satisfies ApiError);
+          return;
+        }
+        // The store re-derives the digest and every entry's bytes; the sender's
+        // claim is never taken as verification.
+        try {
+          sendJson(response, 200, await abortOnDisconnect(response, (signal) => inputBundles.put(bundle, signal)));
+        } catch (error) {
+          if (!(error instanceof ScienceFlowInputBundleError)) throw error;
+          const answer = {
+            invalid: [400, "ScienceFlow input bundle is invalid", "SCIENCEFLOW_INPUT_BUNDLE_INVALID"],
+            corrupt: [409, "Stored ScienceFlow input bundle is corrupt", "SCIENCEFLOW_INPUT_BUNDLE_CORRUPT"],
+            unavailable: [500, "ScienceFlow input bundle storage is unavailable", "SCIENCEFLOW_INPUT_BUNDLE_UNAVAILABLE"],
+          } as const;
+          const [status, message, code] = answer[error.kind];
+          sendJson(response, status, { error: message, code } satisfies ApiError);
+        }
+        return;
       }
       if (request.method === "POST" && url.pathname === "/scienceflow/runtime-check") {
         const body = await readBody(request);

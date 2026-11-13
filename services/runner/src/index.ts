@@ -54,4 +54,9 @@ export {
   type RunnerConfig,
 } from "./server.js";
 export { skillBundleIdentity, skillBundleManifest, verifySkillBundle } from "./skill-packages.js";
+export {
+  RunnerScienceFlowInputBundles,
+  ScienceFlowInputBundleError,
+  scienceFlowInputBundleDigest,
+} from "./scienceflow-input-bundles.js";
 export { prepareSpecialistLauncher } from "./specialist-launch.js";
