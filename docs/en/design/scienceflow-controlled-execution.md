@@ -1212,3 +1212,44 @@ Remaining design blockers (not resolvable by this document alone):
 
 None of these decisions authorizes a start: the five blockers and
 `canStart: false` remain until each has execution-time evidence.
+
+## Round 13 correction: the namespace init is `bwrap`, not the bootstrap
+
+The Round 12 revision 4 text (§3.3) treats "the bootstrap is PID 1" as a runtime
+condition to be asserted, and makes the bootstrap responsible for reaping. The
+implementation checkpoint for Round 13 measured the shape on the real sandbox
+before accepting that premise, and it does not hold:
+
+```
+$ bwrap --unshare-all --unshare-user --die-with-parent --cap-drop ALL \
+    --clearenv ... python3 -I -B - <<'PY'
+  print(json.loads(open('/proc/self/status'...)))  # reads /proc/self/stat + /proc/1/cmdline
+PY
+{"self": 2, "ppid": 1, "sid": 0, "pid1": "bwrap"}
+```
+
+`bwrap` is PID 1 in the new PID namespace and the fixed Python workload is its
+ordinary child. This is bubblewrap's designed shape: the monitor it runs is the
+namespace init that reaps orphans, and the payload is a supervised child. The
+measurement reproduced twice (a direct launch, and a full `ExecutionManager`
+run through the real executor) on Linux 6.18.58.1-microsoft-standard-WSL2,
+x86_64, bubblewrap 0.13.1, Python 3.10.12.
+
+Revised shape, unchanged in every other respect:
+
+- The existing `bwrap` init is kept. No argument was added to force the payload
+  to PID 1, and there is no second init process.
+- The fixed Python code is an **ordinary supervised workload**, not a namespace
+  init. It no longer asserts `os.getpid() == 1`, writes no `not-namespace-init`
+  event, and is not responsible for reaping: the `bwrap` init reaps the
+  namespace, and the Runner's namespace-emptiness proof (§3.5) remains the only
+  termination proof.
+- Everything else in §3.3 stands: the monitor is the Runner's direct child, the
+  boundary is captured in the spawn turn, no signal is sent to a guessed pid, and
+  E23's premise (a payload that asserts it is PID 1) is void. What E23 can still
+  prove is the weaker, still useful statement that a payload which refuses to
+  start produces `failed` + `research: not-started` with
+  `spawned-then-terminated` process evidence.
+- This is a correction to a premise, not a relaxation of a guarantee. The
+  namespace proof, the fence retention on an unproven boundary, and the
+  no-fallback-to-direct-spawn rule are unchanged.
