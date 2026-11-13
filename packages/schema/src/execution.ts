@@ -3,6 +3,7 @@
 
 import type { ExecutionRecovery, RecoveryContext } from "./recovery.js";
 import type { ShellExecutionResult } from "./environment.js";
+import type { ResearchRunStatus } from "./research-run.js";
 
 export interface ExecutionOwner { sessionId: string; agentId: string }
 
@@ -62,6 +63,13 @@ export interface ManagedExecution extends ExecutionOwner {
   workspaceKey?: string;
   npuDevices?: number[];
   id: string;
+  /**
+   * Which workload this record owns. Absent means a shell execution, which is
+   * how every record written before research runs existed is read.
+   */
+  workload?: "shell" | "research";
+  /** Additive research projection; only a research record carries it. */
+  research?: ResearchRunStatus;
   state: "queued" | "running" | "completed" | "failed" | "cancelled" | "unknown";
   queuedAt: string;
   recovery?: ExecutionRecovery;

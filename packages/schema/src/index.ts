@@ -31,6 +31,7 @@ export * from "./permission.js";
 export * from "./sandbox-network.js";
 export * from "./environment.js";
 export * from "./execution.js";
+export * from "./research-run.js";
 export * from "./recovery.js";
 export * from "./workspace-transfer.js";
 export * from "./model-usage.js";
