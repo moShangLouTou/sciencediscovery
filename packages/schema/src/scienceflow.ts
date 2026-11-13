@@ -22,6 +22,8 @@
  * inferred research outcome.
  */
 
+import type { ScienceFlowInputFileRole } from "./scienceflow-input-bundle.js";
+
 /** Version of this response contract, not of the Python reader snapshot. */
 export const SCIENCE_FLOW_RUN_SNAPSHOT_DTO_VERSION = 1;
 
@@ -499,6 +501,55 @@ export interface ScienceFlowRuntimeCheckDto {
 export interface ScienceFlowRuntimeCheckStateDto {
   readonly planId: string;
   readonly check: ScienceFlowRuntimeCheckDto | null;
+}
+
+/**
+ * Version of one persisted "input evidence prepared" receipt.
+ *
+ * A receipt records one successful preparation at one moment: that the
+ * selected Runner held a bundle whose bytes matched the frozen plan's contract.
+ * It is not a continuous health fact, not a runtime identity verification, not
+ * a start authorization, and not a formal Artifact.
+ */
+export const SCIENCE_FLOW_PREPARED_INPUTS_DTO_VERSION = 1;
+
+/** One contract role and the verified byte set that serves it. */
+export interface ScienceFlowPreparedInputFileDto {
+  readonly role: ScienceFlowInputFileRole;
+  /** Logical bundle-relative label, never a Runner host path. */
+  readonly path: string;
+  readonly size: number;
+  readonly sha256: string;
+}
+
+/**
+ * The whitelisted preparation receipt. It carries digests and role summaries
+ * only: no raw manifest, evaluator source, internal layout, or storage address.
+ */
+export interface ScienceFlowPreparedInputsDto {
+  readonly schemaVersion: typeof SCIENCE_FLOW_PREPARED_INPUTS_DTO_VERSION;
+  readonly planId: string;
+  /** The frozen plan digest the preparation was matched against. */
+  readonly contractDigest: string;
+  /** Content identity of the exact file set the Runner materialized. */
+  readonly bundleDigest: string;
+  readonly runnerId: string;
+  /** ISO-8601 time the API recorded the preparation. */
+  readonly preparedAt: string;
+  readonly outcome: "prepared";
+  readonly canStart: false;
+  /** Distinct byte sets materialized; `files` lists every role. */
+  readonly fileCount: number;
+  readonly totalBytes: number;
+  readonly files: readonly ScienceFlowPreparedInputFileDto[];
+  /** Monotonic per plan; a larger generation supersedes an older receipt. */
+  readonly generation: number;
+}
+
+/** The read answer: the latest stored receipt, or none performed yet. */
+export interface ScienceFlowPreparedInputsStateDto {
+  readonly planId: string;
+  readonly prepared: ScienceFlowPreparedInputsDto | null;
 }
 
 /** One immutable plan plus the most recent stored preflight result. */
