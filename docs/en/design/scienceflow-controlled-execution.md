@@ -1085,6 +1085,26 @@ Non-goals: API start action, tables, input delivery, model gateway, token
 metering, remote run-snapshot, resume, artifact import, and any change to
 `canStart` or the five blockers.
 
+### 6.5 The input-delivery seam that now exists (round 14)
+
+Section 4.3 described frozen input delivery across hosts as a later slice. One
+narrow piece of it is now built, and only that piece:
+
+- The contract builder returns the private bytes that produced each frozen
+  digest, and the API assembles them into an explicit entry list
+  (`packages/schema/src/scienceflow-input-bundle.ts`).
+- The selected Runner independently re-derives the bundle digest, verifies every
+  entry, and materializes the tree under its own data directory
+  (`services/runner/src/scienceflow-input-bundles.ts`).
+- The API records a preparation receipt per plan and serves it as local history
+  (`POST/GET .../plans/:planId/prepare-inputs|prepared-inputs`).
+
+What this deliberately does **not** do: mount or bind the bundle into an
+execution, rewrite the engine launch manifest, snapshot datasets or the engine
+source, or change the runner start path. The five blockers and `canStart:
+false` are untouched, and a ready bundle is not evidence that the evaluator,
+dependencies, or a research run can execute.
+
 ## 7. Acceptance matrices
 
 Two tables, because the slice and the full vision must be separable. Every row is

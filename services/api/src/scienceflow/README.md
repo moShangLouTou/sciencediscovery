@@ -21,6 +21,8 @@ GET  /api/projects/:projectId/sessions/:sessionId/scienceflow/plans/:planId
 POST /api/projects/:projectId/sessions/:sessionId/scienceflow/plans/:planId/preflight
 POST /api/projects/:projectId/sessions/:sessionId/scienceflow/plans/:planId/runtime-check
 GET  /api/projects/:projectId/sessions/:sessionId/scienceflow/plans/:planId/runtime-check
+POST /api/projects/:projectId/sessions/:sessionId/scienceflow/plans/:planId/prepare-inputs
+GET  /api/projects/:projectId/sessions/:sessionId/scienceflow/plans/:planId/prepared-inputs
 ```
 
 All routes are mounted behind the existing `/api/` Bearer check and reuse the
@@ -54,6 +56,10 @@ Files:
 | `runtime-check-dto.ts` | Fixed check vocabulary, descriptions, verified rule, unknown whitelist |
 | `runtime-check-repository.ts` | Additive SQLite table, conditional generation write, corruption detection |
 | `runtime-check-http.ts` | The two runtime-check routes and their status mapping |
+| `input-bundle.ts` | Contract-to-bundle assembly: role/digest match, merge, canonical digest |
+| `prepared-inputs-repository.ts` | Additive SQLite table, conditional generation write, corruption detection |
+| `prepared-inputs.ts` | Prepare action: gates, contract re-read, Runner call, receipt |
+| `prepared-inputs-http.ts` | The two prepared-input routes and their status mapping |
 
 ## Enable and disable
 
@@ -943,6 +949,136 @@ gateway, evaluator runnability, or that a research run would start.
 8. Restart the API → the stored row is readable; a new `POST` advances the
    generation.
 
+## Round 14: prepared input evidence bundles
+
+A frozen plan stores digests, not files, and an API host path is not a Runner
+path. This round answers exactly one further question:
+
+> Did the selected Runner receive and independently verify the enumerated input
+> files whose bytes match this frozen plan?
+
+It is not "can research start": `canStart` stays `false`, the five blockers are
+unchanged, no process is started, and no engine is imported.
+
+### What is covered
+
+Only the files the frozen contract already enumerates:
+
+- the administrator's manifest (`manifest.yaml` in the bundle),
+- the task package `task.yaml`,
+- the applied `_shared/task_defaults.yaml` (present only when the plan applied
+  one),
+- the description file,
+- the evaluator entrypoint file.
+
+Not covered: the rest of the task directory, Python import closures, datasets,
+engine sources, evaluator dependencies beyond the entrypoint, or a runnable
+package. A ready bundle does not prove the evaluator runs.
+
+### Route and semantics
+
+```text
+POST .../plans/:planId/prepare-inputs     # takes no body and no query
+GET  .../plans/:planId/prepared-inputs    # local history only
+```
+
+`POST` selects the Runner through the plan's profile `runtimeBindingId` in the
+administrator's existing runtime file. It never falls back to `local` or a
+default, and it does not call the Round 11 probe or reuse its stored verdict.
+
+The service rebuilds the contract from the current profile and compares it with
+the frozen plan: a different `contractDigest` is `409
+SCIENCEFLOW_PLAN_CONTRACT_CHANGED`, and a build that cannot complete is `422
+SCIENCEFLOW_INPUT_PREPARATION_BLOCKED` with fixed checks. The bytes that are
+sent are the same buffers that produced the compared digests — the service
+never re-reads a path after verification. Each role is matched against the
+frozen path and SHA-256; a role missing, extra, or differing is never repaired
+by guessing an older version or creating a new plan.
+
+The transport is a small explicit list, not an archive: `schemaVersion`,
+`contractDigest`, `bundleDigest`, and entries of `{path, roles, size, sha256,
+content}` with canonical base64. Bounds are 5 files, 2 MiB per file, 4 MiB in
+total, and an 8 MiB request body. Paths are logical labels; none is a Runner
+host path. A description and evaluator entrypoint that are one file are stored
+once and keep both role associations.
+
+### Runner side
+
+`services/runner/src/scienceflow-input-bundles.ts` adds two internal routes:
+
+```text
+POST /scienceflow/input-bundles          # signed; verify and publish
+GET  /scienceflow/input-bundles/:digest  # fixed ready | missing | corrupt
+```
+
+The Runner re-derives `bundleDigest` from the manifest and compares it with the
+sender's claim, then re-checks every entry's size and SHA-256 from the decoded
+bytes. It writes a private staging directory under its own data directory and
+commits the whole tree with one rename into
+`<dataDir>/.scienceflow-input-bundles/<bundleDigest>/`, outside every workspace
+and workload-writable bind. Concurrent publishers of the same bytes share one
+tree; an existing but damaged snapshot is reported as `corrupt` and refused,
+never overwritten or re-blessed. Reads verify the stored tree again (no
+symlinks, no extra files, exact sizes and digests). There is no GC, TTL,
+reference counting, or mount step this round: unreferenced content is a cache
+object, not a business record.
+
+### Receipt and storage
+
+A successful preparation stores one receipt per plan in the additive
+`science_flow_prepared_inputs` / `science_flow_prepared_input_generations`
+tables of `catalog.sqlite` (the same generation pattern as Round 11):
+
+- `schemaVersion`, `planId`, `contractDigest`, `bundleDigest`, `runnerId`,
+  `preparedAt`, `outcome: "prepared"`, `canStart: false`, `generation`,
+  `fileCount`, `totalBytes`, and one `{role, path, size, sha256}` per role.
+
+It contains no raw manifest, evaluator source, host path, storage address, or
+remote error text. Gates are rechecked after the Runner await: a deleted
+Session/Project, a revoked write permission, a deselected Runner, a withdrawn
+profile or binding, or a changed plan records nothing. `POST` answers its own
+receipt when saved, a strictly newer receipt stored meanwhile (with its larger
+generation), `404` when the rows were deleted, and `503 ..._UNAVAILABLE` when a
+newer generation was issued but no newer fact exists. A Runner that stored the
+content while the response was lost leaves an unassociated cache; a later
+preparation by digest reuses it. An API save failure is a `500` and registers
+nothing.
+
+`GET` reads only the local receipt: it does not contact the Runner, re-read a
+source file, or start anything. After a configuration change it still serves
+history but never describes the current binding as available. The receipt is a
+record from `preparedAt`, not continuous health, a runtime verification, or a
+start authorization.
+
+Statuses: `401` unauthorized; uniform `404` for a foreign or missing identity;
+`409 ..._CONTRACT_CHANGED`; `422 ..._BLOCKED`; `409
+SCIENCEFLOW_INPUT_PREPARATION_RUNNER_DENIED`; `503 ..._DISABLED`; `503
+..._UNAVAILABLE`; `500 SCIENCEFLOW_PREPARED_INPUTS_CORRUPT` for an unreadable
+stored row.
+
+### Round 14 verification checklist (liyuan)
+
+1. A synthetic task with and without `_shared/task_defaults.yaml`: `POST`
+   returns a receipt whose role set matches the plan exactly and whose
+   `bundleDigest` is queryable on the Runner; the plan's `canStart` stays
+   `false`.
+2. Modify a source after the plan froze: `409 ..._CONTRACT_CHANGED`, nothing
+   stored, no Runner request.
+3. Prepare, then modify/delete the sources: `GET` still returns the same
+   receipt; a new `POST` is `409`/`422`, never a fabricated match.
+4. Send a bundle with a missing/extra/duplicate file, a wrong size or digest,
+   broken base64, or over a limit: the Runner refuses with fixed codes and
+   leaves no published tree.
+5. Point a request at a traversal path or hand the Runner a damaged snapshot:
+   refusal, no overwrite, `corrupt` on read.
+6. Same content twice or concurrently: one tree, no duplicate receipt rows; a
+   lost response is recoverable by digest.
+7. Revoke the Runner selection, the write permission, or the binding during the
+   await: nothing is recorded as current.
+8. Delete the Session/Project during the await or before a save: no row is
+   resurrected.
+
+
 ## Known limits
 
 - Single-service Bearer model: the routes add Project/Session/binding ownership
@@ -960,6 +1096,10 @@ gateway, evaluator runnability, or that a research run would start.
   puts one Git checkout on `sys.path`. Wheels, archives, editable installs, and
   import hooks are `unsupported` rather than guessed. Its result is a
   point-in-time observation, not a health check or a start gate.
+- Prepared input bundles are evidence of the enumerated files only. They are
+  not mounted, are not rewritten into the engine launch manifest, and prove
+  neither the dependency closure nor that an evaluator or a research run can
+  execute. There is no GC, TTL, reference counting, or manual download.
 
 ## Manual verification checklist (liyuan)
 
