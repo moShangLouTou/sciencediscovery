@@ -218,8 +218,9 @@ function managerDb(manager: ExecutionManager): DatabaseSync {
 
 interface Scenario {
   /** `complete`: research then finished; `reporting`: a long report phase;
-   *  `hang`: never reports again; `failed`: a terminal failure; `silent`: no records. */
-  readonly behaviour?: "complete" | "reporting" | "hang" | "failed" | "silent";
+   *  `hang`: never reports again; `failed`: a terminal failure; `silent`: no
+   *  records; `conflict`: a finished record that rewrites the research outcome. */
+  readonly behaviour?: "complete" | "reporting" | "hang" | "failed" | "silent" | "conflict";
   /** Whether the workload reads the stop channel at all. */
   readonly honourStop?: boolean;
   /** Spawn a descendant that leaves the process group and ignores SIGTERM. */
@@ -236,8 +237,8 @@ interface Scenario {
   readonly cleanupSeconds?: number;
   /** Leave a marker in the control directory after the awaited cleanup. */
   readonly cleanupMarker?: boolean;
-  /** Replace the terminal record after it was written once (valid → unusable). */
-  readonly corruptAfter?: "malformed" | "oversize" | "foreign";
+  /** Replace or remove the terminal record after it was written once (valid → unusable). */
+  readonly corruptAfter?: "malformed" | "oversize" | "foreign" | "missing";
   /** Stay alive this much longer after the terminal record. */
   readonly lingerSeconds?: number;
 }
@@ -348,6 +349,15 @@ def body():
             return 0
         record("finished", "completed", "ready")
         return 0
+    if behaviour == "conflict":
+        # The reporting record states the research fact; the finished record
+        # then tries to rewrite it. The reporting record is left in place long
+        # enough for the poll turn to read it before the conflict arrives.
+        record("reporting", "completed", "generating")
+        time.sleep(0.4)
+        record("finished", "failed", "failed")
+        time.sleep(0.6)
+        return 3
 
     # Without a requested lifetime a scenario reports as soon as it is done; a
     # longer one keeps it alive and still honours a stop arriving meanwhile.
@@ -361,8 +371,10 @@ def body():
     record("finished", "completed", "ready")
     corruption = SCENARIO.get("corruptAfter")
     if corruption is not None:
-        time.sleep(0.25)
-        if corruption == "malformed":
+        time.sleep(0.4)
+        if corruption == "missing":
+            os.unlink(os.path.join(CONTROL, "status"))
+        elif corruption == "malformed":
             write("status", "{not json")
         elif corruption == "oversize":
             write("status", "x" * (${RESEARCH_RECORD_MAX_BYTES} + 16))
@@ -577,6 +589,45 @@ test("the record fold refuses a terminal rewrite, a regression and a foreign sto
     researchStopId("run-2", "2026-11-13T00:00:00.000Z"));
 });
 
+test("a research outcome a reporting record stated is never rewritten by a later phase", () => {
+  const reporting = { outcome: "completed", phase: "reporting", report: "generating", stopId: null } as const;
+  const finish = (next: ResearchWorkloadRecord, current: Parameters<typeof nextResearchRecordState>[0],
+    stopContext: { stopId: string | null; stopRequested: boolean } = { stopId: null, stopRequested: false }) =>
+    nextResearchRecordState(current, next, stopContext);
+  // The phase may advance while the research fact stays exactly as stated; a
+  // failed report is a failed report, not a failed research phase.
+  const failedReport = finish(record({ outcome: "completed", phase: "finished", report: "failed" }), reporting);
+  assert.deepEqual(failedReport, {
+    status: "applied", facts: { outcome: "completed", phase: "finished", report: "failed", stopId: null },
+  });
+  // The policy keeps the two facts apart on the publication path too.
+  const stored = status({ outcome: "completed", phase: "finished", process: "spawned-then-terminated", report: "failed" });
+  assert.equal(researchExecutionState(stored, false), "failed");
+  assert.equal(stored.outcome, "completed");
+  // A finished record may not turn a completed research phase into a failure.
+  assert.deepEqual(finish(record({ outcome: "failed", phase: "finished", report: "failed" }), reporting),
+    { status: "refused", code: "RESEARCH_RECORD_TRANSITION_INVALID" });
+  assert.deepEqual(finish(record({ outcome: "stopped", phase: "finished", report: "incomplete" }), reporting,
+    { stopId: null, stopRequested: true }),
+    { status: "refused", code: "RESEARCH_RECORD_TRANSITION_INVALID" });
+  // Nor may a stopped or failed research phase be upgraded to a completion.
+  const stopped = { outcome: "stopped", phase: "reporting", report: "generating", stopId: null } as const;
+  assert.deepEqual(finish(record({ outcome: "completed", phase: "finished", report: "ready" }), stopped),
+    { status: "refused", code: "RESEARCH_RECORD_TRANSITION_INVALID" });
+  const failed = { outcome: "failed", phase: "reporting", report: "generating", stopId: null } as const;
+  assert.deepEqual(finish(record({ outcome: "completed", phase: "finished", report: "ready" }), failed),
+    { status: "refused", code: "RESEARCH_RECORD_TRANSITION_INVALID" });
+  // A research phase still running has stated no outcome yet, so its reporting
+  // record may determine the terminal one normally.
+  const running = { outcome: "unknown", phase: "research", report: "none", stopId: null } as const;
+  assert.equal(finish(record({ outcome: "completed", phase: "reporting", report: "generating" }), running).status,
+    "applied");
+  // Re-reading an identical finished record is still not a conflict.
+  const terminal = { outcome: "completed", phase: "finished", report: "ready", stopId: null } as const;
+  assert.deepEqual(finish(record({ outcome: "completed", phase: "finished", report: "ready" }), terminal),
+    { status: "applied", facts: terminal });
+});
+
 test("a process fact never becomes a research result by itself", () => {
   // Nothing ran: a typed refusal is a failure and may publish; a bare
   // `not_started` (a record that never ran) may not.
@@ -607,6 +658,7 @@ test("an unusable record and a late proof can never be published from an earlier
   // The exact shape a valid completion followed by an unreadable record leaves:
   // the business facts were dropped, the refusal is named, nothing publishes.
   for (const refusal of [
+    "RESEARCH_RECORD_MISSING",
     "RESEARCH_RECORD_MALFORMED",
     "RESEARCH_RECORD_OVERSIZE",
     "RESEARCH_RECORD_IDENTITY_MISMATCH",
@@ -1196,6 +1248,78 @@ test("a valid completion followed by an unusable record is never published", asy
     assert.throws(() => manager.submitResearch(researchRequest(`${id}-later`, workspace)),
       (error: unknown) => (error as { code?: string }).code === "EXECUTION_RESOURCE_QUARANTINED", corruption);
   }
+});
+
+test("a terminal record that is gone when the workload exits is not resurrected from an earlier read", async (context) => {
+  const { close, dataDir, workspace } = await scratch(context, "record-missing");
+  const manager = new ExecutionManager(dataDir, undefined, { research: createResearchRunExecutor(wiring(dataDir, {
+    behaviour: "complete", corruptAfter: "missing", honourStop: true,
+  })) });
+  close(async () => { await manager.close(); });
+  const id = "run-record-missing";
+  manager.submitResearch(researchRequest(id, workspace));
+  // The ledger really did hold a valid `completed`/`ready` before the workload
+  // withdrew the record; this is not a run that never reported.
+  await waitFor(() => manager.get(id, owner).research?.outcome === "completed", 20_000);
+  await until(() => ["unknown", "failed", "completed"].includes(manager.get(id, owner).state), 20_000);
+  const stored = manager.get(id, owner);
+  // The final record, not the earlier read, is the evidence the run is judged
+  // by: a record that is not at its name when the process is gone is no record.
+  assert.equal(stored.state, "unknown");
+  assert.equal(stored.research?.phase, "unknown");
+  assert.equal(stored.research?.outcome, "unknown");
+  assert.equal(stored.research?.report, "none");
+  assert.equal(stored.research?.refusal, "RESEARCH_RECORD_MISSING");
+  assert.equal(stored.version, undefined, "nothing is published from a withdrawn record");
+  assert.equal(stored.research?.process, "spawned-then-terminated");
+  assert.equal(stored.boundary?.terminationConfirmed, true);
+  // The fence is retained, so the workspace cannot accept new work.
+  assert.throws(() => manager.submitResearch(researchRequest(`${id}-later`, workspace)),
+    (error: unknown) => (error as { code?: string }).code === "EXECUTION_RESOURCE_QUARANTINED");
+});
+
+test("a workload that never writes a record is unknown, never a completion by default", async (context) => {
+  const { close, dataDir, workspace } = await scratch(context, "record-never");
+  const manager = new ExecutionManager(dataDir, undefined, { research: createResearchRunExecutor(wiring(dataDir, {
+    behaviour: "silent", honourStop: false, lifetimeSeconds: 0,
+  })) });
+  close(async () => { await manager.close(); });
+  const id = "run-record-never";
+  manager.submitResearch(researchRequest(id, workspace));
+  await until(() => ["unknown", "failed", "completed"].includes(manager.get(id, owner).state), 20_000);
+  const stored = manager.get(id, owner);
+  assert.equal(stored.state, "unknown");
+  assert.equal(stored.research?.refusal, "RESEARCH_RECORD_MISSING");
+  assert.equal(stored.research?.outcome, "unknown");
+  assert.equal(stored.research?.phase, "unknown");
+  assert.equal(stored.version, undefined);
+  assert.throws(() => manager.submitResearch(researchRequest(`${id}-later`, workspace)),
+    (error: unknown) => (error as { code?: string }).code === "EXECUTION_RESOURCE_QUARANTINED");
+});
+
+test("a finished record that rewrites the research outcome invalidates the run", async (context) => {
+  const { close, dataDir, workspace } = await scratch(context, "record-conflict");
+  const manager = new ExecutionManager(dataDir, undefined, { research: createResearchRunExecutor(wiring(dataDir, {
+    behaviour: "conflict", honourStop: false,
+  })) });
+  close(async () => { await manager.close(); });
+  const id = "run-record-conflict";
+  manager.submitResearch(researchRequest(id, workspace));
+  // The reporting record (research completed) really was read before the
+  // conflicting finished record arrived.
+  await waitFor(() => manager.get(id, owner).research?.outcome === "completed", 20_000);
+  await until(() => ["unknown", "failed", "completed"].includes(manager.get(id, owner).state), 20_000);
+  const stored = manager.get(id, owner);
+  // A later phase may add the report fact; it may not turn `completed` into
+  // `failed`. The conflict is not resolved by keeping either value.
+  assert.equal(stored.state, "unknown");
+  assert.equal(stored.research?.refusal, "RESEARCH_RECORD_TRANSITION_INVALID");
+  assert.equal(stored.research?.outcome, "unknown");
+  assert.equal(stored.research?.phase, "unknown");
+  assert.equal(stored.version, undefined);
+  assert.equal(stored.research?.process, "spawned-then-terminated");
+  assert.throws(() => manager.submitResearch(researchRequest(`${id}-later`, workspace)),
+    (error: unknown) => (error as { code?: string }).code === "EXECUTION_RESOURCE_QUARANTINED");
 });
 
 test("a FIFO placed on the live record stops the operation instead of parking it", async (context) => {

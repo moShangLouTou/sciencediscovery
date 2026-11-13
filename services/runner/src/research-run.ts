@@ -120,6 +120,7 @@ const REFUSAL_MESSAGES: Readonly<Record<ResearchRefusalCode, string>> = {
   RESEARCH_CONTROL_OPEN_FAILED: "The research control channel could not be opened",
   RESEARCH_CONTROL_REPLACED: "The research control channel was replaced by another file",
   RESEARCH_CONTROL_WRITE_FAILED: "The research stop request could not be written safely",
+  RESEARCH_RECORD_MISSING: "The research workload's final record is not at its name after the process ended",
   RESEARCH_RECORD_OVERSIZE: "The research workload record exceeds its fixed size bound",
   RESEARCH_RECORD_MALFORMED: "The research workload record is not valid fixed-vocabulary JSON",
   RESEARCH_RECORD_VERSION_UNKNOWN: "The research workload record names an unknown protocol version",
@@ -420,7 +421,8 @@ const PHASE_RANK = { finished: 2, reporting: 1, research: 0 } as const satisfies
  * Identity is checked first: a record naming a stop this run did not persist is
  * another attempt's record, not evidence. The phase only moves forward, a
  * terminal record is final (terminal → non-terminal and terminal → a different
- * terminal are both refused), and a stop outcome requires the stop this run
+ * terminal are both refused), a research outcome already stated is never
+ * rewritten by a later phase, and a stop outcome requires the stop this run
  * actually persisted. Anything else is a named refusal, never a silent repair.
  */
 export function nextResearchRecordState(
@@ -458,8 +460,13 @@ export function nextResearchRecordState(
     return same ? { status: "applied", facts: current }
       : { status: "refused", code: "RESEARCH_RECORD_TRANSITION_INVALID" };
   }
-  if (record.phase === "reporting" && current.phase === "reporting"
-    && current.outcome !== "unknown" && record.outcome !== current.outcome) {
+  // The research outcome, once stated, is the run's research fact for the rest
+  // of the run. A later phase may add how reporting ended (`completed` with a
+  // failed report stays `completed` + `failed`), but it may never rewrite what
+  // the research phase already did: a finished record does not turn a
+  // completed research phase into a failure, and a stopped or failed research
+  // phase is not upgraded to a completion.
+  if (current.outcome !== "unknown" && record.outcome !== null && record.outcome !== current.outcome) {
     return { status: "refused", code: "RESEARCH_RECORD_TRANSITION_INVALID" };
   }
   // A stated report only moves forward: `generating` may become a terminal
@@ -697,6 +704,7 @@ export function createResearchRunExecutor(wiring: ResearchRunWiring): ResearchRu
 /** Refusals that mean the business evidence itself is unusable. */
 const RECORD_INTEGRITY_REFUSALS: ReadonlySet<ResearchRefusalCode> = new Set([
   "RESEARCH_CONTROL_REPLACED",
+  "RESEARCH_RECORD_MISSING",
   "RESEARCH_RECORD_OVERSIZE",
   "RESEARCH_RECORD_MALFORMED",
   "RESEARCH_RECORD_VERSION_UNKNOWN",
@@ -1336,6 +1344,14 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
   const finalRecord = await channel.read(RECORD_FILE);
   if (finalRecord.status === "text") recordState(finalRecord.text);
   else if (finalRecord.status === "refused") invalidate(finalRecord.code);
+  else {
+    // The record the run is judged by must still be at its name once the
+    // process is gone. An earlier read is not a receipt for a withdrawn one:
+    // there is no immutable terminal acknowledgement in this protocol, so a
+    // missing final record leaves no business evidence at all. Waiting for the
+    // name to appear during the run is normal; its absence at exit is not.
+    invalidate("RESEARCH_RECORD_MISSING");
+  }
 
   if (!spawned) {
     // No process was created. Only here may the run be described as
