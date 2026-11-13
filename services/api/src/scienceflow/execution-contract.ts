@@ -41,6 +41,7 @@ import type {
   ScienceFlowExecutionBlockerCode,
   ScienceFlowExecutionPlanContractDto,
   ScienceFlowExecutionBudgetDto,
+  ScienceFlowInputFileRole,
   ScienceFlowPlanBlockerDto,
   ScienceFlowPlanCheckCode,
   ScienceFlowPlanCheckDto,
@@ -63,16 +64,43 @@ export const SCIENCE_FLOW_EXECUTION_MAX_ALIASES = 100;
 
 /** Result of one extraction attempt. */
 export type ScienceFlowContractBuildResult =
-  /** The contract is complete and every structural check passed or is `unknown`. */
+  /**
+   * The contract is complete and every structural check passed or is
+   * `unknown`. `files` are the private bytes the contract was computed from:
+   * the same `Buffer` that produced each role's digest, never a re-read.
+   */
   | {
       readonly status: "ok";
       readonly contract: ScienceFlowExecutionPlanContractDto;
       readonly checks: readonly ScienceFlowPlanCheckDto[];
+      readonly files: readonly ScienceFlowContractFile[];
     }
   /** The source files are missing, malformed, or use an unsupported form. */
   | { readonly status: "rejected"; readonly checks: readonly ScienceFlowPlanCheckDto[] }
   /** An I/O failure prevented a verdict; it is never reported as a blocked check. */
   | { readonly status: "internal" };
+
+/**
+ * One contract role and the exact bytes it was computed from. This is server
+ * state: the bytes never enter a plan DTO, a stored contract, or a response.
+ */
+export interface ScienceFlowContractFile {
+  readonly role: ScienceFlowInputFileRole;
+  /** Logical bundle-relative label; never a host path. */
+  readonly path: string;
+  readonly bytes: Buffer;
+  readonly sha256: string;
+}
+
+/**
+ * Logical bundle labels for files whose host location is not the package tree.
+ * Package files are labelled `package/<contract-relative path>` below.
+ */
+export const SCIENCE_FLOW_INPUT_LOGICAL_PATHS = Object.freeze({
+  manifest: "manifest.yaml",
+  taskYaml: "package/task.yaml",
+  sharedDefaults: "package/_shared/task_defaults.yaml",
+});
 
 /** Injectable so a test can pause the check while a Session changes underneath. */
 export type ScienceFlowContractBuilder = (
@@ -836,6 +864,8 @@ interface TaskFacts {
   readonly descriptionSha256: string;
   readonly taskYamlSha256: string;
   readonly sharedDefaultsSha256: string | null;
+  /** The package-tree bytes this contract came from, in read order. */
+  readonly files: readonly ScienceFlowContractFile[];
 }
 
 const TASK_DEPENDENT_CHECKS = [
@@ -857,6 +887,9 @@ function evaluateTaskPackage(
   expId: string,
   checks: CheckCollector,
 ): TaskFacts | undefined {
+  // Bound to the exact read that produced each digest, so preparation can send
+  // the verified bytes instead of re-reading a file that may have moved on.
+  const files: ScienceFlowContractFile[] = [];
   // Registered as `unknown` and settled at the end of a complete evaluation: a
   // check that an earlier rejection skipped must not read as "passed".
   for (const code of TASK_DEPENDENT_CHECKS) {
@@ -912,6 +945,12 @@ function evaluateTaskPackage(
     return undefined;
   }
   checks.add("task_yaml_yaml");
+  files.push({
+    role: "task_yaml",
+    path: SCIENCE_FLOW_INPUT_LOGICAL_PATHS.taskYaml,
+    bytes: taskYamlRead.bytes,
+    sha256: taskYamlRead.sha256,
+  });
 
   // The engine merges `<category>/_shared/task_defaults.yaml` beneath the task
   // file. Only that fixed sibling path is supported; no other include.
@@ -946,6 +985,12 @@ function evaluateTaskPackage(
     checks.add("shared_defaults");
     sharedDefaults = sharedParsed.value;
     sharedDefaultsSha256 = sharedRead.sha256;
+    files.push({
+      role: "shared_task_defaults",
+      path: SCIENCE_FLOW_INPUT_LOGICAL_PATHS.sharedDefaults,
+      bytes: sharedRead.bytes,
+      sha256: sharedRead.sha256,
+    });
   }
 
   const merged = mergeTaskPackageDefaults(
@@ -1082,6 +1127,12 @@ function evaluateTaskPackage(
     return undefined;
   }
   checks.add("evaluator_file");
+  files.push({
+    role: "evaluator",
+    path: `package/${normalizedEntrypoint.relativePath}`,
+    bytes: entrypointRead.bytes,
+    sha256: entrypointRead.sha256,
+  });
 
   const descriptionFile = resolveFile(
     resolve(packageRoot, normalizedDescription.relativePath),
@@ -1106,6 +1157,12 @@ function evaluateTaskPackage(
     return undefined;
   }
   checks.add("description_file");
+  files.push({
+    role: "description",
+    path: `package/${normalizedDescription.relativePath}`,
+    bytes: descriptionRead.bytes,
+    sha256: descriptionRead.sha256,
+  });
 
   // Every dependent check was reached; only the ones still `unknown` passed.
   for (const code of TASK_DEPENDENT_CHECKS) {
@@ -1132,6 +1189,7 @@ function evaluateTaskPackage(
     descriptionSha256: descriptionRead.sha256,
     taskYamlSha256: taskYamlRead.sha256,
     sharedDefaultsSha256,
+    files,
   };
 }
 
@@ -1314,7 +1372,20 @@ function evaluateProfile(
     },
   };
 
-  return { status: "ok", contract, checks: checks.list() };
+  return {
+    status: "ok",
+    contract,
+    checks: checks.list(),
+    files: [
+      {
+        role: "manifest",
+        path: SCIENCE_FLOW_INPUT_LOGICAL_PATHS.manifest,
+        bytes: manifestRead.bytes,
+        sha256: manifestRead.sha256,
+      },
+      ...taskFacts.files,
+    ],
+  };
 }
 
 // --- small helpers ---------------------------------------------------------

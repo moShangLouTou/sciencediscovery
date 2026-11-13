@@ -347,6 +347,7 @@ import { handleScienceFlowRunSnapshotRequest } from "../scienceflow/http.js";
 import { handleScienceFlowRegistrationRequest } from "../scienceflow/registration-http.js";
 import { handleScienceFlowExecutionPlanRequest } from "../scienceflow/execution-plan-http.js";
 import { handleScienceFlowRuntimeCheckRequest } from "../scienceflow/runtime-check-http.js";
+import { handleScienceFlowPreparedInputsRequest } from "../scienceflow/prepared-inputs-http.js";
 import {
   createPlatformServices,
   initializePlatformServices,
@@ -444,6 +445,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
     remoteCompute,
     runnerClient,
     scienceFlowExecutionPlans,
+    scienceFlowPreparedInputs,
     scienceFlowRegistrations,
     scienceFlowRunSnapshot,
     scienceFlowRuntimeChecks,
@@ -1121,6 +1123,9 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       // Immutable execution plans: a frozen contract, a static preflight, and
       // stored metadata. Nothing here starts ScienceFlow or authorizes a start.
       if (await handleScienceFlowExecutionPlanRequest(request, response, url, scienceFlowExecutionPlans)) return;
+      // Explicit input preparation: the selected Runner verifies and holds the
+      // plan's enumerated file bytes. This records evidence, not a start.
+      if (await handleScienceFlowPreparedInputsRequest(request, response, url, scienceFlowPreparedInputs)) return;
       // Explicit runtime identity check: one plan, one administrator binding,
       // one Runner probe. Never starts ScienceFlow and never a start gate.
       if (await handleScienceFlowRuntimeCheckRequest(request, response, url, scienceFlowRuntimeChecks)) return;

@@ -43,6 +43,7 @@ import { ConfigurationCredentialBridge } from "./configuration/credential-bridge
 import { ScienceFlowRegistrationRepository } from "./scienceflow/registration-repository.js";
 import { ScienceFlowExecutionPlanRepository } from "./scienceflow/execution-plan-repository.js";
 import { ScienceFlowRuntimeCheckRepository } from "./scienceflow/runtime-check-repository.js";
+import { ScienceFlowPreparedInputsRepository } from "./scienceflow/prepared-inputs-repository.js";
 import { configurationDecisionReady } from "./configuration/interaction-wait.js";
 import { nativeConfigurationChoiceRecord, nativeRunOverlay } from "./configuration/native-choices.js";
 
@@ -639,6 +640,7 @@ export class SessionStore {
   private scienceFlowRegistrationStore?: ScienceFlowRegistrationRepository;
   private scienceFlowExecutionPlanStore?: ScienceFlowExecutionPlanRepository;
   private scienceFlowRuntimeCheckStore?: ScienceFlowRuntimeCheckRepository;
+  private scienceFlowPreparedInputsStore?: ScienceFlowPreparedInputsRepository;
   private loaded = false;
   private saveQueue = Promise.resolve();
   /** Physical reclamation outlives the request that asked for it; deletes queue
@@ -713,6 +715,11 @@ export class SessionStore {
   get scienceFlowRuntimeChecks(): ScienceFlowRuntimeCheckRepository {
     if (!this.scienceFlowRuntimeCheckStore) throw new Error("ScienceFlow runtime check storage is not initialized");
     return this.scienceFlowRuntimeCheckStore;
+  }
+
+  get scienceFlowPreparedInputs(): ScienceFlowPreparedInputsRepository {
+    if (!this.scienceFlowPreparedInputsStore) throw new Error("ScienceFlow prepared input storage is not initialized");
+    return this.scienceFlowPreparedInputsStore;
   }
 
   get transfers(): WorkspaceTransfers {
@@ -875,6 +882,7 @@ export class SessionStore {
     this.scienceFlowRegistrationStore = new ScienceFlowRegistrationRepository(this.database);
     this.scienceFlowExecutionPlanStore = new ScienceFlowExecutionPlanRepository(this.database);
     this.scienceFlowRuntimeCheckStore = new ScienceFlowRuntimeCheckRepository(this.database);
+    this.scienceFlowPreparedInputsStore = new ScienceFlowPreparedInputsRepository(this.database);
     this.secretKey = await this.loadOrCreateSecretKey();
     this.migrateRemoteHostTokens();
     const modelIdsWithSecrets = new Set((this.database.prepare("SELECT model_id FROM model_secrets").all() as Array<{ model_id: string }>).map((row) => row.model_id));
@@ -1600,6 +1608,7 @@ export class SessionStore {
     if (exists("science_flow_run_registrations")) this.scienceFlowRegistrationStore?.deleteSession(sessionId);
     if (exists("science_flow_execution_plans")) this.scienceFlowExecutionPlanStore?.deleteSession(sessionId);
     if (exists("science_flow_runtime_checks")) this.scienceFlowRuntimeCheckStore?.deleteSession(sessionId);
+    if (exists("science_flow_prepared_inputs")) this.scienceFlowPreparedInputsStore?.deleteSession(sessionId);
   }
 
 
@@ -6218,6 +6227,7 @@ export class SessionStore {
     this.scienceFlowRegistrationStore?.deleteProject(projectId);
     this.scienceFlowExecutionPlanStore?.deleteProject(projectId);
     this.scienceFlowRuntimeCheckStore?.deleteProject(projectId);
+    this.scienceFlowPreparedInputsStore?.deleteProject(projectId);
     for (const session of sessions) {
       this.database?.prepare("DELETE FROM specialist_runtime_secrets WHERE session_id IN (?, ?, ?)").run(session.id, `claude-code:${session.id}`, `acp:${session.id}`);
       this.database?.prepare("DELETE FROM connector_configuration_requests WHERE session_id = ?").run(session.id);

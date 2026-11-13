@@ -17,6 +17,7 @@ const { test } = createTest(import.meta.url, {
   tags: ["category:ut", "os:linux", "arch:amd64", "arch:arm64"],
 });
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -609,3 +610,60 @@ test("CRT-31 a non-string workspace form is unsupported, not coerced", async (co
 function withDefaultsWorkspace(value: string): string {
   return MANIFEST.replace("  workspace_base: workspace-base\n", `  workspace_base: ${value}\n`);
 }
+
+test("CRT-32 a built contract carries the exact bytes behind each digest", async (context) => {
+  const test = await fixture(context);
+  const result = await build(test);
+  if (result.status !== "ok") assert.fail(`expected ok, got ${result.status}`);
+
+  assert.deepEqual(
+    result.files.map((file) => file.role),
+    ["manifest", "task_yaml", "shared_task_defaults", "evaluator", "description"],
+  );
+  assert.deepEqual(
+    result.files.map((file) => file.path),
+    [
+      "manifest.yaml",
+      "package/task.yaml",
+      "package/_shared/task_defaults.yaml",
+      "package/evaluate.py",
+      "package/description.md",
+    ],
+  );
+  const expected: Readonly<Record<string, string>> = {
+    manifest: result.contract.manifestSha256,
+    task_yaml: result.contract.taskYamlSha256,
+    shared_task_defaults: result.contract.sharedDefaultsSha256 ?? "",
+    evaluator: result.contract.evaluator.sha256,
+    description: result.contract.description.sha256,
+  };
+  for (const file of result.files) {
+    // Each digest came from this buffer, never from a later re-read.
+    assert.equal(file.sha256, expected[file.role], file.role);
+    assert.equal(
+      file.sha256,
+      createHash("sha256").update(file.bytes).digest("hex"),
+      file.role,
+    );
+    assert.equal(file.bytes.length > 0, true, file.role);
+  }
+  assert.equal(
+    result.files.find((file) => file.role === "manifest")?.bytes.toString("utf8"),
+    MANIFEST,
+  );
+  assert.equal(
+    result.files.find((file) => file.role === "evaluator")?.bytes.toString("utf8"),
+    EVALUATOR,
+  );
+});
+
+test("CRT-33 without shared defaults the file set has no shared role", async (context) => {
+  const test = await fixture(context, { shared: null });
+  const result = await build(test);
+  if (result.status !== "ok") assert.fail(`expected ok, got ${result.status}`);
+  assert.equal(result.contract.sharedDefaultsSha256, null);
+  assert.deepEqual(
+    result.files.map((file) => file.role),
+    ["manifest", "task_yaml", "evaluator", "description"],
+  );
+});

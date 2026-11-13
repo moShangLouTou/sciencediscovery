@@ -234,6 +234,7 @@ function harness(options: HarnessOptions = {}): Harness {
       status: "ok" as const,
       contract: contract(),
       checks: [check("manifest_readable")],
+      files: [],
     };
   });
 
@@ -464,6 +465,7 @@ test("PLAN-P02 changed source files report contract_changed without rewriting th
       status: "ok" as const,
       contract: current,
       checks: [check("manifest_readable")],
+      files: [],
     }),
   });
   const created = await test.service.create(IDENTITY, INPUT);
@@ -496,6 +498,7 @@ test("PLAN-P03 unreadable files produce a blocked preflight, not a 500", async (
             status: "ok" as const,
             contract: contract(),
             checks: [check("manifest_readable")],
+            files: [],
           }
         : {
             status: "rejected" as const,
@@ -521,7 +524,7 @@ test("PLAN-P04 an internal preflight failure persists nothing", async () => {
     build: async () => {
       calls += 1;
       return calls === 1
-        ? { status: "ok" as const, contract: contract(), checks: [check("manifest_readable")] }
+        ? { status: "ok" as const, contract: contract(), checks: [check("manifest_readable")], files: [] }
         : { status: "internal" as const };
     },
   });
@@ -560,6 +563,7 @@ test("PLAN-P06 a concurrent preflight that loses the revision race keeps the win
         status: "ok" as const,
         contract: contract(),
         checks: [check("manifest_readable")],
+        files: [],
       };
     },
   });
@@ -634,6 +638,7 @@ test("PLAN-P08 preflight requires the write gate and re-checks it after the awai
         status: "ok" as const,
         contract: contract(),
         checks: [check("manifest_readable")],
+        files: [],
       };
     },
   });

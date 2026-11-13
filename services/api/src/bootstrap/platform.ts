@@ -77,6 +77,10 @@ import {
   createScienceFlowRuntimeCheckService,
   type ScienceFlowRuntimeCheckService,
 } from "../scienceflow/runtime-check.js";
+import {
+  createScienceFlowPrepareInputsService,
+  type ScienceFlowPrepareInputsService,
+} from "../scienceflow/prepared-inputs.js";
 import { createScienceFlowContractBuilder } from "../scienceflow/execution-contract.js";
 
 export interface ApiServerDependencies {
@@ -637,6 +641,34 @@ export function createPlatformServices(
         runnerId === "local" ? runnerClient : remoteCompute.runnerClient(runnerId),
     });
 
+  // Input preparation is the next explicit control-plane step after a plan is
+  // frozen: the selected Runner verifies and holds exactly the enumerated file
+  // bytes. It shares the same trusted profile/binding table and the same gate
+  // helper as the runtime identity check, and never starts the engine.
+  const scienceFlowPreparedInputs: ScienceFlowPrepareInputsService =
+    createScienceFlowPrepareInputsService({
+      identities: {
+        getProject: (projectId) => store.getProject(projectId),
+        getSession: (sessionId) => store.getSession(sessionId),
+      },
+      requireWritable: (sessionId) => store.assertSessionWritable(sessionId),
+      runnerAllowed: (sessionId, runnerId) => {
+        try {
+          store.assertSessionAllowsRunner(sessionId, runnerId);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      profiles: config.scienceFlowExecution,
+      runtime: config.scienceFlowRuntime,
+      plans: () => store.scienceFlowExecutionPlans,
+      store: () => store.scienceFlowPreparedInputs,
+      buildContract: createScienceFlowContractBuilder(),
+      runnerFor: (runnerId) =>
+        runnerId === "local" ? runnerClient : remoteCompute.runnerClient(runnerId),
+    });
+
   return {
     connectorPlugins,
     artifactManager,
@@ -664,6 +696,7 @@ export function createPlatformServices(
     remoteCompute,
     runnerClient,
     scienceFlowExecutionPlans,
+    scienceFlowPreparedInputs,
     scienceFlowRegistrations,
     scienceFlowRunSnapshot,
     scienceFlowRuntimeChecks,
