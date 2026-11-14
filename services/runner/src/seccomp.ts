@@ -27,6 +27,19 @@ const SECCOMP_RET_KILL_PROCESS = 0x80000000;
 export const SECCOMP_BASELINE_VERSION = "multiarch-v1-profile-aware";
 /** Variant used when the Permission Epoch grants `domain-allowlist` network access. */
 export const SECCOMP_NETWORK_VERSION = "multiarch-v1-egress-gateway";
+/**
+ * Variant for the research workload: the baseline filter plus one syscall,
+ * `socketpair`, and only for `AF_UNIX`.
+ *
+ * A real `asyncio` event loop creates its self-pipe with `socket.socketpair()`,
+ * which the baseline refuses like every other socket-family call. The research
+ * workload needs that local primitive and nothing more, so the filter allows
+ * exactly that syscall, checked against its first argument: `AF_INET` and
+ * `AF_INET6` socketpairs, `socket()`, `connect()`, `bind()`, `listen()` and
+ * `accept4()` stay refused. The network variant is not used, the network
+ * namespace is still unshared, and no egress bridge is bound.
+ */
+export const SECCOMP_RESEARCH_VERSION = "multiarch-v1-research-local";
 
 /**
  * Socket-family syscalls. The baseline denies them outright (`networkPolicy`
@@ -94,12 +107,28 @@ function seccompProfile(architecture: string) {
  * `network` allows socket-family syscalls for the audited egress bridge.
  * `npu` allows the same calls for CANN/TE Python-module initialization, but the
  * sandbox keeps its private network namespace and receives no egress bridge.
+ * `research` allows `socketpair` for `AF_UNIX` only; see `SECCOMP_RESEARCH_VERSION`.
  */
-export type SeccompVariant = "baseline" | "network" | "npu";
+export type SeccompVariant = "baseline" | "network" | "npu" | "research";
+
+/**
+ * The one syscall the research variant restores, per architecture, and the
+ * only domain it may be used with. The argument is `args[0]`, i.e. the word at
+ * offset 16 of `struct seccomp_data`.
+ */
+const RESEARCH_LOCAL_SOCKETPAIR = { arm64: 199, x64: 53 } as const;
+const AUDIT_AF_UNIX = 1;
+const SEE_DATA_ARG0 = 16;
 
 function deniedSyscalls(architecture: string, variant: SeccompVariant): readonly number[] {
   const profile = seccompProfile(architecture);
   if (variant === "baseline") return profile.deniedSyscalls;
+  if (variant === "research") {
+    // The research filter is the baseline minus exactly one syscall. It must
+    // never take the network list: that would open the whole socket family.
+    const local = RESEARCH_LOCAL_SOCKETPAIR[architecture as SupportedSeccompArchitecture];
+    return profile.deniedSyscalls.filter((syscall) => syscall !== local);
+  }
   const allowed = new Set<number>(NETWORK_SYSCALLS[architecture as SupportedSeccompArchitecture]);
   return profile.deniedSyscalls.filter((syscall) => !allowed.has(syscall));
 }
@@ -115,6 +144,20 @@ export function baselineSeccompFilter(
     instruction(BPF_RET_K, 0, 0, SECCOMP_RET_KILL_PROCESS),
     instruction(BPF_LD_W_ABS, 0, 0, 0),
   ];
+  if (variant === "research") {
+    // Allow `socketpair` and nothing else in the socket family, and only when
+    // its domain argument is `AF_UNIX`. The four-instruction block is skipped
+    // wholesale for every other syscall, so the argument load only runs for
+    // the one syscall it describes. A non-`AF_UNIX` domain falls through to
+    // the same `EPERM` the baseline always returned.
+    instructions.push(
+      instruction(BPF_JMP_JEQ_K, 0, 4, RESEARCH_LOCAL_SOCKETPAIR[architecture as SupportedSeccompArchitecture]),
+      instruction(BPF_LD_W_ABS, 0, 0, SEE_DATA_ARG0),
+      instruction(BPF_JMP_JEQ_K, 0, 1, AUDIT_AF_UNIX),
+      instruction(BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW),
+      instruction(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO_EPERM),
+    );
+  }
   for (const syscall of deniedSyscalls(architecture, variant)) {
     instructions.push(
       instruction(BPF_JMP_JEQ_K, 0, 1, syscall),
