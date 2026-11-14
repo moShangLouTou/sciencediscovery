@@ -525,14 +525,14 @@ Exactly one new seccomp variant, Runner-selected for this workload kind:
   existing `research` variant; it defines a stricter variant for this workload.
 - **What a permitted pair can do, exactly.** Both ends are created by the
   caller and are already connected to each other, in the same process tree.
-  Linux refuses to re-target such an endpoint: `connect()` to a different
-  address fails (`EISCONN`/`EINVAL`), `sendto`/`sendmsg` with an explicit
-  destination on a connected `SOCK_STREAM` Unix socket fails
-  (`EISCONN`/`EOPNOTSUPP`), and `bind`/`listen` on it fail (`EINVAL`). A
-  `SOCK_DGRAM` pair — the only pair type for which an addressed `sendto` is
-  meaningful — is refused by the type check. `SCM_RIGHTS` needs a receiving
-  socket the workload can name, and it has none. The only peer a permitted pair
-  can reach is its own other end.
+  The required property is that no permitted endpoint can be re-targeted to a
+  host service. G15 measures `connect`, `bind`/`listen`, addressed
+  `sendto`/`sendmsg`, and descriptor-passing routes rather than assuming an
+  errno. An addressed operation may fail or communicate only with the original
+  peer; neither outcome may deliver data or descriptors to a host service.
+  Datagram pairs are refused by the type check. Normal stream-pair self-IPC
+  must continue to work, because the engine's asyncio loop needs it. This is a
+  conditional isolation argument until those routes have been measured.
 - **`AF_UNIX` stays denied for `socket()`.** A process cannot create *a socket
   that can name a filesystem or abstract Unix peer* without `socket(AF_UNIX)`,
   so that denial holds no matter what appears in `/workspace`,
@@ -544,8 +544,8 @@ Exactly one new seccomp variant, Runner-selected for this workload kind:
   separately because they fail differently: the capability is a namespace
   attribute that a future launch option could widen, whereas the type test is
   in the filter.
-- **This argument is code-derived, not measured.** The errno behaviour above is
-  the Linux contract, but this round ran no sandbox attack. G15 now tries the
+- **This argument is conditional, not measured.** This round ran no sandbox
+  attack. G15 tests host reachability rather than assuming errno behaviour for the
   pair routes against a live host service. If any route reaches a host
   endpoint, the no-bypass claim stays **blocked** and the variant is not
   accepted; the design does not fall back to "the service was not running".
@@ -572,7 +572,7 @@ Attack surface added, stated plainly:
 | Workload can talk to the gateway directly over loopback | It speaks chat-completions to the same gateway | Metering and attribution are unchanged; the forwarder is transport, not the enforcement point |
 | A second interpreter + stdlib mounted for the forwarder | A read-only interpreter the workload did not have | [code] already mounted on the audited egress path (`egress-bridge.ts:235-242`); no writable path is added |
 | The tunnel descriptor is live in the sandbox during the run | With fd 4 a workload could write frames itself | It reaches the same gateway with the same token requirement; the forwarder marks fd 4 non-inheritable in its child, and G24 asserts the workload sees `EBADF` |
-| Workload may create `AF_UNIX`/`SOCK_STREAM` socketpairs | Self-IPC only, as `asyncio` needs | The pair is already connected to itself and cannot be re-targeted or addressed; datagram/raw pairs are refused by the type mask (§3.4) |
+| Workload may create `AF_UNIX`/`SOCK_STREAM` socketpairs | Required guarantee: self-IPC only, as `asyncio` needs | Datagram/raw pairs are refused by the type mask; G15 must establish that every permitted pair route stays confined to its original peer (§3.4) |
 
 The primitives that do **not** exist and must not be claimed: seccomp cannot
 filter `connect()` by destination address (its argument is a pointer), and the
@@ -736,9 +736,12 @@ entry, R never runs.
    `research/onboarding/support/preparation/validation.py:46-47`); their argv
    is not built by `child_cli_argv`. They inherit `PYTHONPATH` but not `-P`, so
    a script run from `/workspace` still imports its siblings as it does today.
-   If such a subprocess imports `scienceflow`, it gets `/scienceflow-engine`
-   first, because `PYTHONPATH` order decides once `cwd` is not prepended; it
-   cannot replace the entry used to start the worker.
+   Such a subprocess may resolve its own `scienceflow` package from its script
+   directory or `cwd`; its code is untrusted research code. The verified source
+   guarantee applies to the engine's prep/task/report entry processes launched
+   with `-P`, not to arbitrary research programs. Those programs cannot change
+   which package was used to enter the already-running engine worker, and they
+   remain subject to the same egress and gateway authorization boundaries.
 5. **The checkout's `.venv` is masked.** `resolve_project_python()` would
    otherwise return `/scienceflow-engine/.venv/bin/python` when the host
    checkout has one (`SF` `runtime/environment.py:27-54`). An empty tmpfs over
@@ -756,7 +759,7 @@ entry is dangling and contributes nothing):
 | supervisor (bridge) | leased/fixture interpreter, `-I -B -` | `['/scienceflow-engine', …]` | explicit `sys.path.insert`, unchanged |
 | prep / research task | `resolve_project_python()`, `-P -m …` | `['/scienceflow-engine', …, <lease site-packages>, <dangling .pth line>]` — no `cwd` | `PYTHONPATH`, first |
 | reporting child | `sys.executable`, `-P -m scienceflow.runtime.parallel.control.reporting` | the same list as the task child | `PYTHONPATH`, first |
-| research shell subprocess | whatever the workload runs | its own; `cwd`/script directory as today | `PYTHONPATH`, first if it imports |
+| research shell subprocess | whatever the workload runs | its own; `cwd`/script directory as today | not source-verified; script directory or `cwd` may win over `PYTHONPATH` |
 
 **The probe's own facts.** R is a separate supervised launch with its own
 boundary capture, like the R11 probes (`SD` `scienceflow-runtime-check.ts:443-554`);
@@ -1351,8 +1354,10 @@ The gateway has no write path to `research_status`; the mapping of
   `unknown` with every fence held — the model ledger adds no new release path.
 - A refused gateway start (missing config, the tunnel descriptor not delivered,
   the source probe failing, ledger unavailable, relay unsupported) refuses
-  **the start**, before spawn, with a fixed code. There is no "run without
-  metering" mode.
+  **research startup** with a fixed code. Configuration failures detected before
+  any launch have no process; failures detected in a probe or forwarder retain
+  the actual process evidence and require termination proof (§3.6, G20).
+  There is no "run without metering" mode.
   The persisted refusal vocabulary is closed (`RESEARCH_REFUSAL_CODES`, `SD`
   `packages/schema/src/research-run.ts:179-209`), so this slice does **not**
   extend it: these conditions are reported through the existing
@@ -1461,12 +1466,12 @@ runtime, never literals.
 | G12 | Real task child connects to a host LAN address | Bypass attempt | `ENETUNREACH`; the gateway ledger is unchanged |
 | G13 | Real task child resolves a hostname | Bypass attempt | Resolution fails; no request leaves the namespace |
 | G14 | Real task child calls `socket()` with `AF_UNIX`, `AF_INET6`, `AF_NETLINK`, `AF_PACKET`, `SOCK_RAW`, `SOCK_DGRAM`, and `socketpair()` with `AF_UNIX`/`SOCK_DGRAM`, `AF_UNIX`/`SOCK_RAW`, `AF_INET`/`SOCK_STREAM` | Bypass attempt | `EPERM` for each; only `socket(AF_INET, SOCK_STREAM)` and `socketpair(AF_UNIX, SOCK_STREAM, 0)` succeed |
-| G15 | **Live host IPC services** under the mounted `/workspace` at launch time — a stream listener on a filesystem path, a stream listener on an abstract name, and a **datagram** listener on a filesystem path; a second socket appears during the run | Real task child tries every route: plain `socket(AF_UNIX)`, `socketpair(AF_UNIX, SOCK_DGRAM)`, `sendto`/`sendmsg` with an address from a permitted stream pair, and a connect to the socket created mid-run | Each fails at creation or at the addressed operation (`EPERM`, or `EISCONN`/`EOPNOTSUPP` for the pair route); the host services keep answering a host-side probe. If any route reaches a host service, no-bypass **stays blocked** |
+| G15 | **Live host IPC services** under the mounted `/workspace` at launch time — a stream listener on a filesystem path, a stream listener on an abstract name, and a **datagram** listener on a filesystem path; a second socket appears during the run | Real task child tries plain `socket(AF_UNIX)`, datagram socketpairs, and connect/bind/listen, addressed sendto/sendmsg and descriptor passing from a permitted stream pair, including the socket created mid-run | Forbidden creation returns `EPERM`; a permitted pair can communicate only with its original peer. Host services receive no test data or descriptors and continue answering host-side probes. Addressed operations need not share one errno. If any route reaches a host service, no-bypass **stays blocked** |
 | G16 | Real task child calls the gateway with no token / another execution's token | Bypass attempt | 401; no row |
 | G17 | Real report subprocess makes a model call | Attribution | The call is admitted into the same execution's rows; a refusal leaves `report_status` as the engine recorded it and shows only in `model.outcome` |
 | G18 | Real prep/task child clears its environment and hard-codes `127.0.0.1:18119` | Fail-closed | Without the token: 401; with the token: metered. Neither reaches the provider unmetered |
 | G19 | Ledger write fails (injected) | Start a request | 503 `MODEL_GATEWAY_LEDGER_UNAVAILABLE`; nothing forwarded |
-| G20 | Tunnel descriptor not delivered by bwrap | Start the run | Start refused before spawn (`RESEARCH_LAUNCH_FAILED`, fixed reason); no workload, no fallback transport |
+| G20 | Tunnel descriptor not delivered by bwrap | Start the run | Research bootstrap does not start (`RESEARCH_LAUNCH_FAILED`, fixed reason); any probe/forwarder process that did start is recorded and reclaimed, with boundary proof required. No fallback transport and no claim that no process was spawned |
 | G21 | Crash window: kill the Runner between reservation and settlement | Restart, re-read | Row `unknown` with `runner_restart`; no release, no replay |
 | G22 | Run ends normally | Observe | Tunnel closed; `model` evidence present; `outcome = "within"` |
 | G23 | Proof R: the research-layout probe, with a `scienceflow/` package **pre-planted** in `/workspace` | Read the record and compare with the real task child | `find_spec("scienceflow")` origin is `/scienceflow-engine/scienceflow/__init__.py` for the probe **and** the child; `sys.executable`/`sys.prefix` are the expected interpreter; `resolve_project_python()` is the expected value with the `.venv` mask; the pre-planted package does not win |
