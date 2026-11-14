@@ -21,7 +21,7 @@ import {
   type ExecutionObservation,
   type SpawnedExecution,
 } from "./execution-boundary.js";
-import { ResearchRunError, parseResearchRunRequest, researchExecutionState, researchPublishable, researchRefusalMessage, researchRunDeadlines, researchStopId, type ResearchRunExecutor } from "./research-run.js";
+import { ResearchRunError, parseResearchRunRequest, researchExecutionState, researchPublishable, researchRefusalMessage, researchRunDeadlines, researchStopId, verifiedResearchInputs, type ResearchRunExecutor } from "./research-run.js";
 import type { ExecutionLogPage, ExecutionOwner, ManagedExecution, ResearchPhase, ResearchReportOutcome, ResearchRunRequest, ResearchRunStatus, ResearchStopState, ShellExecutionRequest, ShellExecutionResult } from "@sciencediscovery/schema";
 
 export type ExecutionLogSink = (stream: "stdout" | "stderr", chunk: Buffer) => void;
@@ -297,6 +297,13 @@ export class ExecutionManager {
       if (error instanceof ResearchRunError) throw new ExecutionManagerError(error.code, error.message, 400);
       throw error;
     }
+    // Every new execution consumes one prepared bundle. A request without that
+    // identity is refused before the ledger is touched: there is no fallback to
+    // workspace files, and no record is written that could imply one.
+    if (request.inputs === undefined) {
+      throw new ExecutionManagerError("RESEARCH_INPUT_REQUIRED",
+        researchRefusalMessage("RESEARCH_INPUT_REQUIRED"), 400);
+    }
     return this.submitInternal(request, (signal, _log, expectedEnvironmentRevisionId, lifecycle) =>
       executor.run(request, { expectedEnvironmentRevisionId, lifecycle, signal }));
   }
@@ -336,6 +343,9 @@ export class ExecutionManager {
         stop: "none" as const, schedule: researchRequest.schedule,
         forceReclaimRequested: false, deadlineViolated: false,
         verificationWindowMs: researchRequest.schedule.verificationWindowMs, observedAt: acceptedAt,
+        ...(researchRequest.inputs
+          ? { inputs: { ...researchRequest.inputs, state: "declared" as const } }
+          : {}),
       } } : {}),
       ...(shell?.recoveryContext ? { recoveryContext: shell.recoveryContext } : {}),
       receipt: { ...this.identity, revision: 1, requestDigest, acceptedAt } };
@@ -452,6 +462,26 @@ export class ExecutionManager {
           // result. Workload output was never forwarded to the log sink.
           execution.result = returned.result;
           execution.research = returned.research;
+          const reportedInputs = execution.research.inputs;
+          const declaredInputs = researchRequest?.inputs;
+          if (declaredInputs !== undefined && (reportedInputs === undefined
+            || reportedInputs.contractDigest !== declaredInputs.contractDigest
+            || reportedInputs.bundleDigest !== declaredInputs.bundleDigest)) {
+            // The operation never reported evidence for the accepted identity.
+            // Keep the declaration so the run can never be published as having
+            // consumed inputs it did not verify.
+            execution.research = { ...execution.research,
+              inputs: { ...declaredInputs, state: "declared" } };
+          } else if (reportedInputs?.state === "verified"
+            && verifiedResearchInputs(reportedInputs) === null) {
+            // Evidence that does not rebuild to its own bundle digest is not a
+            // verified set, whatever it claims; only the declaration is left.
+            execution.research = { ...execution.research, inputs: {
+              contractDigest: reportedInputs.contractDigest,
+              bundleDigest: reportedInputs.bundleDigest,
+              state: "declared",
+            } };
+          }
           execution.state = researchExecutionState(returned.research, controller.signal.aborted);
           if (returned.research.refusal) execution.error = researchRefusalMessage(returned.research.refusal);
           else if (returned.research.outcome === "failed") {
@@ -517,7 +547,10 @@ export class ExecutionManager {
         execution.state = "unknown";
         delete execution.finishedAt;
         delete execution.result;
-        execution.error = "Research workload ended without a terminal research record; its business state is unknown and its resources stay fenced";
+        execution.error = execution.research?.inputs !== undefined
+          && execution.research.inputs.state !== "verified"
+          ? "Research workload ended without a verified input set for this execution; its business state is unknown and its resources stay fenced"
+          : "Research workload ended without a terminal research record; its business state is unknown and its resources stay fenced";
         this.quarantine(execution);
         this.save(execution);
         await this.releaseResources(execution.id, new ProcessTerminationUnverifiedError(execution.error));
@@ -556,6 +589,12 @@ export class ExecutionManager {
             executionId: execution.id, ...owner, ...(workspace ? { workspace } : {}), code, stdout, stderr,
             environmentRevisionId: execution.result?.environmentRevisionId ?? null,
             state: execution.state,
+            // The published record keeps the exact input identity this
+            // execution verified and consumed, so a later reader can trace the
+            // run to its frozen task version without the private mount or the
+            // operation's in-memory result.
+            ...(execution.research?.inputs?.state === "verified"
+              ? { researchInputs: execution.research.inputs } : {}),
             ...(collected.ref ? { recoveryManifest: collected.ref } : {}),
             ...(shell?.recoveryContext ? { recoveryContext: shell.recoveryContext } : {}),
           });
@@ -807,6 +846,22 @@ export class ExecutionManager {
     const stop = observed?.stop;
     if (stop !== undefined && STOP_RANK[stop] > STOP_RANK[research.stop]) {
       research = { ...research, stop };
+    }
+    const inputs = observed?.inputs;
+    if (inputs !== undefined) {
+      const declared = research.inputs;
+      // A run may only record evidence for the identity it was accepted under,
+      // and a declaration already upgraded to `verified` is never downgraded.
+      if (declared === undefined
+        || declared.contractDigest !== inputs.contractDigest
+        || declared.bundleDigest !== inputs.bundleDigest) {
+        throw new Error("The observed input identity does not match the accepted request");
+      }
+      if (declared.state !== "verified") {
+        const verified = verifiedResearchInputs(inputs);
+        if (verified === null) throw new Error("The observed input evidence is not self-consistent");
+        research = { ...research, inputs: verified };
+      }
     }
     execution.research = research;
     this.save(execution);
@@ -1181,6 +1236,12 @@ export class ExecutionManager {
           execution.research = { ...execution.research,
             ...(stopStronger ? { stop: durableStop } : {}),
             ...(causeMissing ? { stopCause: durableCause } : {}) };
+        }
+        // A verified input set is a durable fact of this instance. A later,
+        // older copy of the record may not replace it with the declaration.
+        const durableInputs = previous.research.inputs;
+        if (durableInputs?.state === "verified" && execution.research.inputs?.state !== "verified") {
+          execution.research = { ...execution.research, inputs: durableInputs };
         }
       }
       if (execution.receipt) {

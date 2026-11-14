@@ -485,8 +485,9 @@ export function createRunnerServer(
   const sandbox = executorSandboxKind(config);
   const skillPackages = new RunnerSkillPackages(config.dataDir);
   // Input evidence bundles are opaque frozen task files addressed by content.
-  // They never become a mount or an execution input; storing them needs no
-  // external configuration, so the capability is always present.
+  // This server only stores and reports them; a fixed internal research
+  // execution (constructed elsewhere) may verify one and materialize its own
+  // read-only copy. There is still no research start route here.
   const inputBundles = new RunnerScienceFlowInputBundles(config.dataDir);
   const logger = createOperationalLogger({ category: "runner", dataDir: config.dataDir, service: "runner" });
   const profiles = envProfiles ?? new SessionEnvProfileStore();

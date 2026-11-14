@@ -34,6 +34,7 @@ import {
 } from "@sciencediscovery/sandbox-capability";
 import type {
   ExecutionBoundaryStatus,
+  ResearchInputEvidence,
   ResearchOutcome,
   ResearchPhase,
   ResearchReportOutcome,
@@ -86,6 +87,12 @@ export interface ExecutionObservation {
     readonly outcome?: ResearchOutcome | null;
     readonly report?: ResearchReportOutcome;
     readonly stop?: ResearchStopState;
+    /**
+     * The input set this instance verified and materialized before spawn. It is
+     * recorded before the process exists, and it can never downgrade a durable
+     * `verified` record back to the caller's declaration.
+     */
+    readonly inputs?: ResearchInputEvidence;
   };
 }
 

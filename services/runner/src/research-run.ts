@@ -24,9 +24,16 @@
  *
  * Trust boundaries:
  *
- * - the request names an identity and a time schedule; it cannot name a
- *   program, an interpreter, a module, a path, an environment variable, a
- *   state root, or a control-file location;
+ * - the request names an identity, one input content identity and a time
+ *   schedule; it cannot name a program, an interpreter, a module, a host path,
+ *   a bundle root, a file list, replacement bytes, a mount point, an
+ *   environment variable, a state root, or a control-file location;
+ * - the input bundle is verified through the Runner's own content-addressed
+ *   store and copied into a directory derived from the execution id, before any
+ *   sandbox exists. The copy is written from the buffers those checks
+ *   described, re-verified, published with one rename and mounted read-only at
+ *   a fixed path after the workspace and control binds; the shared cache
+ *   directory is never mounted;
  * - the state root is derived from the execution id by digest, so `.`, `..`,
  *   separators and collisions are not representable;
  * - the control directory is held open by a directory descriptor for the whole
@@ -44,14 +51,21 @@
  * workload's self-reports; nothing is published and no fence is released until
  * the full PID namespace is proven empty by the ledger's own boundary check.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants as FS } from "node:fs";
-import { mkdir, open, rename, unlink, type FileHandle } from "node:fs/promises";
-import { resolve } from "node:path";
+import { lstat, mkdir, open, rename, rm, unlink, writeFile, type FileHandle } from "node:fs/promises";
+import { dirname, resolve, sep } from "node:path";
 
 import {
+  canonicalScienceFlowInputBundleManifest,
+  parseScienceFlowInputBundleManifest,
   RESEARCH_RUN_SCHEMA_VERSION,
   RESEARCH_WORKLOAD_KINDS,
+  SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
+  isScienceFlowInputBundleDigest,
+  type ResearchInputEvidence,
+  type ResearchInputFileEvidence,
+  type ResearchInputIdentity,
   type ResearchOutcome,
   type ResearchPhase,
   type ResearchProcessEvidence,
@@ -64,6 +78,12 @@ import {
   type ShellExecutionResult,
 } from "@sciencediscovery/schema";
 import { SYSTEM_SHELL_ENVIRONMENT_REVISION_ID } from "@sciencediscovery/schema";
+
+import {
+  scienceFlowInputBundleDigest,
+  verifyScienceFlowInputCopy,
+  type ScienceFlowInputSnapshot,
+} from "./scienceflow-input-bundles.js";
 
 import type { EnvironmentRuntime, EnvironmentStore } from "./environment-store.js";
 import {
@@ -93,6 +113,13 @@ export const RESEARCH_CONTROL_PROTOCOL_VERSION = 1;
 export const RESEARCH_CONTROL_MOUNT = "/runner-control";
 /** Largest record the Runner will read; anything bigger is a refusal. */
 export const RESEARCH_RECORD_MAX_BYTES = 4_096;
+/**
+ * Fixed mount point of this execution's verified input copy. It is Runner code,
+ * never a manifest or request value, and it is bound read-only after the
+ * workspace and control mounts so nothing later can replace it with a writable
+ * one.
+ */
+export const RESEARCH_INPUTS_MOUNT = "/research-inputs";
 
 const CONTROL_DIRECTORY = "control";
 const RECORD_FILE = "status";
@@ -100,6 +127,7 @@ const STOP_FILE = "stop";
 const STOP_CONSUMED_FILE = "stop.consumed";
 const STOP_PENDING_FILE = "stop.pending";
 const STATE_DIRECTORY = "runner-research";
+const INPUT_STATE_DIRECTORY = "runner-research-inputs";
 /** Observation cadence; the deadline checks run on the same turn. */
 const POLL_MS = 25;
 /**
@@ -133,6 +161,9 @@ const REFUSAL_MESSAGES: Readonly<Record<ResearchRefusalCode, string>> = {
   RESEARCH_ENVIRONMENT_REVISION_MISMATCH: "The managed environment is no longer at the revision the caller expected",
   RESEARCH_SANDBOX_UNSUPPORTED: "The research workload requires the bubblewrap sandbox",
   RESEARCH_LAUNCH_FAILED: "The research workload could not be launched inside its sandbox",
+  RESEARCH_INPUT_REQUIRED: "A research run requires the prepared input bundle it consumes",
+  RESEARCH_INPUT_UNAVAILABLE: "The prepared input bundle this run named is not available or is not the one it claims",
+  RESEARCH_INPUT_COPY_FAILED: "The execution's private input copy could not be prepared and verified",
 };
 
 /** A fixed refusal. The message is from the table above, never an inner one. */
@@ -191,7 +222,7 @@ export function parseResearchTimeSchedule(value: unknown): ResearchTimeSchedule 
 export function parseResearchRunRequest(value: unknown): ResearchRunRequest {
   if (!isRecord(value)) throw new ResearchRunError("RESEARCH_REQUEST_INVALID");
   const allowed = [
-    "agentId", "environmentId", "executionId", "expectedEnvironmentRevisionId", "kind",
+    "agentId", "environmentId", "executionId", "expectedEnvironmentRevisionId", "inputs", "kind",
     "maxOutputBytes", "maxWorkspaceBytes", "npuDevices", "permissionEpoch", "runnerWorkspaceKey",
     "schedule", "schemaVersion", "workload", "workspaceRoot",
   ];
@@ -231,6 +262,10 @@ export function parseResearchRunRequest(value: unknown): ResearchRunRequest {
     || npuDevices.some((device) => !Number.isSafeInteger(device) || (device as number) < 0))) {
     throw new ResearchRunError("RESEARCH_REQUEST_INVALID");
   }
+  // Inputs are an identity, never a locator: two digests and nothing else.
+  // Absent is accepted here so a pre-consumption request or stored record still
+  // parses; the internal submission path refuses a new execution without one.
+  const inputs = value.inputs === undefined ? undefined : parseResearchInputIdentity(value.inputs);
   const budget = (key: string): number | undefined => {
     const entry = value[key];
     if (entry === undefined) return undefined;
@@ -249,6 +284,7 @@ export function parseResearchRunRequest(value: unknown): ResearchRunRequest {
     kind: "research",
     ...(budget("maxOutputBytes") !== undefined ? { maxOutputBytes: value.maxOutputBytes as number } : {}),
     ...(budget("maxWorkspaceBytes") !== undefined ? { maxWorkspaceBytes: value.maxWorkspaceBytes as number } : {}),
+    ...(inputs !== undefined ? { inputs } : {}),
     ...(Array.isArray(npuDevices) ? { npuDevices: [...npuDevices as number[]] } : {}),
     permissionEpoch: epoch as unknown as ResearchRunRequest["permissionEpoch"],
     ...(optional("runnerWorkspaceKey", 160) ? { runnerWorkspaceKey: value.runnerWorkspaceKey as string } : {}),
@@ -257,6 +293,20 @@ export function parseResearchRunRequest(value: unknown): ResearchRunRequest {
     workload: value.workload as ResearchRunRequest["workload"],
     workspaceRoot,
   };
+}
+
+/** One input identity: exactly two lowercase SHA-256 digests, nothing else. */
+export function parseResearchInputIdentity(value: unknown): ResearchInputIdentity {
+  if (!isRecord(value)) throw new ResearchRunError("RESEARCH_REQUEST_INVALID");
+  const keys = Object.keys(value).sort();
+  if (keys.length !== 2 || keys[0] !== "bundleDigest" || keys[1] !== "contractDigest") {
+    throw new ResearchRunError("RESEARCH_REQUEST_INVALID");
+  }
+  if (!isScienceFlowInputBundleDigest(value.contractDigest)
+    || !isScienceFlowInputBundleDigest(value.bundleDigest)) {
+    throw new ResearchRunError("RESEARCH_REQUEST_INVALID");
+  }
+  return { contractDigest: value.contractDigest, bundleDigest: value.bundleDigest };
 }
 
 /** Fixed run deadlines, all counted from the instant the operation starts. */
@@ -286,6 +336,17 @@ export function researchRunDeadlines(schedule: ResearchTimeSchedule): ResearchRu
 export function researchStateRoot(dataDir: string, executionId: string): string {
   const digest = createHash("sha256").update(`research-run\n${executionId}`, "utf8").digest("hex");
   return resolve(dataDir, STATE_DIRECTORY, digest.slice(0, 32));
+}
+
+/**
+ * The private input copy for one execution. Like the state root it is derived
+ * from the execution id by digest, so no id text becomes a path component and
+ * two executions can never share a copy. It lives outside every workspace and
+ * every workload-writable bind, and the shared bundle cache is never mounted.
+ */
+export function researchInputRoot(dataDir: string, executionId: string): string {
+  const digest = createHash("sha256").update(`research-inputs\n${executionId}`, "utf8").digest("hex");
+  return resolve(dataDir, INPUT_STATE_DIRECTORY, digest.slice(0, 32));
 }
 
 /** The fixed base this workload runs in. It manages no packages. */
@@ -657,6 +718,14 @@ export interface ResearchRunWiring {
    */
   readonly environmentStore?: Pick<EnvironmentStore, "withRuntime">;
   /**
+   * The Runner's own content-addressed bundle store. A request names a digest;
+   * this store re-verifies that the named bundle is exactly the manifest and
+   * bytes it claims. It is a constructor dependency like the program: no
+   * request field can substitute another source, and a wiring without one
+   * refuses an input-bound execution before spawn.
+   */
+  readonly inputBundles?: { snapshot(bundleDigest: string): Promise<ScienceFlowInputSnapshot> };
+  /**
    * Test-only host runtime for fixtures that do not lease a managed
    * environment. Production never sets it: the run then records this fixture
    * identity in its result instead of pretending a managed revision was leased,
@@ -666,6 +735,155 @@ export interface ResearchRunWiring {
   /** Test seam: a synthetic `/proc` root for boundary observation. */
   readonly procRoot?: string;
   readonly onDiagnostic?: (event: string, detail?: Record<string, unknown>) => void;
+}
+
+/**
+ * Validate a stored or returned `verified` input evidence record.
+ *
+ * The manifest parser is the protocol's own, and the digest is recomputed from
+ * the canonical manifest, so evidence carried across a restart can never name a
+ * file set whose bytes and identity disagree. `null` means the record is not
+ * evidence this Runner may publish.
+ */
+export function verifiedResearchInputs(value: unknown): ResearchInputEvidence | null {
+  if (!isRecord(value) || value.state !== "verified") return null;
+  if (!isScienceFlowInputBundleDigest(value.contractDigest)
+    || !isScienceFlowInputBundleDigest(value.bundleDigest)) {
+    return null;
+  }
+  const parsed = parseScienceFlowInputBundleManifest({
+    schemaVersion: SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
+    contractDigest: value.contractDigest,
+    files: value.files,
+  });
+  if (parsed.status !== "ok") return null;
+  const digest = createHash("sha256")
+    .update(canonicalScienceFlowInputBundleManifest(parsed.manifest), "utf8")
+    .digest("hex");
+  if (digest !== value.bundleDigest) return null;
+  return {
+    contractDigest: value.contractDigest,
+    bundleDigest: value.bundleDigest,
+    state: "verified",
+    files: parsed.manifest.files.map((file) => Object.freeze({
+      path: file.path,
+      roles: [...file.roles],
+      size: file.size,
+      sha256: file.sha256,
+    })),
+  };
+}
+
+/** One execution's private, verified input copy. Runner-internal only. */
+interface PreparedResearchInputs {
+  /** Host path of the published copy; never leaves this process. */
+  readonly root: string;
+  /** The plain index the fixed program receives, with no host path in it. */
+  readonly index: string;
+  readonly evidence: ResearchInputEvidence;
+  readonly cleanup: () => Promise<void>;
+}
+
+/**
+ * Verify the named bundle and materialize this execution's private copy.
+ *
+ * The bytes written are the buffers the store read through its held directory
+ * descriptor, not a second read of the same path. The copy is built in an
+ * exclusive staging directory, re-verified against the canonical manifest, and
+ * published with one rename; a half-written tree is never mountable. A leftover
+ * copy from an earlier attempt at the same execution id is neither reused nor
+ * repaired: it is a fixed refusal.
+ */
+async function prepareResearchInputs(
+  wiring: ResearchRunWiring,
+  request: ResearchRunRequest,
+): Promise<PreparedResearchInputs> {
+  const inputs = request.inputs;
+  if (inputs === undefined) throw new ResearchRunError("RESEARCH_INPUT_REQUIRED");
+  const store = wiring.inputBundles;
+  if (store === undefined) throw new ResearchRunError("RESEARCH_INPUT_UNAVAILABLE");
+  let snapshot: ScienceFlowInputSnapshot;
+  try {
+    snapshot = await store.snapshot(inputs.bundleDigest);
+  } catch {
+    throw new ResearchRunError("RESEARCH_INPUT_UNAVAILABLE");
+  }
+  const manifest = snapshot.manifest;
+  if (manifest.contractDigest !== inputs.contractDigest
+    || scienceFlowInputBundleDigest(manifest) !== inputs.bundleDigest) {
+    throw new ResearchRunError("RESEARCH_INPUT_UNAVAILABLE");
+  }
+  for (const file of manifest.files) {
+    if (snapshot.contents.get(file.path) === undefined) {
+      throw new ResearchRunError("RESEARCH_INPUT_UNAVAILABLE");
+    }
+  }
+
+  const parent = resolve(wiring.config.dataDir, INPUT_STATE_DIRECTORY);
+  const root = researchInputRoot(wiring.config.dataDir, request.executionId);
+  await mkdir(parent, { recursive: true, mode: 0o700 })
+    .catch(() => { throw new ResearchRunError("RESEARCH_INPUT_COPY_FAILED"); });
+  // The private root is Runner-owned: a link, a non-directory, or a directory
+  // another account can write is not a place to materialize verified bytes.
+  let parentInfo: Awaited<ReturnType<typeof lstat>>;
+  try {
+    parentInfo = await lstat(parent);
+  } catch {
+    throw new ResearchRunError("RESEARCH_INPUT_COPY_FAILED");
+  }
+  if (!parentInfo.isDirectory() || parentInfo.isSymbolicLink() || (parentInfo.mode & 0o022) !== 0) {
+    throw new ResearchRunError("RESEARCH_INPUT_COPY_FAILED");
+  }
+  const existing = await lstat(root).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined;
+    throw new ResearchRunError("RESEARCH_INPUT_COPY_FAILED");
+  });
+  if (existing !== undefined) throw new ResearchRunError("RESEARCH_INPUT_COPY_FAILED");
+
+  const staging = resolve(parent, `.${randomUUID()}`);
+  try {
+    await mkdir(staging, { mode: 0o700 });
+    for (const file of manifest.files) {
+      const target = resolve(staging, file.path);
+      if (!target.startsWith(`${staging}${sep}`)) {
+        throw new ResearchRunError("RESEARCH_INPUT_COPY_FAILED");
+      }
+      await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+      await writeFile(target, snapshot.contents.get(file.path)!, { flag: "wx", mode: 0o444 });
+    }
+    // The copy that will be mounted is checked against the same manifest the
+    // bytes were verified against; a partial or damaged staging tree never
+    // reaches the rename.
+    await verifyScienceFlowInputCopy(staging, manifest.files);
+    await rename(staging, root);
+  } catch (error) {
+    await rm(staging, { force: true, recursive: true }).catch(() => undefined);
+    throw error instanceof ResearchRunError ? error : new ResearchRunError("RESEARCH_INPUT_COPY_FAILED");
+  }
+
+  const files: readonly ResearchInputFileEvidence[] = manifest.files.map((file) => Object.freeze({
+    path: file.path,
+    roles: [...file.roles],
+    size: file.size,
+    sha256: file.sha256,
+  }));
+  const evidence: ResearchInputEvidence = Object.freeze({
+    contractDigest: inputs.contractDigest,
+    bundleDigest: inputs.bundleDigest,
+    state: "verified",
+    files,
+  });
+  return {
+    root,
+    index: JSON.stringify({
+      schemaVersion: SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
+      contractDigest: inputs.contractDigest,
+      bundleDigest: inputs.bundleDigest,
+      files,
+    }),
+    evidence,
+    cleanup: async () => { await rm(root, { force: true, recursive: true }); },
+  };
 }
 
 /** What the manager hands to one research launch. */
@@ -767,6 +985,11 @@ export function researchPublishable(status: ResearchRunStatus | undefined): bool
     return status.refusal !== undefined;
   }
   if (status.process !== "spawned-then-terminated") return false;
+  // A spawned execution must have consumed a verified input set. This Runner
+  // records that set before the process exists, so a record that still carries
+  // only the caller's declaration has no evidence the run read the bytes its
+  // contract named. A pre-spawn refusal above is a different, positive fact.
+  if (status.inputs !== undefined && status.inputs.state !== "verified") return false;
   if (status.deadlineViolated) return false;
   if (researchRecordUnusable(status)) return false;
   if (status.outcome === null || status.outcome === "unknown") return false;
@@ -786,6 +1009,8 @@ interface RunState {
   report: ResearchReportOutcome;
   /** The folded business facts; `null` until a valid record exists. */
   facts: ResearchRecordFacts | null;
+  /** The declared identity, replaced by the verified file set before spawn. */
+  inputs: ResearchInputEvidence | undefined;
   refusal: ResearchRefusalCode | undefined;
   /** A record was unusable, so no earlier business value may be published. */
   invalid: boolean;
@@ -819,6 +1044,9 @@ function runResearchWorkload(
     deadlineViolated: false,
     facts: null,
     forceReclaimRequested: false,
+    inputs: request.inputs === undefined
+      ? undefined
+      : { ...request.inputs, state: "declared" },
     invalid: false,
     outcome: null,
     phase: "unknown",
@@ -886,6 +1114,7 @@ function runResearchWorkload(
     report: overrides.report ?? state.report,
     schedule,
     schemaVersion: RESEARCH_RUN_SCHEMA_VERSION,
+    ...(state.inputs !== undefined ? { inputs: state.inputs } : {}),
     ...(state.spawnedAt !== undefined ? { spawnedAt: state.spawnedAt } : {}),
     stop: state.stopState,
     ...(state.stopCause !== null ? { stopCause: state.stopCause } : {}),
@@ -915,6 +1144,13 @@ function runResearchWorkload(
     return Promise.resolve(refused("RESEARCH_ENVIRONMENT_UNAVAILABLE"));
   }
   const environmentStore = wiring.environmentStore;
+
+  // A new execution without an input identity is refused before the state root
+  // or any control channel exists. There is no fallback to workspace files and
+  // nothing is collected on the API's behalf.
+  if (request.inputs === undefined) {
+    return Promise.resolve(refused("RESEARCH_INPUT_REQUIRED"));
+  }
 
   // The state root is derived here, never supplied: no caller names this path.
   const channelPromise = (async (): Promise<ResearchControlChannel> => {
@@ -1099,6 +1335,44 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
       result: options.emptyResult(1),
     };
   }
+
+  // Verify the named bundle and build this execution's private copy inside the
+  // workspace admission gate, before any sandbox exists. The workload is only
+  // launched once these bytes are the ones that were checked.
+  let inputs: PreparedResearchInputs;
+  try {
+    inputs = await prepareResearchInputs(wiring, request);
+  } catch (error) {
+    const code = error instanceof ResearchRunError ? error.code : "RESEARCH_INPUT_UNAVAILABLE";
+    return {
+      research: statusOf("not_started", { phase: "unknown", outcome: null, refusal: code }),
+      result: options.emptyResult(1, environment),
+    };
+  }
+  // A spawned record must never carry only the caller's declaration. The
+  // verified set is persisted before the process can exist; if the ledger
+  // cannot accept it, nothing is launched.
+  try {
+    state.inputs = inputs.evidence;
+    options.observe({ research: { inputs: inputs.evidence } }, true);
+  } catch {
+    await inputs.cleanup().catch(() => undefined);
+    return {
+      research: statusOf("not_started", {
+        phase: "unknown", outcome: null, refusal: "RESEARCH_STATE_SAVE_FAILED",
+      }),
+      result: options.emptyResult(1, environment),
+    };
+  }
+  // From this point a spawn is possible, so cleanup belongs to the manager's
+  // resource owner and runs only after termination is proven. A direct executor
+  // call (no manager) keeps ownership here.
+  let ownsInputs = true;
+  if (launch.lifecycle?.retainResource) {
+    launch.lifecycle.retainResource(inputs.cleanup, "research-input-copy");
+    ownsInputs = false;
+  }
+
   const workspaceBinds = workspaceBindArguments(request.workspaceRoot, undefined);
   let prepared: SandboxLaunch;
   try {
@@ -1113,13 +1387,16 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
       hostRuntimeSupport: await resolveHostRuntimeSupport(config.dataDir),
       language: "python",
       pathEnv: environment ? "/opt/science-env/bin:/usr/bin" : "/usr/bin",
-      // The control directory is the only extra mount. It is Runner-owned, has
-      // no host data, and is the one writable place the workload is given
-      // outside its own workspace.
-      workspaceBindArgs: [...workspaceBinds.args, "--bind", channel.hostPath, RESEARCH_CONTROL_MOUNT],
+      // The control directory and the execution's verified input copy are the
+      // only extra mounts. Both are Runner-owned; the copy is bound read-only
+      // and after the workspace binds, so nothing later can replace it with a
+      // writable view.
+      workspaceBindArgs: [...workspaceBinds.args, "--bind", channel.hostPath, RESEARCH_CONTROL_MOUNT,
+        "--ro-bind", inputs.root, RESEARCH_INPUTS_MOUNT],
       workspaceRoot: request.workspaceRoot,
     });
   } catch {
+    if (ownsInputs) await inputs.cleanup().catch(() => undefined);
     return {
       research: statusOf("not_started", { phase: "unknown", outcome: null, refusal: "RESEARCH_LAUNCH_FAILED" }),
       result: options.emptyResult(1, environment),
@@ -1129,11 +1406,13 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
   // The interpreter is the leased environment's or the explicitly wired
   // fixture runtime's. The execution id is passed as argv, so every business
   // record is bound to this execution by the Runner itself rather than by a
-  // value the workload could choose.
+  // value the workload could choose. The input index is Runner-derived JSON:
+  // logical paths and digests only, never a host path.
   const interpreter = environment
     ? sandboxCommandPath(prepared, "/opt/science-env/bin/python", environment.interpreterPath)
     : sandboxCommandPath(prepared, fixture!.interpreterPath, fixture!.interpreterPath);
-  const commandArguments = [interpreter, "-I", "-B", "-", RESEARCH_CONTROL_MOUNT, request.executionId];
+  const commandArguments = [interpreter, "-I", "-B", "-", RESEARCH_CONTROL_MOUNT, request.executionId,
+    RESEARCH_INPUTS_MOUNT, inputs.index];
 
   let spawned = false;
   let boundary: ExecutionBoundaryHandle | "ended" | "unavailable" | undefined;
@@ -1358,6 +1637,7 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
     // `not_started`, and only with the refusal that prevented it.
     const code = state.refusal ?? "RESEARCH_LAUNCH_FAILED";
     options.diagnose("research_run_not_started", { code });
+    if (ownsInputs) await inputs.cleanup().catch(() => undefined);
     return {
       research: statusOf("not_started", { phase: "unknown", outcome: null, refusal: code }),
       result: options.emptyResult(1, environment),
@@ -1382,6 +1662,9 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
   const reported = state.facts !== null && state.facts.phase === "finished"
     && state.facts.outcome !== "unknown";
   const outcome: ResearchOutcome | null = reported ? state.facts!.outcome : "unknown";
+  // A manager-owned copy is released only by the manager, after it proves this
+  // process tree gone; a direct executor call releases its own.
+  if (ownsInputs) await inputs.cleanup().catch(() => undefined);
   return {
     research: statusOf(processFact, { outcome }),
     result: options.emptyResult(exitCode, environment),
