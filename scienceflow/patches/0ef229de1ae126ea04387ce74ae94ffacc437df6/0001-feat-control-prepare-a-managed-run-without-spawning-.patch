@@ -1,0 +1,478 @@
+From 4c3c949324c9b764db886d14a63383ff68af0f7e Mon Sep 17 00:00:00 2001
+From: liyuan <liyuan390@huawei.com>
+Date: Sat, 14 Nov 2026 18:20:45 +0800
+Subject: [PATCH 1/2] feat(control): prepare a managed run without spawning and
+ let a host adopt it
+
+Extract the record-creating half of start_run() into prepare_run(), which
+returns a PreparedRun and starts nothing, and keep start_run() as prepare plus
+the detached spawn inside the same registry lock so the existing start/stop/
+resume behaviour is unchanged.
+
+supervise() now claims an unset pid/process_created under the directory lock
+itself and refuses an identity that belongs to another process. It accepts two
+additive host hooks -- an in-process stop_event and an on_ready callback -- and,
+when a stop event is given, short-circuits into a positive not-started record
+and arms exactly one control task that cancels the bound supervisor once,
+cancelled and awaited in finally on every exit path. A stop consumed while
+reports are generating keeps the research outcome and states the report as
+incomplete instead of escaping as an unrecorded cancellation.
+
+The expensive boundaries stay substitutable: run_manifest is a module attribute
+resolved lazily, and the report generator is imported from its own module.
+---
+ .../runtime/parallel/control/__init__.py      |  22 ++-
+ .../runtime/parallel/control/service.py       | 110 +++++++++--
+ .../runtime/parallel/control/worker.py        | 183 ++++++++++++++++--
+ 3 files changed, 281 insertions(+), 34 deletions(-)
+
+diff --git a/scienceflow/runtime/parallel/control/__init__.py b/scienceflow/runtime/parallel/control/__init__.py
+index afde352..0f8c18b 100644
+--- a/scienceflow/runtime/parallel/control/__init__.py
++++ b/scienceflow/runtime/parallel/control/__init__.py
+@@ -1,6 +1,24 @@
+ """Durable control plane for detached long-research processes."""
+ 
+ from .selection import AmbiguousRun, resolve_run
+-from .service import get_run, list_runs, resume_run, start_run, stop_run
++from .service import (
++    PreparedRun,
++    get_run,
++    list_runs,
++    prepare_run,
++    resume_run,
++    start_run,
++    stop_run,
++)
+ 
+-__all__ = ['AmbiguousRun', 'resolve_run', 'get_run', 'list_runs', 'resume_run', 'start_run', 'stop_run']
++__all__ = [
++    'AmbiguousRun',
++    'PreparedRun',
++    'resolve_run',
++    'get_run',
++    'list_runs',
++    'prepare_run',
++    'resume_run',
++    'start_run',
++    'stop_run',
++]
+diff --git a/scienceflow/runtime/parallel/control/service.py b/scienceflow/runtime/parallel/control/service.py
+index 083db18..d6de37b 100644
+--- a/scienceflow/runtime/parallel/control/service.py
++++ b/scienceflow/runtime/parallel/control/service.py
+@@ -7,8 +7,9 @@ import signal
+ import subprocess
+ import sys
+ import time
+-from dataclasses import asdict
++from dataclasses import asdict, dataclass
+ from pathlib import Path
++from typing import Any, Literal, overload
+ from uuid import uuid4
+ 
+ import psutil
+@@ -27,7 +28,71 @@ class WorkspaceBusy(ValueError):
+         super().__init__(f"Task workspace is already running: {run_id}")
+ 
+ 
+-def start_run(manifest_path, *, draft=None, library_workspace=None) -> dict:
++@dataclass(frozen=True, slots=True)
++class PreparedRun:
++    """One managed run whose durable record and first attempt exist, unlaunched.
++
++    ``prepare_run()`` returns this instead of a public status: the record is the
++    engine's own private state, including the launch token and the manifest
++    payload, so a host that supervises the run itself must never publish it as
++    status. The CLI path launches the supervisor immediately and returns the
++    same public view as before.
++    """
++
++    directory: Path
++    record: dict[str, Any]
++
++    @property
++    def run_id(self) -> str:
++        return str(self.record["run_id"])
++
++    @property
++    def launch_token(self) -> str:
++        return str(self.record["launch_token"])
++
++    @property
++    def attempt(self) -> int:
++        return int(self.record["attempt"])
++
++    @property
++    def manifest(self) -> str:
++        return str(self.record["manifest"])
++
++
++def prepare_run(manifest_path, *, draft=None, library_workspace=None) -> PreparedRun:
++    """Create the managed record and its first attempt without spawning anything.
++
++    This is the record-creating half of :func:`start_run`: manifest validation,
++    run id, ``attempt + 1``, ``launch_token``, stale-key clearing, the
++    per-attempt ``manifest-{attempt}.yaml`` and the resource reservation all
++    happen here, under the same registry lock. Nothing is executed, no PID is
++    recorded and nothing is signalled, so a host that owns a sandbox can adopt
++    the record in its own supervised process (see
++    :func:`scienceflow.runtime.parallel.control.worker.supervise`).
++    """
++    return _create_run(manifest_path, draft=draft, library_workspace=library_workspace, spawn=False)
++
++
++@overload
++def _create_run(
++    manifest_path, *, draft, library_workspace, spawn: Literal[False],
++) -> PreparedRun: ...
++
++
++@overload
++def _create_run(
++    manifest_path, *, draft, library_workspace, spawn: Literal[True],
++) -> dict: ...
++
++
++def _create_run(manifest_path, *, draft, library_workspace, spawn: bool):
++    """The shared half of ``start_run`` and ``prepare_run``.
++
++    Both take the registry lock across the whole record-creating step, exactly
++    as ``start_run`` always did: the busy check and the PID write have to stay
++    inside one critical section or two starts could both pass the check before
++    either is alive. Only the spawn is optional.
++    """
+     from scienceflow.runtime.parallel.execution.runner import ParallelRunner
+ 
+     source = Path(manifest_path).expanduser().resolve()
+@@ -108,14 +173,24 @@ def start_run(manifest_path, *, draft=None, library_workspace=None) -> dict:
+ 
+             record["resource_requests"] = task_requests(tasks)
+             apply_reservation(record, list_runs())
+-            return _launch(
+-                directory,
+-                record,
+-                resume=False,
+-            )
++            prepared = _prepare_launch(directory, record, resume=False)
++            if not spawn:
++                return prepared
++            _spawn_supervisor(prepared, record)
++            return _public(record)
+ 
+ 
+-def _launch(directory: Path, record: dict, *, resume: bool) -> dict:
++def start_run(manifest_path, *, draft=None, library_workspace=None) -> dict:
++    """Prepare a managed run and start its detached supervisor, as before."""
++    return _create_run(manifest_path, draft=draft, library_workspace=library_workspace, spawn=True)
++
++
++def _prepare_launch(directory: Path, record: dict, *, resume: bool) -> PreparedRun:
++    """Arm one attempt: clear stale facts, write the record and its manifest.
++
++    This half writes durable state but starts no process, so it is shared by the
++    CLI's detached launch and by a host that supervises the attempt itself.
++    """
+     payload = dict(record["manifest_payload"])
+     payload["resume"] = resume
+     if resume:
+@@ -152,6 +227,18 @@ def _launch(directory: Path, record: dict, *, resume: bool) -> dict:
+     record["manifest"] = str(manifest)
+     record["log"] = str(directory / f"supervisor-{record['attempt']}.log")
+     write_record(directory, record)
++    return PreparedRun(directory, record)
++
++
++def _launch(directory: Path, record: dict, *, resume: bool) -> dict:
++    """Arm one attempt and start the detached supervisor in its own session."""
++    prepared = _prepare_launch(directory, record, resume=resume)
++    _spawn_supervisor(prepared, record)
++    return _public(record)
++
++
++def _spawn_supervisor(prepared: PreparedRun, record: dict) -> None:
++    """Start the detached worker for an armed attempt and record its identity."""
+     fd = os.open(record["log"], os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+     with os.fdopen(fd, "a") as output:
+         process = subprocess.Popen(
+@@ -159,8 +246,8 @@ def _launch(directory: Path, record: dict, *, resume: bool) -> dict:
+                 sys.executable,
+                 "-m",
+                 "scienceflow.runtime.parallel.control.worker",
+-                record["run_id"],
+-                record["launch_token"],
++                prepared.run_id,
++                prepared.launch_token,
+             ],
+             cwd=record["cwd"],
+             stdin=subprocess.DEVNULL,
+@@ -172,8 +259,7 @@ def _launch(directory: Path, record: dict, *, resume: bool) -> dict:
+     record.update(
+         pid=process.pid, process_created=psutil.Process(process.pid).create_time()
+     )
+-    write_record(directory, record)
+-    return _public(record)
++    write_record(prepared.directory, record)
+ 
+ 
+ def _public(record: dict) -> dict:
+diff --git a/scienceflow/runtime/parallel/control/worker.py b/scienceflow/runtime/parallel/control/worker.py
+index fbea46a..3e8a723 100644
+--- a/scienceflow/runtime/parallel/control/worker.py
++++ b/scienceflow/runtime/parallel/control/worker.py
+@@ -1,4 +1,17 @@
+-"""Detached supervisor entry point; no terminal or interactive CLI ownership."""
++"""Supervisor for one managed run; no terminal or interactive CLI ownership.
++
++The same entry point serves two hosts:
++
++* the CLI launches this module as a detached session, which adopts the record
++  the launcher already owns through the PID it recorded;
++* a host that owns a supervised process (a sandbox bootstrap) prepares the run
++  with ``service.prepare_run()`` and then calls :func:`supervise` in that
++  process. The record has no PID yet, so the supervisor claims it here under
++  the directory lock, and the host may hand in the two additive hooks it needs:
++  an in-process ``stop_event`` and an ``on_ready`` callback. A supervisor that
++  claims nothing (another process's token or identity) returns without touching
++  the record, so a second attempt never overwrites an owner.
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -7,14 +20,34 @@ import os
+ import signal
+ import sys
+ import time
++from collections.abc import Awaitable, Callable
++from contextlib import suppress
++from pathlib import Path
++from typing import Any
++
++import psutil
+ 
+-from scienceflow.runtime.parallel.service import run_manifest
+ from scienceflow.research.solver.lnr.lifecycle.records.storage_usage import (
+     record_final_storage,
+ )
+ 
+ from .registry import locked, read_record, run_dir, write_record
+ 
++# The research step is the engine's own manifest execution. It stays a module
++# attribute so a host (or a test) can substitute exactly this expensive
++# boundary while the supervisor, the registry and every state transition below
++# remain the real ones. It is resolved lazily so importing this module does not
++# import the whole engine graph at once.
++run_manifest: Callable[[str], Awaitable[Any]] | None = None
++
++
++def _research_step() -> Callable[[str], Awaitable[Any]]:
++    if run_manifest is not None:
++        return run_manifest
++    from scienceflow.runtime.parallel.service import run_manifest as step
++
++    return step
++
+ 
+ def _input_data_paths(record: dict) -> tuple[str, ...]:
+     """Collect configured read-only inputs without touching their contents."""
+@@ -52,17 +85,93 @@ def _record_terminal_storage(record: dict) -> None:
+             continue
+ 
+ 
+-async def supervise(run_id: str, token: str) -> None:
++def _claim_identity(record: dict) -> bool:
++    """Bind this process to the record, claiming an unset identity.
++
++    A launcher that spawns the supervisor records the PID itself; a host that
++    supervises the run inside its own process leaves it unset. In both cases the
++    identity is written under the directory lock, and an identity that is
++    already someone else's is never overwritten.
++    """
++    here = os.getpid()
++    created = psutil.Process(here).create_time()
++    pid = record.get("pid")
++    if pid is None:
++        record["pid"] = here
++        record["process_created"] = created
++        return True
++    if int(pid) != here:
++        return False
++    recorded = record.get("process_created")
++    if recorded is None:
++        record["process_created"] = created
++        return True
++    return abs(created - float(recorded)) < 0.01
++
++
++def _record_not_started(directory: Path, record: dict) -> None:
++    """State positively that a stop arrived before any research could run.
++
++    This is the only positive pre-research fact: a missing ``running`` write or
++    a missing readiness file is not evidence that nothing started.
++    """
++    now = time.time()
++    record.update(
++        status="stopped",
++        phase="finished",
++        research_status="not-started",
++        research_error=None,
++        research_finished_at=now,
++        report_status="none",
++        report_timed_out=False,
++        report_finished_at=now,
++        finished_at=now,
++        error=None,
++    )
++    write_record(directory, record)
++
++
++async def _cancel_once(stop_event: asyncio.Event, task: asyncio.Task) -> None:
++    """Wait for the one stop intent and cancel the bound supervisor once."""
++    await stop_event.wait()
++    task.cancel()
++
++
++async def supervise(
++    run_id: str,
++    token: str,
++    *,
++    stop_event: asyncio.Event | None = None,
++    on_ready: Callable[[], None] | None = None,
++    research: Callable[[str], Awaitable[Any]] | None = None,
++) -> None:
++    """Own one attempt until its terminal record exists.
++
++    ``stop_event`` and ``on_ready`` are the additive host contract: a host that
++    owns the process delivers a stop through its own durable channel and
++    receives the instant at which this supervisor is able to act on one. With
++    neither, the behaviour is exactly the detached CLI worker: signals cancel
++    it and nothing else does.
++    """
+     directory = run_dir(run_id)
+     current = asyncio.current_task()
++    if current is None:  # pragma: no cover - only reachable outside a task
++        raise RuntimeError("supervise() must run inside an asyncio task")
+     loop = asyncio.get_running_loop()
+     for sig in (signal.SIGINT, signal.SIGTERM):
+         loop.add_signal_handler(sig, current.cancel)
+     with locked(directory):
+         record = read_record(directory)
+-        if record["launch_token"] != token or record.get("pid") != os.getpid():
++        if record["launch_token"] != token:
++            return
++        if not _claim_identity(record):
+             return
+-        if record["status"] == "stopping":
++        if stop_event is not None and stop_event.is_set():
++            # A stop that predates the supervisor is a correlated
++            # short-circuit: nothing runs, and the record says so positively.
++            _record_not_started(directory, record)
++            return
++        if record["status"] == "stopping" and stop_event is None:
+             current.cancel()
+         else:
+             record["status"] = "running"
+@@ -73,19 +182,27 @@ async def supervise(run_id: str, token: str) -> None:
+         if record.get("recovery_mode") == "report_only"
+         else None
+     )
++    control_task: asyncio.Task | None = None
+     try:
+-        if record.get("recovery_mode") != "report_only":
+-            summary = await run_manifest(record["manifest"])
+-            print(summary.text, flush=True)
+-            status = "completed"
+-            if any(r.status not in {"success", "skipped"} for r in summary.results):
+-                status = "failed"
+-    except asyncio.CancelledError:
+-        status = "stopped"
+-    except Exception as exc:
+-        status, error = "failed", type(exc).__name__
+-        print(f"Supervisor failed: {type(exc).__name__}", flush=True)
+-    finally:
++        # The readiness point is where the host learns this supervisor can act
++        # on a stop; the control task is armed once here and stays armed through
++        # research and reporting, so one intent cancels exactly once.
++        if on_ready is not None:
++            on_ready()
++        if stop_event is not None:
++            control_task = asyncio.create_task(_cancel_once(stop_event, current))
++        try:
++            if record.get("recovery_mode") != "report_only":
++                summary = await (research or _research_step())(record["manifest"])
++                print(summary.text, flush=True)
++                status = "completed"
++                if any(r.status not in {"success", "skipped"} for r in summary.results):
++                    status = "failed"
++        except asyncio.CancelledError:
++            status = "stopped"
++        except Exception as exc:
++            status, error = "failed", type(exc).__name__
++            print(f"Supervisor failed: {type(exc).__name__}", flush=True)
+         from .reporting import finalize_reports, report_budget
+ 
+         with locked(directory):
+@@ -114,24 +231,43 @@ async def supervise(run_id: str, token: str) -> None:
+         print(
+             f"Reporting: separate budget {record['report_budget_sec']:g}s", flush=True
+         )
++        report_cancelled = False
+         try:
+             reports, timed_out = await finalize_reports(record)
++        except asyncio.CancelledError:
++            # A stop consumed while reports are generating keeps the research
++            # outcome already stated and records the report as incomplete. It
++            # is not a research failure, and it must not escape unrecorded.
++            reports, timed_out = [], False
++            report_cancelled = True
+         except Exception as exc:
+             reports, timed_out = [], False
+             error = f"Report generation failed: {type(exc).__name__}"
+         ready = bool(reports) and all(r.get("status") == "ready" for r in reports)
+-        if not ready:
++        if not ready and not report_cancelled:
+             error = error or "Report generation failed; resume to retry reporting."
+         with locked(directory):
+             current_record = read_record(directory)
+             if current_record["launch_token"] != token:
+                 return
+             current_record.update(
+-                status=("failed" if status == "completed" and not ready else status),
++                # A report truncated by a durable stop never rewrites what the
++                # research phase did: the record keeps the research outcome and
++                # states the report as incomplete. Only a report that failed or
++                # never finished on its own makes a completed run a failure.
++                status=(
++                    "failed"
++                    if status == "completed" and not ready and not report_cancelled
++                    else status
++                ),
+                 phase="finished",
+                 finished_at=time.time(),
+                 error=error,
+-                report_status="ready" if ready else "generation_failed",
++                report_status=(
++                    "incomplete"
++                    if report_cancelled
++                    else ("ready" if ready else "generation_failed")
++                ),
+                 report_timed_out=timed_out,
+                 report_finished_at=time.time(),
+                 final_reports=[
+@@ -157,6 +293,13 @@ async def supervise(run_id: str, token: str) -> None:
+                     current_record["task_registration"] = registration
+                     write_record(directory, current_record)
+             print("Task registration: " + registration["status"], flush=True)
++    finally:
++        # No waiter survives the phase or the attempt: the control task is
++        # cancelled and awaited on the natural, cancelled and failed paths.
++        if control_task is not None:
++            control_task.cancel()
++            with suppress(asyncio.CancelledError):
++                await control_task
+ 
+ 
+ if __name__ == "__main__":
+-- 
+2.34.1
+

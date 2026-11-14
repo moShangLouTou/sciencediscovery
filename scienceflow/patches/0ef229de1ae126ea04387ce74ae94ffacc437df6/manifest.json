@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "engine": "scienceflow",
+  "baseRevision": "0ef229de1ae126ea04387ce74ae94ffacc437df6",
+  "patchedRevision": "cda7d275f3ccaf3272096d78fe4ad9ec5e565732",
+  "patchedTree": "e8dff1ec922b5496606d21841f5295150f539361",
+  "patches": [
+    {
+      "path": "0001-feat-control-prepare-a-managed-run-without-spawning-.patch",
+      "sha256": "8543cd7406d43d3e3475fa77263531248a598c3985b38de5b05e061dc9cc6bba"
+    },
+    {
+      "path": "0002-test-control-cover-prepare-only-arming-adoption-stop.patch",
+      "sha256": "686e3b074b79cdbed2063fcb3387163d2a575f2c3edc62be15b060b341f430c4"
+    }
+  ]
+}

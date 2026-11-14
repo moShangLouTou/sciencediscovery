@@ -1,0 +1,350 @@
+From cda7d275f3ccaf3272096d78fe4ad9ec5e565732 Mon Sep 17 00:00:00 2001
+From: liyuan <liyuan390@huawei.com>
+Date: Sat, 14 Nov 2026 18:21:04 +0800
+Subject: [PATCH 2/2] test(control): cover prepare-only arming, adoption, stops
+ and reporting
+
+Exercise the real service arming half, the real supervisor and the real
+registry with only the research step and the report generator substituted.
+Covers: no spawn and no pid on prepare; adoption of an unset identity; refusal
+of a foreign identity and a wrong token; the positive not-started record for a
+pending stop; a single research cancellation with no surviving control task; a
+reporting stop that keeps research completed and states the report incomplete;
+the natural path leaving no waiter; and the unchanged legacy 'stopping' path.
+---
+ tests/test_managed_lifecycle.py | 324 ++++++++++++++++++++++++++++++++
+ 1 file changed, 324 insertions(+)
+
+diff --git a/tests/test_managed_lifecycle.py b/tests/test_managed_lifecycle.py
+new file mode 100644
+index 0000000..7ac8212
+--- /dev/null
++++ b/tests/test_managed_lifecycle.py
+@@ -0,0 +1,324 @@
++"""Managed lifecycle: prepare-only, supervisor adoption, stop and reporting.
++
++These tests exercise the real control plane (``service._prepare_launch``,
++``worker.supervise`` and ``registry``) with only the expensive boundaries
++substituted: the research step and the report generator. The supervisor, the
++registry's durable record and every state transition are the production code.
++
++``prepare_run()`` itself parses a manifest through ``ParallelRunner``, whose
++import graph needs the engine's third-party dependencies; a checkout without
++them cannot call it. The record-arming half it shares with the CLI is covered
++here directly, and ``prepare_run`` is additionally checked to exist and to be
++callable in shape.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import os
++import sys
++import tempfile
++import time
++import types
++import unittest
++from pathlib import Path
++from unittest import mock
++
++from scienceflow.runtime.parallel.control import PreparedRun, prepare_run, service
++from scienceflow.runtime.parallel.control import worker
++from scienceflow.runtime.parallel.control.registry import read_record, run_dir
++
++
++def _record(root: Path, run_id: str, **extra) -> dict:
++    return {
++        "attempt": 0,
++        "created_at": time.time(),
++        "cwd": str(root),
++        "draft": None,
++        "manifest_payload": {"report_budget_sec": 5},
++        "run_id": run_id,
++        "started_at": time.time(),
++        "status": "starting",
++        "task_roots": [str(root)],
++        **extra,
++    }
++
++
++class _Summary:
++    def __init__(self, statuses: tuple[str, ...] = ("success",)):
++        self.results = [types.SimpleNamespace(status=status) for status in statuses]
++        self.text = "summary"
++
++
++class ManagedLifecycleTest(unittest.IsolatedAsyncioTestCase):
++    def setUp(self) -> None:
++        self._tmp = tempfile.TemporaryDirectory()
++        self.root = Path(self._tmp.name)
++        self.state = self.root / "state"
++        self.state.mkdir()
++        self._previous = os.environ.get("XDG_STATE_HOME")
++        os.environ["XDG_STATE_HOME"] = str(self.state)
++        # The library export is an expensive boundary of its own and imports
++        # the engine's configuration graph; it is never what these tests check.
++        self._export = types.ModuleType("scienceflow.research.onboarding.library.export")
++        self._export.export_success = lambda record: {"status": "registered"}
++        self._exported = sys.modules.get("scienceflow.research.onboarding.library.export")
++        sys.modules["scienceflow.research.onboarding.library.export"] = self._export
++        self._previous_research = worker.run_manifest
++
++    def tearDown(self) -> None:
++        worker.run_manifest = self._previous_research
++        if self._exported is None:
++            sys.modules.pop("scienceflow.research.onboarding.library.export", None)
++        else:
++            sys.modules["scienceflow.research.onboarding.library.export"] = self._exported
++        if self._previous is None:
++            os.environ.pop("XDG_STATE_HOME", None)
++        else:
++            os.environ["XDG_STATE_HOME"] = self._previous
++        self._tmp.cleanup()
++
++    def _prepare(self, run_id: str, **extra) -> PreparedRun:
++        directory = run_dir(run_id)
++        directory.mkdir(parents=True, exist_ok=True)
++        return service._prepare_launch(directory, _record(self.root, run_id, **extra), resume=False)
++
++    async def test_prepare_arms_one_attempt_without_spawning(self) -> None:
++        """E1: the record and its per-attempt manifest exist; no PID is set."""
++        prepared = self._prepare("prepare-only")
++        record = read_record(run_dir("prepare-only"))
++        self.assertIsInstance(prepared, PreparedRun)
++        self.assertEqual(prepared.attempt, 1)
++        self.assertEqual(record["status"], "starting")
++        self.assertNotIn("pid", record)
++        self.assertNotIn("process_created", record)
++        self.assertEqual(record["attempt"], 1)
++        self.assertTrue(Path(record["manifest"]).is_file())
++        self.assertEqual(record["manifest"], str(run_dir("prepare-only") / "manifest-1.yaml"))
++        self.assertEqual(prepared.launch_token, record["launch_token"])
++        # Nothing was executed and nothing was signalled: the arming half stops
++        # at durable state, which is what lets a host adopt the record.
++        self.assertNotIn("pid", record)
++
++    async def test_supervisor_claims_an_unset_identity(self) -> None:
++        """E2: a prepared record is adopted under the lock, never overwritten."""
++        prepared = self._prepare("adopt")
++        calls: list[str] = []
++
++        async def research(manifest: str):
++            calls.append(manifest)
++            self.assertEqual(read_record(run_dir("adopt"))["pid"], os.getpid())
++            return _Summary()
++
++        async def finalize(record: dict):
++            return [{"status": "ready"}], False
++
++        with mock.patch(
++            "scienceflow.runtime.parallel.control.reporting.finalize_reports", finalize,
++        ):
++            await worker.supervise("adopt", prepared.launch_token, research=research)
++        record = read_record(run_dir("adopt"))
++        self.assertEqual(record["pid"], os.getpid())
++        self.assertIn("process_created", record)
++        self.assertEqual(record["status"], "completed")
++        self.assertEqual(record["phase"], "finished")
++        self.assertEqual(record["research_status"], "completed")
++        self.assertEqual(record["report_status"], "ready")
++        self.assertEqual(calls, [prepared.manifest])
++
++    async def test_a_foreign_identity_is_never_claimed(self) -> None:
++        """E2: an identity another process recorded is left untouched."""
++        prepared = self._prepare("foreign")
++        directory = run_dir("foreign")
++        record = read_record(directory)
++        record.update(pid=os.getpid() + 1, process_created=1.0)
++        from scienceflow.runtime.parallel.control.registry import write_record
++
++        write_record(directory, record)
++        research = mock.AsyncMock()
++        await worker.supervise("foreign", prepared.launch_token, research=research)
++        research.assert_not_called()
++        self.assertEqual(read_record(directory)["pid"], os.getpid() + 1)
++        self.assertEqual(read_record(directory)["status"], "starting")
++
++    async def test_a_wrong_launch_token_is_refused(self) -> None:
++        prepared = self._prepare("token")
++        research = mock.AsyncMock()
++        await worker.supervise("token", prepared.launch_token + "0", research=research)
++        research.assert_not_called()
++        self.assertNotIn("pid", read_record(run_dir("token")))
++
++    async def test_a_pending_stop_is_stated_positively(self) -> None:
++        """E3: a stop that predates the supervisor writes the not-started record."""
++        prepared = self._prepare("pending")
++        stop_event = asyncio.Event()
++        stop_event.set()
++        research = mock.AsyncMock()
++        ready: list[bool] = []
++        await worker.supervise(
++            "pending",
++            prepared.launch_token,
++            stop_event=stop_event,
++            on_ready=lambda: ready.append(True),
++            research=research,
++        )
++        record = read_record(run_dir("pending"))
++        self.assertEqual(record["status"], "stopped")
++        self.assertEqual(record["phase"], "finished")
++        self.assertEqual(record["research_status"], "not-started")
++        self.assertEqual(record["report_status"], "none")
++        self.assertNotEqual(record["status"], "running")
++        research.assert_not_called()
++        # The short-circuit happens before the supervisor is ready: nothing was
++        # armed, so there is no control task to leave behind either.
++        self.assertEqual(ready, [])
++
++    async def test_the_research_phase_is_cancelled_once(self) -> None:
++        """E3: one intent cancels the bound supervisor once and cleans up."""
++        prepared = self._prepare("research-stop")
++        stop_event = asyncio.Event()
++        cancelled: list[int] = []
++
++        async def research(manifest: str):
++            try:
++                await asyncio.sleep(30)
++            except asyncio.CancelledError:
++                cancelled.append(1)
++                raise
++            raise AssertionError("research was not cancelled")
++
++        async def stop_later():
++            await asyncio.sleep(0.1)
++            stop_event.set()
++
++        async def finalize(record: dict):
++            return [], False
++
++        starter = asyncio.create_task(stop_later())
++        with mock.patch(
++            "scienceflow.runtime.parallel.control.reporting.finalize_reports", finalize,
++        ):
++            await worker.supervise(
++                "research-stop", prepared.launch_token, stop_event=stop_event, research=research,
++            )
++        await starter
++        # No control task (and no waiter of any kind) survives the attempt.
++        leftovers = [
++            task for task in asyncio.all_tasks()
++            if getattr(task.get_coro(), "__qualname__", "").endswith("_cancel_once")
++        ]
++        self.assertEqual(leftovers, [])
++        record = read_record(run_dir("research-stop"))
++        self.assertEqual(record["research_status"], "stopped")
++        self.assertEqual(record["report_status"], "generation_failed")
++        self.assertEqual(len(cancelled), 1)
++        self.assertEqual(record["research_status"], "stopped")
++        self.assertEqual(record["report_status"], "generation_failed")
++
++    async def test_a_stop_during_reporting_keeps_the_research_outcome(self) -> None:
++        """E4: a reporting stop is incomplete, not a research failure."""
++        prepared = self._prepare("report-stop")
++        stop_event = asyncio.Event()
++        cancelled: list[int] = []
++        started = asyncio.Event()
++
++        async def research(manifest: str):
++            return _Summary()
++
++        async def finalize(record: dict):
++            started.set()
++            try:
++                await asyncio.sleep(30)
++            except asyncio.CancelledError:
++                cancelled.append(1)
++                raise
++            return [{"status": "ready"}], False
++
++        async def stop_later():
++            await started.wait()
++            stop_event.set()
++
++        starter = asyncio.create_task(stop_later())
++        with mock.patch(
++            "scienceflow.runtime.parallel.control.reporting.finalize_reports", finalize,
++        ):
++            await worker.supervise(
++                "report-stop", prepared.launch_token, stop_event=stop_event, research=research,
++            )
++        await starter
++        record = read_record(run_dir("report-stop"))
++        self.assertEqual(record["research_status"], "completed")
++        self.assertEqual(record["report_status"], "incomplete")
++        self.assertEqual(record["status"], "completed")
++        self.assertEqual(record["phase"], "finished")
++        self.assertEqual(len(cancelled), 1)
++
++    async def test_a_natural_end_leaves_no_control_task(self) -> None:
++        """E3: the control task is cancelled and awaited on the normal path."""
++        prepared = self._prepare("natural")
++        stop_event = asyncio.Event()
++
++        async def research(manifest: str):
++            await asyncio.sleep(0)
++            return _Summary()
++
++        async def finalize(record: dict):
++            return [{"status": "generation_failed"}], False
++
++        before = len(asyncio.all_tasks())
++        with mock.patch(
++            "scienceflow.runtime.parallel.control.reporting.finalize_reports", finalize,
++        ):
++            await worker.supervise(
++                "natural", prepared.launch_token, stop_event=stop_event, research=research,
++            )
++        self.assertEqual(len(asyncio.all_tasks()), before)
++        # The intent was never consumed by anyone.
++        self.assertFalse(stop_event.is_set())
++        self.assertEqual(read_record(run_dir("natural"))["report_status"], "generation_failed")
++
++    async def test_the_legacy_stopping_status_still_cancels_the_worker(self) -> None:
++        """The CLI's stop path is unchanged when no host stop event is passed."""
++        prepared = self._prepare("legacy")
++        # `stop_run()` writes `stopping` and signals; a stop that lands in the
++        # window before the worker adopts the record must still cancel it.
++        from scienceflow.runtime.parallel.control.registry import write_record
++
++        stopped = read_record(run_dir("legacy"))
++        stopped["status"] = "stopping"
++        write_record(run_dir("legacy"), stopped)
++        entered: list[int] = []
++        cancelled: list[int] = []
++
++        async def research(manifest: str):
++            entered.append(1)
++            try:
++                await asyncio.sleep(30)
++            except asyncio.CancelledError:
++                cancelled.append(1)
++                raise
++
++        async def finalize(record: dict):
++            return [], False
++
++        with mock.patch(
++            "scienceflow.runtime.parallel.control.reporting.finalize_reports", finalize,
++        ):
++            await worker.supervise("legacy", prepared.launch_token, research=research)
++        record = read_record(run_dir("legacy"))
++        # The CLI's cancel arrives at the research step's first suspension, and
++        # the supervisor is stopped exactly as the detached worker always was.
++        self.assertEqual(entered, [1])
++        self.assertEqual(cancelled, [1])
++        self.assertEqual(record["research_status"], "stopped")
++        self.assertEqual(record["phase"], "finished")
++
++    def test_the_public_entry_points_keep_their_shapes(self) -> None:
++        self.assertTrue(callable(prepare_run))
++        self.assertIsInstance(worker.run_manifest, type(None))
++        self.assertEqual(PreparedRun.__slots__, ("directory", "record"))
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.34.1
+
