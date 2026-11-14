@@ -209,14 +209,19 @@ Consequences to accept explicitly:
   it exists, **B2 and B3 stay blocked**, and the next implementation slice does
   not build the gateway.
 
-Round 17 update (2026-11-14, design only): the transport, the egress contract,
-the identity tuple and the reservation ledger are now specified in
+Round 17 update (2026-11-14, design only; revised after the round-17 review):
+the transport, the egress contract, the identity tuple and the reservation
+ledger are now specified in
 [`scienceflow-model-gateway-budget.md`](./scienceflow-model-gateway-budget.md).
-That note selects a bind-mounted Unix socket behind the existing sandbox
-forwarder, adds one seccomp variant with an address-family domain filter, and
-keeps spend explicitly unenforceable. It is **not implemented**, it clears no
-blocker, and the paragraph above remains the state of the code: B2 and B3 stay
-blocked until the real-provider evidence named there exists.
+That note selects an inherited socketpair descriptor behind the existing sandbox
+forwarder — so `AF_UNIX` stays denied inside the sandbox and a host socket left
+in a mounted directory is unreachable — adds one seccomp variant that permits
+only `socket(AF_INET, SOCK_STREAM)`, narrows the promise to requests, bytes,
+concurrency and time (reported tokens are accounting, spend is not
+enforceable), and requires a child interpreter/source probe before any run. It
+is **not implemented**, it clears no blocker, and the paragraph above remains
+the state of the code: B2 and B3 stay blocked until the real-provider evidence
+named there exists.
 
 ### 2.2 Budget: who enforces what
 
