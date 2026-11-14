@@ -22,7 +22,7 @@ import {
   type SpawnedExecution,
 } from "./execution-boundary.js";
 import { ResearchRunError, parseResearchRunRequest, researchExecutionState, researchPublishable, researchRefusalMessage, researchRunDeadlines, researchStopId, verifiedResearchInputs, type ResearchRunExecutor } from "./research-run.js";
-import type { ExecutionLogPage, ExecutionOwner, ManagedExecution, ResearchPhase, ResearchReportOutcome, ResearchRunRequest, ResearchRunStatus, ResearchStopState, ShellExecutionRequest, ShellExecutionResult } from "@sciencediscovery/schema";
+import type { ExecutionLogPage, ExecutionOwner, ManagedExecution, ResearchEngineEvidence, ResearchPhase, ResearchReportOutcome, ResearchRunRequest, ResearchRunStatus, ResearchStopState, ShellExecutionRequest, ShellExecutionResult } from "@sciencediscovery/schema";
 
 export type ExecutionLogSink = (stream: "stdout" | "stderr", chunk: Buffer) => void;
 /**
@@ -72,6 +72,68 @@ const conflict = () => new ExecutionManagerError("EXECUTION_ID_CONFLICT", "Execu
 const PHASE_RANK: Readonly<Record<ResearchPhase | "unknown", number>> = { unknown: 0, research: 1, reporting: 2, finished: 3 };
 const REPORT_RANK: Readonly<Record<ResearchReportOutcome, number>> = { none: 0, unknown: 0, generating: 1, incomplete: 2, failed: 2, ready: 3 };
 const STOP_RANK: Readonly<Record<ResearchStopState, number>> = { none: 0, requested: 1, unconfirmed: 2, consumed: 2 };
+
+/**
+ * Validate engine evidence before it can enter the ledger.
+ *
+ * The ledger keeps this association for the whole life of a run, so it is
+ * checked like the verified input set: a whitelisted shape, a run id the engine
+ * could have chosen, a full revision, a 64-hex derived digest and a positive
+ * attempt and mapping version. Anything else is not evidence about this
+ * execution and must not be stored.
+ */
+export function validResearchEngine(value: unknown): ResearchEngineEvidence | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const allowed = ["attempt", "derivedManifestDigest", "engineRunId", "mappingVersion", "revision", "version"];
+  if (Object.keys(record).some((key) => !allowed.includes(key))) return null;
+  if (typeof record.engineRunId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/.test(record.engineRunId)) return null;
+  if (!Number.isSafeInteger(record.attempt) || (record.attempt as number) < 1) return null;
+  if (typeof record.revision !== "string" || !/^[0-9a-f]{40}$/.test(record.revision)) return null;
+  if (typeof record.version !== "string" || record.version.trim().length === 0 || record.version.length > 64) return null;
+  if (typeof record.derivedManifestDigest !== "string" || !/^[0-9a-f]{64}$/.test(record.derivedManifestDigest)) return null;
+  if (!Number.isSafeInteger(record.mappingVersion) || (record.mappingVersion as number) < 1) return null;
+  return {
+    attempt: record.attempt as number,
+    derivedManifestDigest: record.derivedManifestDigest,
+    engineRunId: record.engineRunId,
+    mappingVersion: record.mappingVersion as number,
+    revision: record.revision,
+    version: record.version,
+  };
+}
+
+function sameResearchEngine(left: ResearchEngineEvidence, right: ResearchEngineEvidence): boolean {
+  return left.engineRunId === right.engineRunId
+    && left.attempt === right.attempt
+    && left.revision === right.revision
+    && left.version === right.version
+    && left.derivedManifestDigest === right.derivedManifestDigest
+    && left.mappingVersion === right.mappingVersion;
+}
+
+/**
+ * Merge one engine association into the durable one.
+ *
+ * The first association this ledger accepted is the association of record: a
+ * later observation may confirm it but never replace it, and a stored row that
+ * is corrupt is a conflict rather than a value to overwrite. `conflict` is the
+ * caller's instruction to refuse the run, not to pick either side.
+ */
+export function mergeResearchEngine(
+  persisted: unknown,
+  reported: unknown,
+): { readonly engine: ResearchEngineEvidence | undefined; readonly conflict: boolean } {
+  const stored = persisted === undefined ? null : validResearchEngine(persisted);
+  const incoming = reported === undefined ? null : validResearchEngine(reported);
+  if (persisted !== undefined && stored === null) return { conflict: true, engine: undefined };
+  if (reported !== undefined && incoming === null) return { conflict: true, engine: stored ?? undefined };
+  if (stored === null) return { conflict: false, engine: incoming ?? undefined };
+  if (incoming === null) return { conflict: false, engine: stored };
+  return sameResearchEngine(stored, incoming)
+    ? { conflict: false, engine: stored }
+    : { conflict: true, engine: stored };
+}
 
 /**
  * A research request is the only shape with a workload kind. A shell request
@@ -394,6 +456,7 @@ export class ExecutionManager {
       return withWorkspaceAdmission(this.versions, key, () => withWorkspaceLease(key, async () => {
       if (!shell?.explicitHandoff) await ensureWorkspaceBaseline(this.versions, key);
       let changed = false;
+      let engineConflict = false;
       let resourcesRecorded = false;
       let cursor = 0;
       let retained = 0;
@@ -462,6 +525,19 @@ export class ExecutionManager {
           // result. Workload output was never forwarded to the log sink.
           execution.result = returned.result;
           execution.research = returned.research;
+          // The engine association the ledger already persisted outlives this
+          // in-memory result: a returned status can confirm it but can neither
+          // drop it nor replace it. The durable row is read here because the
+          // observation path wrote it, not the operation's own copy.
+          const stored = this.db.prepare("SELECT record FROM executions WHERE id = ?").get(execution.id);
+          const durableEngine = stored
+            ? (JSON.parse(String(stored.record)) as ManagedExecution).research?.engine
+            : undefined;
+          const engine = mergeResearchEngine(durableEngine, returned.research.engine);
+          if (engine.conflict) engineConflict = true;
+          if (engine.engine !== undefined) {
+            execution.research = { ...execution.research, engine: engine.engine };
+          }
           const reportedInputs = execution.research.inputs;
           const declaredInputs = researchRequest?.inputs;
           if (declaredInputs !== undefined && (reportedInputs === undefined
@@ -543,14 +619,16 @@ export class ExecutionManager {
       // state. A missing, late or unreadable record is `unknown`; this path
       // keeps the workspace, environment and device fences exactly like an
       // unverified process would.
-      if (changed && researchRequest && !researchPublishable(execution.research)) {
+      if (changed && researchRequest && (engineConflict || !researchPublishable(execution.research))) {
         execution.state = "unknown";
         delete execution.finishedAt;
         delete execution.result;
-        execution.error = execution.research?.inputs !== undefined
-          && execution.research.inputs.state !== "verified"
-          ? "Research workload ended without a verified input set for this execution; its business state is unknown and its resources stay fenced"
-          : "Research workload ended without a terminal research record; its business state is unknown and its resources stay fenced";
+        execution.error = engineConflict
+          ? "Research workload reported an engine association that conflicts with the one this ledger already recorded; its business state is unknown and its resources stay fenced"
+          : execution.research?.inputs !== undefined
+            && execution.research.inputs.state !== "verified"
+            ? "Research workload ended without a verified input set for this execution; its business state is unknown and its resources stay fenced"
+            : "Research workload ended without a terminal research record; its business state is unknown and its resources stay fenced";
         this.quarantine(execution);
         this.save(execution);
         await this.releaseResources(execution.id, new ProcessTerminationUnverifiedError(execution.error));
@@ -862,6 +940,15 @@ export class ExecutionManager {
         if (verified === null) throw new Error("The observed input evidence is not self-consistent");
         research = { ...research, inputs: verified };
       }
+    }
+    const engine = observed?.engine;
+    if (engine !== undefined) {
+      // The engine association is durable evidence, not a progress note: the
+      // first one this ledger recorded is kept, a conflicting one is refused,
+      // and a corrupt stored value is never silently replaced.
+      const merged = mergeResearchEngine(research.engine, engine);
+      if (merged.conflict) throw new Error("The observed engine association conflicts with the one already recorded");
+      if (merged.engine !== undefined) research = { ...research, engine: merged.engine };
     }
     execution.research = research;
     this.save(execution);
