@@ -16,7 +16,7 @@ import { randomUUID } from "node:crypto";
 import { hostname, userInfo } from "node:os";
 import { constants } from "node:fs/promises";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import type { Readable } from "node:stream";
+import type { Readable, Stream } from "node:stream";
 import { access, mkdir, mkdtemp, open, readdir, realpath, rm, stat, writeFile, type FileHandle } from "node:fs/promises";
 import { dirname, delimiter, isAbsolute, relative, resolve, sep } from "node:path";
 
@@ -826,6 +826,50 @@ export interface SandboxEgress {
   proxyPort?: number;
 }
 
+/** Fixed sandbox path the research workload's engine source is mounted at. */
+export const RESEARCH_ENGINE_MOUNT = "/scienceflow-engine";
+/**
+ * The checkout's own `.venv`, when the host has one. It is masked by an empty
+ * tmpfs so `resolve_project_python()` cannot pick a source-side interpreter.
+ */
+export const RESEARCH_ENGINE_VENV_MASK = `${RESEARCH_ENGINE_MOUNT}/.venv`;
+
+/**
+ * The research source layout: the trusted checkout at a fixed sandbox path,
+ * with the checkout's `.venv` optionally masked. Internal and test-facing; no
+ * request, environment profile or product route selects it. It exists so the
+ * research-layout proof can mount exactly what a managed run would.
+ */
+export interface SandboxResearchEngine {
+  /** Host path of the trusted checkout; absolute and never the root. */
+  readonly sourceRoot: string;
+  /**
+   * Mask `<sourceRoot>/.venv` with an empty tmpfs so the interpreter walk in
+   * `resolve_project_python()` cannot pick a source-side interpreter.
+   *
+   * The mask is applied **only when the host checkout really has a `.venv`
+   * directory**. That is a measured constraint, not a preference: bubblewrap
+   * refuses to create the mount point of a `--tmpfs` inside a read-only bind —
+   * `bwrap: Can't create file /scienceflow-engine/.venv: Read-only file
+   * system` — so masking an absent directory would fail the whole launch. A
+   * checkout without `.venv` needs no mask, because the walk already falls back
+   * to `sys.executable`; a `.venv` that is not a directory is refused rather
+   * than approximated.
+   */
+  readonly maskVirtualEnv?: boolean;
+}
+
+/**
+ * Everything a launch needs when a fixed relay process runs as the sandbox
+ * entrypoint and executes the real argv as its own child. The binds are host
+ * paths at fixed sandbox locations; the prefix never contains a caller-chosen
+ * program.
+ */
+export interface SandboxTunnel {
+  bindArgs: string[];
+  commandPrefix: string[];
+}
+
 /**
  * Resolve the egress plumbing for one execution. `none` needs nothing;
  * `domain-allowlist` fails closed when the host has no bridge interpreter or
@@ -927,11 +971,32 @@ export function buildSandboxLaunch(options: {
    * checkout this way); it is never derived from a request field.
    */
   readOnlyHostBinds?: readonly string[];
+  /** Research source layout; see `SandboxResearchEngine`. */
+  researchEngine?: SandboxResearchEngine;
   skillRoots?: SandboxSkillRoots;
+  /**
+   * The fixed entry prefix and its read-only mounts when the launch runs a
+   * relay that then executes the real argv as its child. Internal and
+   * test-facing in this round: the research model tunnel is its only caller and
+   * no request can select it. A launch that also uses the egress bridge is
+   * refused, because two entry prefixes would both have to fork the workload.
+   */
+  tunnel?: SandboxTunnel;
   workspaceBindArgs: string[];
 }): SandboxLaunch {
+  if (options.tunnel && options.egress) {
+    // Both would be an entry prefix that forks the workload; only one process
+    // can be the sandbox entrypoint that execs the real argv.
+    throw new Error("A sandbox launch cannot run both the egress bridge and the model tunnel relay");
+  }
   // Runner-owned baseline first; profile variables never override it
   // (profileKeyAllowed re-checks the reserved/blocked policy defensively).
+  if (options.researchEngine) {
+    const { sourceRoot } = options.researchEngine;
+    if (!isAbsolute(sourceRoot) || sourceRoot.includes("\0") || sourceRoot === "/") {
+      throw new TypeError("researchEngine.sourceRoot must be an absolute non-root path");
+    }
+  }
   // Ascend host tools such as npu-smi ship in /usr/local/bin, which `/usr` is
   // bound into the sandbox but the ordinary PATH omits; expose it only when
   // the launch carries NPUs so non-NPU sandboxes stay byte-for-byte unchanged.
@@ -985,7 +1050,16 @@ export function buildSandboxLaunch(options: {
       // checkout only). Mounted at their own path so an interpreter inside the
       // sandbox resolves exactly the `sys.path` a future execution would see.
       ...(options.readOnlyHostBinds ?? []).flatMap((path) => ["--ro-bind", path, path]),
+      ...(options.researchEngine
+        ? [
+            "--ro-bind", options.researchEngine.sourceRoot, RESEARCH_ENGINE_MOUNT,
+            // An empty tmpfs over the checkout's `.venv`: the host directory is
+            // not exposed, and the interpreter walk cannot resolve into it.
+            ...(options.researchEngine.maskVirtualEnv ? ["--tmpfs", RESEARCH_ENGINE_VENV_MASK] : []),
+          ]
+        : []),
       ...(options.egress?.bindArgs ?? []),
+      ...(options.tunnel?.bindArgs ?? []),
       ...options.workspaceBindArgs,
       ...(options.skillRoots ? [
         "--ro-bind", options.skillRoots.packagesRoot, SANDBOX_SKILL_PACKAGES_ROOT,
@@ -997,7 +1071,7 @@ export function buildSandboxLaunch(options: {
       "--seccomp", "3",
     ],
     chdir: options.chdir,
-    commandPrefix: options.egress?.commandPrefix ?? [],
+    commandPrefix: options.tunnel?.commandPrefix ?? options.egress?.commandPrefix ?? [],
     env,
     sandbox: "bubblewrap",
   };
@@ -1103,8 +1177,12 @@ export interface PreparedSandboxOptions {
   pythonPathEnv?: string;
   /** Extra read-only host paths; see `buildSandboxLaunch`. */
   readOnlyHostBinds?: readonly string[];
+  /** Research source layout; see `SandboxResearchEngine`. */
+  researchEngine?: SandboxResearchEngine;
   readOnlyWorkspaceRoot?: string;
   skillRoots?: SandboxSkillRoots;
+  /** See `buildSandboxLaunch`; bubblewrap only. */
+  tunnel?: SandboxTunnel;
   workspaceBindArgs: string[];
   workspaceRoot: string;
 }
@@ -1167,6 +1245,35 @@ function buildDirectLaunch(options: {
   };
 }
 
+/**
+ * Decide, against the host, whether the `.venv` mask can and must be applied.
+ *
+ * bubblewrap cannot create a mount point inside the read-only source bind, so a
+ * `--tmpfs` whose target is absent fails the launch with `Read-only file
+ * system`. The mask is therefore emitted only when the checkout really carries a
+ * `.venv` directory; anything else at that path, or an unreadable one, is a
+ * refusal rather than a silently different interpreter.
+ */
+async function resolvedResearchEngine(
+  engine: SandboxResearchEngine,
+): Promise<SandboxResearchEngine> {
+  const { sourceRoot } = engine;
+  let kind: "absent" | "directory" | "other";
+  try {
+    kind = (await stat(resolve(sourceRoot, ".venv"))).isDirectory() ? "directory" : "other";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    kind = "absent";
+  }
+  if (kind === "other") {
+    throw new Error("The research checkout's .venv is not a directory and cannot be masked");
+  }
+  return {
+    maskVirtualEnv: engine.maskVirtualEnv === true && kind === "directory",
+    sourceRoot,
+  };
+}
+
 /** Build one platform-neutral launch used by ephemeral and persistent tools. */
 export async function prepareSandboxLaunch(
   config: SandboxRuntimeConfig,
@@ -1182,13 +1289,28 @@ export async function prepareSandboxLaunch(
     }
   }
   if (executorSandboxKind(config) === "seatbelt") {
+    if (options.tunnel) {
+      // The tunnel is a bubblewrap descriptor hand-off; Seatbelt has no proven
+      // analogue, and silently dropping the entry prefix would run the workload
+      // without its transport.
+      throw new Error("A model tunnel relay launch requires the bubblewrap sandbox");
+    }
+    if (options.researchEngine) {
+      // The fixed research mount path is a bubblewrap mount; Seatbelt maps host
+      // paths instead and has no equivalent, so refuse rather than approximate.
+      throw new Error("A research source layout requires the bubblewrap sandbox");
+    }
     return await buildSeatbeltLaunch(config, {
       ...options,
       readPaths: [...options.environmentPaths, ...(options.readOnlyHostBinds ?? [])],
     });
   }
+  const researchEngine = options.researchEngine
+    ? await resolvedResearchEngine(options.researchEngine)
+    : undefined;
   const launch = buildSandboxLaunch({
     ...options,
+    researchEngine,
     ...await sandboxLaunchProfile(config.bwrapPath),
   });
   launch.executable = config.bwrapPath;
@@ -1386,6 +1508,21 @@ async function stopUnrecordedSandbox(
   return (!child.pid || sandbox !== "bubblewrap") && joined;
 }
 
+/**
+ * One already-connected stream the sandbox payload must receive on a fixed
+ * descriptor. The Runner keeps the other end; only the sandbox's end is handed
+ * over here, and it is never named on the filesystem or mounted.
+ */
+export interface SandboxInheritedDescriptor {
+  /**
+   * stdio index inside the child. `3` is reserved by `--seccomp 3`, so the
+   * model tunnel uses `4`; nothing else may claim either one.
+   */
+  readonly index: number;
+  /** Connected duplex stream whose descriptor the payload adopts. */
+  readonly stream: Stream;
+}
+
 /** Spawn through the selected sandbox and attach Linux seccomp when applicable. */
 export async function spawnSandboxProcess(
   config: SandboxRuntimeConfig,
@@ -1394,9 +1531,27 @@ export async function spawnSandboxProcess(
   seccompVariant: SeccompVariant,
   closeFilter: (handle: FileHandle) => Promise<void> = (handle) => handle.close(),
   onSpawned?: (child: ChildProcessWithoutNullStreams, sandbox: SandboxKind) => void,
+  /**
+   * Optional extra descriptor for the payload. Absent for every caller today;
+   * only a launch that has proven the descriptor path may pass one, because a
+   * descriptor that never arrives must fail the launch rather than degrade.
+   */
+  inherited?: SandboxInheritedDescriptor,
 ): Promise<ChildProcessWithoutNullStreams> {
   const kind = launch.sandbox ?? executorSandboxKind(config);
   const graceMs = config.terminationGraceMs ?? DEFAULT_TERMINATION_GRACE_MS;
+  if (inherited) {
+    // Refuse instead of silently dropping the descriptor: a payload that
+    // expects a tunnel but is spawned without one would start a research
+    // workload with no transport, which is the failure this parameter exists
+    // to make loud. Only bubblewrap has a proven descriptor path.
+    if (kind !== "bubblewrap") {
+      throw new Error("Inherited descriptors are supported only by the bubblewrap sandbox");
+    }
+    if (!Number.isSafeInteger(inherited.index) || inherited.index < 4) {
+      throw new Error("An inherited descriptor index must be an integer of at least 4");
+    }
+  }
   // The record callback runs after the process exists but before anyone else
   // can hear about it. If it fails (an unreadable identity, or the ledger
   // refusing the row), the child is still ours and still running: stop it and
@@ -1443,6 +1598,13 @@ export async function spawnSandboxProcess(
       filter = await open(await ensureSeccompFilter(config.dataDir, seccompVariant), "r");
     }
     const processGroup = kind === "bubblewrap";
+    const stdio: Array<"pipe" | Stream | number> = filter
+      ? ["pipe", "pipe", "pipe", filter.fd]
+      : ["pipe", "pipe", "pipe"];
+    if (inherited) {
+      while (stdio.length < inherited.index) stdio.push("pipe");
+      stdio[inherited.index] = inherited.stream;
+    }
     const child = spawn(launch.executable ?? config.bwrapPath, [
       // Node establishes a new session before exec. Keep bwrap's namespace init
       // in that group: --new-session would move it out of reach of group kill.
@@ -1453,7 +1615,7 @@ export async function spawnSandboxProcess(
       detached: processGroup,
       ...(launch.hostCwd ? { cwd: launch.hostCwd } : {}),
       env: launch.sandbox === "seatbelt" ? launch.env : undefined,
-      stdio: filter ? ["pipe", "pipe", "pipe", filter.fd] : ["pipe", "pipe", "pipe"],
+      stdio,
     }) as ChildProcessWithoutNullStreams;
     ownSandboxChild(child);
     if (processGroup) {
