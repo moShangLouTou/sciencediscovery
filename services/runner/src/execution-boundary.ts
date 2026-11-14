@@ -34,6 +34,7 @@ import {
 } from "@sciencediscovery/sandbox-capability";
 import type {
   ExecutionBoundaryStatus,
+  ResearchEngineEvidence,
   ResearchInputEvidence,
   ResearchOutcome,
   ResearchPhase,
@@ -93,6 +94,12 @@ export interface ExecutionObservation {
      * `verified` record back to the caller's declaration.
      */
     readonly inputs?: ResearchInputEvidence;
+    /**
+     * The engine's own managed run, reported once by the fixed bridge. It binds
+     * the engine identity to this execution; it never replaces the execution id
+     * and it is not a business result.
+     */
+    readonly engine?: ResearchEngineEvidence;
   };
 }
 

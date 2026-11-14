@@ -201,8 +201,34 @@ export const RESEARCH_REFUSAL_CODES = [
   "RESEARCH_INPUT_REQUIRED",
   "RESEARCH_INPUT_UNAVAILABLE",
   "RESEARCH_INPUT_COPY_FAILED",
+  "RESEARCH_ENGINE_NOT_CONFIGURED",
+  "RESEARCH_ENGINE_UNAVAILABLE",
+  "RESEARCH_ENGINE_IDENTITY_MISMATCH",
 ] as const;
 export type ResearchRefusalCode = typeof RESEARCH_REFUSAL_CODES[number];
+
+/**
+ * The engine run one execution created, as the fixed bridge reported it.
+ *
+ * The engine's own run id and attempt are recorded next to, never in place of,
+ * the execution id: they name the managed record the patched engine wrote, and
+ * the association is persisted with the run. The engine's launch token is not
+ * part of this evidence.
+ */
+export interface ResearchEngineEvidence {
+  readonly engineRunId: string;
+  readonly attempt: number;
+  readonly revision: string;
+  readonly version: string;
+  /**
+   * SHA-256 of the derived launch manifest the bridge generated from the
+   * frozen inputs, and the version of the fixed mapping that produced it. The
+   * original bundle bytes are unchanged; this digest describes only the
+   * Runner-side derivative and never stands in for `contractDigest`.
+   */
+  readonly derivedManifestDigest: string;
+  readonly mappingVersion: number;
+}
 
 /**
  * The additive, host-free projection of one research run.
@@ -255,6 +281,12 @@ export interface ResearchRunStatus {
    * set. Absent on records written before input consumption existed.
    */
   readonly inputs?: ResearchInputEvidence;
+  /**
+   * The engine's own managed run this execution created. Present only when the
+   * fixed bridge created one and reported it; it binds the two identities
+   * without letting either stand in for the other.
+   */
+  readonly engine?: ResearchEngineEvidence;
   readonly refusal?: ResearchRefusalCode;
   readonly observedAt: string;
 }
