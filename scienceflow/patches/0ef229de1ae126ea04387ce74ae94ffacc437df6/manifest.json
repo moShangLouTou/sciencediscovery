@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "engine": "scienceflow",
   "baseRevision": "0ef229de1ae126ea04387ce74ae94ffacc437df6",
-  "patchedRevision": "d6d4b77f93061ced9ae3e3d8c10c0f70f28113a9",
-  "patchedTree": "ec041398d2ce81f432d39be2784c27bb4f94bc01",
+  "patchedRevision": "e1347021eaa497d2dc138d9e66ce36e09260568a",
+  "patchedTree": "f1f1567e17946e7d3d1c5fefe66ef811e24b7078",
   "patches": [
     {
       "path": "0001-feat-control-prepare-a-managed-run-without-spawning-.patch",
@@ -16,6 +16,10 @@
     {
       "path": "0003-fix-control-tell-a-reporting-stop-apart-from-a-repor.patch",
       "sha256": "35f3445df67c24e9cfbbe6a1ace6e58492322e7a530db19d89135cc450f84728"
+    },
+    {
+      "path": "0004-feat-execution-run-the-engine-s-own-child-entries-with.patch",
+      "sha256": "b0330a17e9e0e42c0d194755f0c70122eb44e2154585ae826844bf8a9cf4938e"
     }
   ]
 }

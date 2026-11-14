@@ -1,15 +1,15 @@
 # ScienceFlow managed-lifecycle patch
 
 This directory pins the engine change the Runner's research workload depends on.
-It is a reproducible dependency, not a copy of the engine: the three patches
+It is a reproducible dependency, not a copy of the engine: the four patches
 apply to the base commit and rebuild the exact tree recorded in `manifest.json`.
 
 | item | value |
 | --- | --- |
 | base commit | `0ef229de1ae126ea04387ce74ae94ffacc437df6` |
-| patched commit | `d6d4b77f93061ced9ae3e3d8c10c0f70f28113a9` |
-| patched tree | `ec041398d2ce81f432d39be2784c27bb4f94bc01` |
-| patches | `0001-…` (`feat(control)`), `0002-…` (`test(control)`), `0003-…` (`fix(control)`) |
+| patched commit | `e1347021eaa497d2dc138d9e66ce36e09260568a` |
+| patched tree | `f1f1567e17946e7d3d1c5fefe66ef811e24b7078` |
+| patches | `0001-…` (`feat(control)`), `0002-…` (`test(control)`), `0003-…` (`fix(control)`), `0004-…` (`feat(execution)`) |
 
 `manifest.json` also pins each patch's SHA-256.
 
@@ -43,6 +43,14 @@ apply to the base commit and rebuild the exact tree recorded in `manifest.json`.
   process that exits non-zero is still its own failure; the three facts are no
   longer collapsed.
 
+- **EC6 — `-P` on the engine's own `-m` children.** The prep worker, the
+  research task worker (`child_cli_argv`) and the report child
+  (`finalize_reports`) start with `-P` before `-m`, so `cwd` is never prepended
+  to `sys.path`. With the engine mounted read-only and named on `PYTHONPATH`, a
+  `scienceflow` package left in the attempt's writable workspace cannot become
+  the entry of an engine process. Arbitrary research shell subprocesses are not
+  changed: they remain untrusted research code and keep their sibling imports.
+
 Three seams exist for hosts and tests only, and none replaces the supervisor, the
 registry or a state transition: `research=` (default: the engine's own
 `run_manifest`, still reachable as the `worker.run_manifest` module attribute),
@@ -70,12 +78,14 @@ one. It never fetches, installs or writes to the source checkout.
 
 ## Engine tests
 
-The patch's own tests live in `tests/test_managed_lifecycle.py` and need only the
-standard library plus `psutil` (the supervisor's identity check) and the engine's
-own package path:
+The patch's own tests live in `tests/test_managed_lifecycle.py` (stdlib plus
+`psutil`, the supervisor's identity check) and in
+`tests/test_parallel_runner_prep.py` (pytest, for the argv builders). Both need
+the engine's own package path:
 
 ```bash
 PYTHONPATH=/tmp/engine python3 -m unittest tests.test_managed_lifecycle -v
+PYTHONPATH=/tmp/engine python3 -m pytest tests/test_parallel_runner_prep.py -q
 ```
 
 They exercise the real arming half, the real supervisor, the real registry and —
