@@ -3,9 +3,11 @@
 import { createTest } from "../../../test/support/tagged/compat.mjs";
 const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:linux", "arch:amd64", "arch:arm64"] });
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmod,
+  link,
   lstat,
   mkdir,
   mkdtemp,
@@ -16,6 +18,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { resolve } from "node:path";
+import { promisify } from "node:util";
 
 import {
   canonicalScienceFlowInputBundleManifest,
@@ -34,6 +37,27 @@ const CONTRACT_DIGEST = "a".repeat(64);
 
 const digest = (bytes: Uint8Array): string =>
   createHash("sha256").update(bytes).digest("hex");
+
+const invalid = (error: unknown): boolean =>
+  error instanceof ScienceFlowInputBundleError && error.kind === "invalid";
+const corrupt = (error: unknown): boolean =>
+  error instanceof ScienceFlowInputBundleError && error.kind === "corrupt";
+
+const execFileAsync = promisify(execFile);
+
+/** A bundle with its own digest, so each case owns a distinct tree. */
+function variant(label: string): ScienceFlowInputBundleRequest {
+  return bundle([
+    entry("manifest.yaml", ["manifest"], `manifest ${label}\n`),
+    entry("package/task.yaml", ["task_yaml"], "id: t\n"),
+    entry("package/description.md", ["description"], "description\n"),
+    entry("package/evaluate.py", ["evaluator"], "def score():\n  return 0\n"),
+  ]);
+}
+
+function bundleRoot(root: string, request: ScienceFlowInputBundleRequest): string {
+  return resolve(root, ".scienceflow-input-bundles", request.bundleDigest);
+}
 
 async function dataDir(): Promise<string> {
   await mkdir(resolve(process.cwd(), ".tmp"), { recursive: true });
@@ -285,4 +309,122 @@ test("BUNDLE-R06 a traversal-shaped path never reaches the filesystem", async (c
       error instanceof ScienceFlowInputBundleError && error.kind === "invalid",
   );
   await assert.rejects(lstat(resolve(root, "escape.yaml")), /ENOENT/);
+});
+
+test("BUNDLE-R07 an existing bundle never skips this request's byte check", async (context) => {
+  const root = await dataDir();
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const store = new RunnerScienceFlowInputBundles(root);
+  const request = bundle();
+  await store.put(request);
+
+  const evaluator = request.entries.find(
+    (entry) => entry.path === "package/evaluate.py",
+  );
+  if (!evaluator) assert.fail("expected an evaluator entry");
+  // Same declared size, same declared digest, different bytes: only the
+  // request's own content can reveal it.
+  const replacement = Buffer.from("def score():\n  return 1\n", "utf8");
+  assert.equal(replacement.length, evaluator.size);
+  const wrong = {
+    ...request,
+    entries: request.entries.map((entry) =>
+      entry.path === "package/evaluate.py"
+        ? { ...entry, content: replacement.toString("base64") }
+        : entry,
+    ),
+  };
+
+  // The bundle already exists, but the bytes submitted now are not the bytes
+  // it names. The answer must be the same as for a first upload.
+  await assert.rejects(store.put(wrong), invalid);
+  assert.equal((await store.status(request.bundleDigest)).status, "ready");
+  assert.equal(
+    await readFile(
+      resolve(bundleRoot(root, request), "package/evaluate.py"),
+      "utf8",
+    ),
+    "def score():\n  return 0\n",
+    "the verified content is not replaced by the rejected request",
+  );
+
+  const freshRoot = await dataDir();
+  context.after(() => rm(freshRoot, { recursive: true, force: true }));
+  const fresh = new RunnerScienceFlowInputBundles(freshRoot);
+  await assert.rejects(fresh.put(wrong), invalid);
+  await assert.rejects(
+    lstat(resolve(bundleRoot(freshRoot, request), "package/evaluate.py")),
+    /ENOENT/,
+  );
+});
+
+test("BUNDLE-R08 a hardlink alias means the snapshot is no longer controlled", async (context) => {
+  const root = await dataDir();
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const store = new RunnerScienceFlowInputBundles(root);
+
+  const request = variant("one");
+  await store.put(request);
+  const alias = resolve(root, "evaluate.alias.py");
+  await link(resolve(bundleRoot(root, request), "package/evaluate.py"), alias);
+  assert.equal((await store.status(request.bundleDigest)).status, "corrupt");
+  await assert.rejects(store.put(request), corrupt);
+  // The alias is evidence of the damage; it is not removed or relinked.
+  assert.equal(await readFile(alias, "utf8"), "def score():\n  return 0\n");
+
+  // The stored manifest is held to the same rule.
+  const manifest = variant("two");
+  await store.put(manifest);
+  const manifestAlias = resolve(root, "manifest.alias.json");
+  await link(resolve(bundleRoot(root, manifest), ".input-bundle.json"), manifestAlias);
+  assert.equal((await store.status(manifest.bundleDigest)).status, "corrupt");
+});
+
+test("BUNDLE-R09 non-regular, oversized, and padded manifests are refused", async (context) => {
+  const root = await dataDir();
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const store = new RunnerScienceFlowInputBundles(root);
+
+  // A directory where a file belongs.
+  const replaced = variant("directory");
+  await store.put(replaced);
+  const evaluatorPath = resolve(bundleRoot(root, replaced), "package/evaluate.py");
+  await rm(evaluatorPath);
+  await mkdir(evaluatorPath);
+  assert.equal((await store.status(replaced.bundleDigest)).status, "corrupt");
+
+  // A file far larger than its declared size is refused by its stat size,
+  // before any content is read.
+  const grown = variant("grown");
+  await store.put(grown);
+  const grownPath = resolve(bundleRoot(root, grown), "package/evaluate.py");
+  await chmod(grownPath, 0o644);
+  await writeFile(grownPath, Buffer.alloc(3 * 1024 * 1024, 0x61));
+  assert.equal((await store.status(grown.bundleDigest)).status, "corrupt");
+
+  // The stored manifest is bounded. The padding keeps the JSON parseable, so
+  // only a bounded read can refuse it.
+  const padded = variant("padded");
+  await store.put(padded);
+  const manifestPath = resolve(bundleRoot(root, padded), ".input-bundle.json");
+  const stored = await readFile(manifestPath, "utf8");
+  await chmod(manifestPath, 0o644);
+  await writeFile(manifestPath, `${stored}${" ".repeat(80 * 1024)}`);
+  assert.equal((await store.status(padded.bundleDigest)).status, "corrupt");
+
+  // A FIFO would block an unbounded open/read; it is refused as non-regular.
+  const fifo = variant("fifo");
+  await store.put(fifo);
+  const fifoPath = resolve(bundleRoot(root, fifo), "package/evaluate.py");
+  await rm(fifoPath);
+  try {
+    await execFileAsync("mkfifo", [fifoPath]);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      context.skip("mkfifo is not available in this environment");
+      return;
+    }
+    throw error;
+  }
+  assert.equal((await store.status(fifo.bundleDigest)).status, "corrupt");
 });

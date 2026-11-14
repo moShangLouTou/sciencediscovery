@@ -19,7 +19,8 @@
  * digests. This store re-derives the bundle identity from the received
  * manifest, re-checks every byte, and only then publishes a directory named by
  * the digest. Nothing here trusts the sender's claim: the digest is recomputed,
- * each entry's size and SHA-256 are recomputed from the decoded bytes, and a
+ * each entry's size and SHA-256 are recomputed from the decoded bytes — for
+ * every submission, even when a tree for that digest already exists — and a
  * published tree is verified again before it is reported ready.
  *
  * The store lives under the Runner's own data directory, outside every
@@ -28,17 +29,19 @@
  * staging is a private sibling directory, the commit is one rename, a
  * concurrent publisher of the same bytes is reused, and an existing but
  * damaged snapshot is reported rather than overwritten or re-blessed.
+ * Verification reads each file through a descriptor this process holds, with
+ * no symlink or hardlink alias, a bounded read, and a final digest check.
  *
  * This round deliberately has no GC, TTL, reference counting, or mount step:
  * an unreferenced bundle is a cache object, not a resurrected business record.
  */
 import { createHash, randomUUID } from "node:crypto";
+import { constants } from "node:fs";
 import {
   lstat,
   mkdir,
   open,
   readdir,
-  readFile,
   rename,
   rm,
   writeFile,
@@ -58,6 +61,13 @@ import {
 
 /** The stored manifest: the canonical digest input, copied verbatim. */
 const MANIFEST = ".input-bundle.json";
+
+/**
+ * The largest stored manifest this Runner will read. A real one describes at
+ * most five paths of 512 characters, so this is far above any legitimate
+ * manifest and only bounds a corrupted or tampered file.
+ */
+const MAX_MANIFEST_BYTES = 64 * 1024;
 
 type FailureKind = "invalid" | "corrupt" | "unavailable";
 
@@ -159,16 +169,11 @@ export class RunnerScienceFlowInputBundles {
       throw new ScienceFlowInputBundleError("invalid");
     }
 
-    const existing = await this.status(digest);
-    if (existing.status === "ready") {
-      return publication(manifest, digest);
-    }
-    if (existing.status === "corrupt") {
-      throw new ScienceFlowInputBundleError("corrupt");
-    }
-
-    // Decode and verify before touching the staging tree, so a bundle whose
-    // content disagrees with its manifest never reaches the filesystem.
+    // Verify the bytes this request actually carries before anything can
+    // answer ready. An already materialized bundle must not turn a malformed
+    // upload into a success: the protocol promises that every submission is
+    // checked on its own, and the client's GET shortcut (which carries no
+    // bytes) is a separate path.
     const files = parsed.request.entries.map((entry) => {
       const bytes = Buffer.from(entry.content, "base64");
       if (
@@ -184,6 +189,15 @@ export class RunnerScienceFlowInputBundles {
       return { path: entry.path, bytes };
     });
 
+    const existing = await this.status(digest);
+    if (existing.status === "ready") {
+      return publication(manifest, digest);
+    }
+    if (existing.status === "corrupt") {
+      throw new ScienceFlowInputBundleError("corrupt");
+    }
+
+    // The bytes are verified; only now may they reach the staging tree.
     const staging = resolve(await this.stagingParent(), randomUUID());
     const root = resolve(await this.parent(), digest);
     try {
@@ -240,11 +254,15 @@ export class RunnerScienceFlowInputBundles {
     bundleDigest: string,
   ): Promise<ScienceFlowInputBundleManifest> {
     const path = resolve(root, MANIFEST);
-    const info = await lstat(path);
-    if (!info.isFile() || info.isSymbolicLink()) {
+    // The manifest is read through the same held-descriptor path as content:
+    // bounded, no symlink or hardlink alias, and no unbounded parse.
+    const bytes = await readSnapshotFile(path, { maxBytes: MAX_MANIFEST_BYTES });
+    let value: unknown;
+    try {
+      value = JSON.parse(bytes.toString("utf8")) as unknown;
+    } catch {
       throw new ScienceFlowInputBundleError("corrupt");
     }
-    const value = JSON.parse(await readFile(path, "utf8")) as unknown;
     const parsed = parseStoredManifest(value);
     if (parsed === null) throw new ScienceFlowInputBundleError("corrupt");
     // The directory name must still be the digest of the manifest inside it.
@@ -317,27 +335,119 @@ async function verifySnapshot(
     if (!target.startsWith(`${root}${sep}`)) {
       throw new ScienceFlowInputBundleError("corrupt");
     }
-    const info = await lstat(target);
-    // A link planted after publication would make this read another file; the
-    // walk above already rejected links, and this check closes the gap between
-    // the walk and the read.
-    if (!info.isFile() || info.isSymbolicLink() || info.size !== file.size) {
+    // Every directory between the root and the file must still be a plain
+    // directory: a component swapped for a symlink after the walk would
+    // otherwise redirect this read.
+    await assertPlainParents(root, file.path);
+    const bytes = await readSnapshotFile(target, { exact: file.size });
+    if (digestBytes(bytes) !== file.sha256) {
       throw new ScienceFlowInputBundleError("corrupt");
     }
-    const hash = createHash("sha256");
-    let size = 0;
-    const handle = await open(target, "r");
+  }
+}
+
+// --- bounded, alias-free reads ---------------------------------------------
+
+type ReadBound = { readonly exact: number } | { readonly maxBytes: number };
+
+function corruptFile(): ScienceFlowInputBundleError {
+  return new ScienceFlowInputBundleError("corrupt");
+}
+
+/**
+ * Read one published file through a descriptor this process holds.
+ *
+ * The path is lstat'ed, opened with `O_NOFOLLOW` (and `O_NONBLOCK`, so a FIFO
+ * cannot hang the open), then checked again through the descriptor: same
+ * device and inode, still a regular file, and a link count of one. The read is
+ * bounded by the expected size — or by the manifest limit — and the caller
+ * compares the digest with the manifest. A link count above one means the
+ * bytes can also be written through an alias outside this tree, which is not a
+ * controlled snapshot.
+ */
+async function readSnapshotFile(
+  target: string,
+  bound: ReadBound,
+): Promise<Buffer> {
+  const before = await lstat(target);
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1) {
+    throw corruptFile();
+  }
+  const limit = "exact" in bound ? bound.exact : bound.maxBytes;
+  if (before.size > limit) throw corruptFile();
+  if ("exact" in bound && before.size !== bound.exact) throw corruptFile();
+
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await open(
+      target,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+  } catch {
+    throw corruptFile();
+  }
+  try {
+    const after = await handle.stat();
+    // The identity inspected before the open must still be the file the
+    // descriptor names: a replacement in that window is refused, not read.
+    if (
+      !after.isFile() ||
+      after.nlink !== 1 ||
+      after.dev !== before.dev ||
+      after.ino !== before.ino ||
+      after.size !== before.size
+    ) {
+      throw corruptFile();
+    }
+    const bytes = await readHandleBounded(handle, limit);
+    if ("exact" in bound && bytes.length !== bound.exact) throw corruptFile();
+    return bytes;
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Read at most `limit` bytes through one descriptor. One byte past the bound
+ * is requested on purpose, so a file that grew since its stat is detected
+ * instead of silently truncated.
+ */
+async function readHandleBounded(
+  handle: Awaited<ReturnType<typeof open>>,
+  limit: number,
+): Promise<Buffer> {
+  const buffer = Buffer.allocUnsafe(limit + 1);
+  let total = 0;
+  while (total < buffer.length) {
+    const { bytesRead } = await handle.read(
+      buffer,
+      total,
+      buffer.length - total,
+      total,
+    );
+    if (bytesRead === 0) break;
+    total += bytesRead;
+  }
+  if (total > limit) throw corruptFile();
+  return buffer.subarray(0, total);
+}
+
+/** Every directory component of a bundle path must still be a plain dir. */
+async function assertPlainParents(
+  root: string,
+  relativePath: string,
+): Promise<void> {
+  const parts = relativePath.split("/").slice(0, -1);
+  let current = root;
+  for (const part of parts) {
+    current = resolve(current, part);
+    let info: Awaited<ReturnType<typeof lstat>>;
     try {
-      for await (const chunk of handle.createReadStream()) {
-        hash.update(chunk as Buffer);
-        size += (chunk as Buffer).length;
-      }
-    } finally {
-      await handle.close();
+      info = await lstat(current);
+    } catch {
+      throw corruptFile();
     }
-    if (size !== file.size || hash.digest("hex") !== file.sha256) {
-      throw new ScienceFlowInputBundleError("corrupt");
-    }
+    if (!info.isDirectory() || info.isSymbolicLink()) throw corruptFile();
   }
 }
 
