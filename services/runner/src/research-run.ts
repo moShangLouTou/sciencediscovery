@@ -1897,6 +1897,45 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
   // spawn that never completes from parking the operation forever.
   armDeadline(deadlines.hardDeadlineMs + SPAWN_HANDSHAKE_BOUND_MS);
 
+  /**
+   * Read the bridge's contract refusal once, for this execution only.
+   *
+   * A validated refusal is the positive statement that the frozen contract was
+   * judged unsupported before any engine run was prepared. It lives in the
+   * Runner-owned engine state directory and is bound to this execution id, so
+   * it can never describe another execution. Reading it again after the exit is
+   * what makes the result independent of the last poll's timing.
+   */
+  const refreshContractRefusal = async (): Promise<boolean> => {
+    if (engineRoot === undefined || state.refusal !== undefined || state.invalid) return false;
+    const refusal = await readEngineContractRefusal(engineRoot, request.executionId);
+    if (refusal === null) return false;
+    state.refusal = "RESEARCH_ENGINE_CONTRACT_UNSUPPORTED";
+    options.diagnose("research_engine_contract_refused", { reason: refusal.reason });
+    return true;
+  };
+
+  /**
+   * Read the engine link once, for the decision that needs it.
+   *
+   * A link that does not name this execution at the declared revision and
+   * version is not another engine run, it is no engine run.
+   */
+  const readEngineLink = async (): Promise<void> => {
+    if (engine === undefined || state.engine !== undefined || state.invalid) return;
+    const link = await channel.read(ENGINE_LINK_FILE);
+    if (link.status === "text") {
+      const parsed = parseScienceFlowEngineLink(link.text, request.executionId, engine);
+      if (parsed === null) invalidate("RESEARCH_ENGINE_IDENTITY_MISMATCH");
+      else {
+        state.engine = parsed;
+        options.observe({ research: { engine: parsed } }, false);
+      }
+    } else if (link.status === "refused") {
+      invalidate(link.code);
+    }
+  };
+
   const runPromise = runSandboxed(
     config,
     prepared,
@@ -1994,30 +2033,12 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
     // The bridge reports the engine run it created once. It is evidence only
     // when it names this execution at the declared revision and version; a
     // link that does not is not a different engine run, it is no engine run.
-    if (engine !== undefined && state.engine === undefined && !state.invalid) {
-      const link = await channel.read(ENGINE_LINK_FILE);
-      if (link.status === "text") {
-        const parsed = parseScienceFlowEngineLink(link.text, request.executionId, engine);
-        if (parsed === null) invalidate("RESEARCH_ENGINE_IDENTITY_MISMATCH");
-        else {
-          state.engine = parsed;
-          options.observe({ research: { engine: parsed } }, false);
-        }
-      } else if (link.status === "refused") {
-        invalidate(link.code);
-      }
-    }
+    await readEngineLink();
     // A contract the bridge refused is a definite answer, not a missing
     // result: the frozen inputs were read, found outside the supported subset,
     // and no engine run was prepared. It is read from the Runner-owned engine
     // state directory, so the refusal can only describe this execution.
-    if (engineRoot !== undefined && state.refusal === undefined && !state.invalid) {
-      const refusal = await readEngineContractRefusal(engineRoot, request.executionId);
-      if (refusal !== null) {
-        state.refusal = "RESEARCH_ENGINE_CONTRACT_UNSUPPORTED";
-        options.diagnose("research_engine_contract_refused", { reason: refusal.reason });
-      }
-    }
+    await refreshContractRefusal();
     if (!settled) await delay(POLL_MS);
   }
   await runPromise;
@@ -2036,6 +2057,12 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
     invalidate("RESEARCH_RECORD_MISSING");
   }
 
+  // The last poll and the exit are not the same instant. The association and
+  // the contract refusal are read once more here so a bridge that finished
+  // between them is still judged, instead of losing the fixed refusal code.
+  await readEngineLink();
+  await refreshContractRefusal();
+
   if (!spawned) {
     // No process was created. Only here may the run be described as
     // `not_started`, and only with the refusal that prevented it.
@@ -2048,10 +2075,19 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
     };
   }
 
-  // A real engine run must have reported its engine identity. A workload that
-  // ran but never named the engine run it created leaves the association
-  // unproven, and an unproven association is not published.
-  if (state.engineRequired && state.engine === undefined && !state.invalid) {
+  // A real engine run must have reported its engine identity, and a validated
+  // pre-launch contract refusal is the opposite fact: the bridge read the
+  // frozen inputs, judged them outside the supported subset and prepared no
+  // engine run at all. The two are mutually exclusive protocol states. A
+  // refusal with a link beside it contradicts itself and stays unknown; a run
+  // that claims to have started without a link is an unproven association and
+  // also stays unknown. Neither shape is ever reported as the other, and the
+  // refusal keeps its fixed code only after the process and boundary are
+  // proven (an unproven boundary is `unknown` further below regardless).
+  const contractRefused = state.refusal === "RESEARCH_ENGINE_CONTRACT_UNSUPPORTED";
+  if (contractRefused && state.engine !== undefined) {
+    invalidate("RESEARCH_ENGINE_IDENTITY_MISMATCH");
+  } else if (state.engineRequired && state.engine === undefined && !contractRefused && !state.invalid) {
     invalidate("RESEARCH_ENGINE_IDENTITY_MISMATCH");
   }
 
