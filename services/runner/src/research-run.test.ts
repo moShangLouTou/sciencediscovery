@@ -37,6 +37,7 @@ import { createTest } from "../../../test/support/tagged/compat.mjs";
 const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:linux", "arch:amd64", "arch:arm64", "sandbox:bubblewrap"] });
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -49,17 +50,20 @@ import {
   ResearchRunError,
   createResearchRunExecutor,
   nextResearchRecordState,
+  parseResearchInputIdentity,
   parseResearchRunRequest,
   parseResearchTimeSchedule,
   parseResearchWorkloadRecord,
   parseStopMarker,
   researchExecutionState,
+  researchInputRoot,
   researchPublishable,
   researchRecordUnusable,
   researchRefusalMessage,
   researchRunDeadlines,
   researchStateRoot,
   researchStopId,
+  verifiedResearchInputs,
   type ResearchRunExecutor,
   type ResearchRunLaunch,
   type ResearchRunWiring,
@@ -67,17 +71,23 @@ import {
 } from "./research-run.js";
 import { ExecutionManager, type ExecutionManagerOptions } from "./execution-manager.js";
 import { assertEnvironmentMutationAllowed } from "./execution-resource-fences.js";
+import { VersionStore } from "@sciencediscovery/cas";
 import {
   EnvironmentStore,
   type EnvironmentRuntime,
   type ProvisionerExecutor,
 } from "./environment-store.js";
-import type {
-  ExecutionOwner,
-  ResearchRunRequest,
-  ResearchRunStatus,
-  ResearchTimeSchedule,
-  ShellExecutionRequest,
+import {
+  canonicalScienceFlowInputBundleManifest,
+  SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
+  type ExecutionOwner,
+  type ResearchInputEvidence,
+  type ResearchInputIdentity,
+  type ResearchRunRequest,
+  type ResearchRunStatus,
+  type ResearchTimeSchedule,
+  type ScienceFlowInputBundleManifest,
+  type ShellExecutionRequest,
 } from "@sciencediscovery/schema";
 
 const owner: ExecutionOwner = { agentId: "agent", sessionId: "session" };
@@ -91,6 +101,68 @@ const SCHEDULE: ResearchTimeSchedule = {
   verificationWindowMs: 2_000,
 };
 
+/**
+ * A synthetic input bundle whose manifest digest is computed the same way the
+ * real store computes it. Tests that are not about the bundle store consume
+ * this snapshot through the executor's constructor seam; the store's own
+ * verification has separate, real-filesystem coverage.
+ */
+interface InputFixture {
+  readonly identity: ResearchInputIdentity;
+  readonly manifest: ScienceFlowInputBundleManifest;
+  readonly contents: ReadonlyMap<string, Buffer>;
+  readonly evidence: ResearchInputEvidence;
+}
+
+function inputFixture(): InputFixture {
+  const contractDigest = "a".repeat(64);
+  const entries = [
+    { content: "contract\n", path: "manifest.yaml", roles: ["manifest"] as const },
+    { content: "task: 1\n", path: "package/task.yaml", roles: ["task_yaml"] as const },
+    { content: "description\n", path: "package/description.md", roles: ["description"] as const },
+    { content: "def evaluate():\n    return 1\n", path: "package/evaluate.py", roles: ["evaluator"] as const },
+  ].sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
+  const files = entries.map((entry) => ({
+    path: entry.path,
+    roles: [...entry.roles],
+    size: Buffer.byteLength(entry.content),
+    sha256: createHash("sha256").update(entry.content).digest("hex"),
+  }));
+  const manifest: ScienceFlowInputBundleManifest = {
+    schemaVersion: SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
+    contractDigest,
+    files,
+  };
+  const bundleDigest = createHash("sha256")
+    .update(canonicalScienceFlowInputBundleManifest(manifest), "utf8")
+    .digest("hex");
+  return {
+    identity: { contractDigest, bundleDigest },
+    manifest,
+    contents: new Map(entries.map((entry) => [entry.path, Buffer.from(entry.content)])),
+    evidence: {
+      contractDigest,
+      bundleDigest,
+      state: "verified",
+      files: files.map((file) => ({ ...file, roles: [...file.roles] })),
+    },
+  };
+}
+
+const INPUT = inputFixture();
+
+function stubInputSource(): { snapshot(bundleDigest: string): Promise<{
+  manifest: InputFixture["manifest"];
+  contents: ReadonlyMap<string, Buffer>;
+}> } {
+  return {
+    snapshot: async (bundleDigest: string) => {
+      if (bundleDigest !== INPUT.identity.bundleDigest) throw new Error("bundle is not materialized");
+      return { manifest: INPUT.manifest, contents: INPUT.contents };
+    },
+  };
+}
+
 function researchRequest(
   id: string,
   workspaceRoot: string,
@@ -99,6 +171,7 @@ function researchRequest(
   return {
     agentId: owner.agentId,
     executionId: id,
+    inputs: { ...INPUT.identity },
     kind: "research",
     permissionEpoch: { sessionId: owner.sessionId } as ResearchRunRequest["permissionEpoch"],
     schedule: { ...SCHEDULE },
@@ -115,7 +188,7 @@ function shellRequest(root: string, id: string): ShellExecutionRequest {
 }
 
 function status(overrides: Partial<ResearchRunStatus> = {}): ResearchRunStatus {
-  return {
+  const base: ResearchRunStatus = {
     deadlineViolated: false,
     forceReclaimRequested: false,
     observedAt: new Date().toISOString(),
@@ -130,6 +203,15 @@ function status(overrides: Partial<ResearchRunStatus> = {}): ResearchRunStatus {
     workload: "scienceflow-fixed",
     ...overrides,
   };
+  // A run that was accepted but never spawned still carries only the caller's
+  // declaration; one that reports a process fact has the verified set. The
+  // manager and the publication policy distinguish exactly those two.
+  if (base.inputs === undefined) {
+    return { ...base, inputs: base.process === "not_started"
+      ? { ...INPUT.identity, state: "declared" }
+      : INPUT.evidence };
+  }
+  return base;
 }
 
 function record(
@@ -415,7 +497,12 @@ function bareWiring(
   scenario: Scenario,
   extra: Partial<ResearchRunWiring> = {},
 ): ResearchRunWiring {
-  return { config: executorConfig(dataDir), program: fixedProgram(scenario), ...extra };
+  return {
+    config: executorConfig(dataDir),
+    inputBundles: stubInputSource(),
+    program: fixedProgram(scenario),
+    ...extra,
+  };
 }
 
 function wiring(
@@ -462,10 +549,57 @@ test("a research request cannot name a program, a path, a state root or a contro
     (error: unknown) => error instanceof ResearchRunError && error.code === "RESEARCH_REQUEST_INVALID");
   assert.throws(() => parseResearchRunRequest(researchRequest("id", "/workspace", { workload: "scienceflow" as never })),
     (error: unknown) => error instanceof ResearchRunError && error.code === "RESEARCH_WORKLOAD_UNKNOWN");
-  // The accepted shape carries exactly the identity and the schedule.
+  // The accepted shape carries exactly the identity, the input reference and
+  // the schedule.
   const parsed = parseResearchRunRequest(researchRequest("run-1", "/workspace"));
   assert.deepEqual(Object.keys(parsed).sort(),
-    ["agentId", "executionId", "kind", "permissionEpoch", "schedule", "schemaVersion", "workload", "workspaceRoot"]);
+    ["agentId", "executionId", "inputs", "kind", "permissionEpoch", "schedule", "schemaVersion", "workload", "workspaceRoot"]);
+});
+
+test("the input reference is exactly two digests and never a locator", () => {
+  const request = researchRequest("run-inputs", "/workspace");
+  assert.deepEqual(parseResearchInputIdentity(request.inputs),
+    { contractDigest: INPUT.identity.contractDigest, bundleDigest: INPUT.identity.bundleDigest });
+  for (const bad of [
+    { contractDigest: "A".repeat(64), bundleDigest: "b".repeat(64) },
+    { contractDigest: "a".repeat(63), bundleDigest: "b".repeat(64) },
+    { contractDigest: "a".repeat(64) },
+    { bundleDigest: "b".repeat(64) },
+    { contractDigest: "a".repeat(64), bundleDigest: "b".repeat(64), root: "/shared" },
+    { contractDigest: "a".repeat(64), bundleDigest: "b".repeat(64), files: [] },
+    "a".repeat(64),
+  ]) {
+    assert.throws(() => parseResearchInputIdentity(bad),
+      (error: unknown) => error instanceof ResearchRunError && error.code === "RESEARCH_REQUEST_INVALID",
+      JSON.stringify(bad));
+  }
+  // A request without the optional reference still parses: historical records
+  // and pre-consumption callers keep their meaning. Only a new execution is
+  // refused, and that refusal happens in the launcher and the manager.
+  const { inputs: _omitted, ...legacy } = request;
+  assert.equal(parseResearchRunRequest(legacy).inputs, undefined);
+  assert.throws(() => parseResearchRunRequest({ ...request, inputs: { contractDigest: "a".repeat(64) } }),
+    (error: unknown) => error instanceof ResearchRunError && error.code === "RESEARCH_REQUEST_INVALID");
+});
+
+test("a verified input record must rebuild to its own bundle digest", () => {
+  assert.deepEqual(verifiedResearchInputs(INPUT.evidence), INPUT.evidence);
+  // A declared record is not verified evidence.
+  assert.equal(verifiedResearchInputs({ ...INPUT.identity, state: "declared" }), null);
+  // The files and the digest must describe the same canonical manifest.
+  assert.equal(verifiedResearchInputs({ ...INPUT.evidence, bundleDigest: "b".repeat(64) }), null);
+  assert.equal(verifiedResearchInputs({ ...INPUT.evidence, files: [] }), null);
+  assert.equal(verifiedResearchInputs({
+    ...INPUT.evidence,
+    files: INPUT.evidence.files!.map((file) => file.path === "manifest.yaml"
+      ? { ...file, sha256: "c".repeat(64) } : file),
+  }), null);
+  // There is no host path in evidence: a path that could escape is not one.
+  assert.equal(verifiedResearchInputs({
+    ...INPUT.evidence,
+    files: INPUT.evidence.files!.map((file) => file.path === "manifest.yaml"
+      ? { ...file, path: "../outside" } : file),
+  }), null);
 });
 
 test("an out-of-range schedule refuses the submission instead of being clamped", () => {
@@ -940,6 +1074,116 @@ test("a pre-spawn refusal is a failed run with not_started evidence that still p
   assert.equal(record.error, researchRefusalMessage("RESEARCH_SANDBOX_UNSUPPORTED"));
   assert.ok(record.version, "a typed pre-spawn refusal is publishable");
   assert.equal(record.boundary?.terminationConfirmed ?? false, false);
+});
+
+test("an unbound input, a missing bundle or another contract refuses before spawn", async (context) => {
+  const { dataDir, root, workspace } = await scratch(context, "input-refusals");
+  const run = (
+    extra: Partial<ResearchRunWiring>,
+    request = researchRequest("run-input", workspace),
+  ) => createResearchRunExecutor(wiring(dataDir, { behaviour: "complete" }, extra))
+    .run(request, { signal: new AbortController().signal });
+
+  const { inputs: _omitted, ...legacy } = researchRequest("run-unbound", workspace);
+  const unbound = await run({}, legacy);
+  assert.equal(unbound.research.process, "not_started");
+  assert.equal(unbound.research.refusal, "RESEARCH_INPUT_REQUIRED");
+  assert.equal(await pathExists(resolve(root, "data", "runner-research")), false,
+    "nothing was created for a run that names no inputs");
+
+  // A wiring without the store, a store that does not hold the digest, and a
+  // manifest whose contract is not the requested one are all one fixed refusal.
+  assert.equal((await run({ inputBundles: undefined })).research.refusal, "RESEARCH_INPUT_UNAVAILABLE");
+  assert.equal((await run({ inputBundles: { snapshot: async () => { throw new Error("not materialized"); } } }))
+    .research.refusal, "RESEARCH_INPUT_UNAVAILABLE");
+  const otherContract = await run({}, researchRequest("run-input", workspace, {
+    inputs: { contractDigest: "c".repeat(64), bundleDigest: INPUT.identity.bundleDigest },
+  }));
+  assert.equal(otherContract.research.refusal, "RESEARCH_INPUT_UNAVAILABLE");
+  assert.equal(await pathExists(researchInputRoot(dataDir, "run-input")), false,
+    "a refused run leaves no copy behind");
+
+  // The manager refuses an unbound new execution before writing the ledger.
+  const manager = new ExecutionManager(dataDir, undefined, { research: createResearchRunExecutor(
+    wiring(dataDir, { behaviour: "complete" })) });
+  context.after(async () => { await manager.close(); });
+  assert.throws(() => manager.submitResearch(legacy),
+    (error: unknown) => (error as { code?: string }).code === "RESEARCH_INPUT_REQUIRED");
+  const db = readOnlyLedger(dataDir);
+  context.after(async () => { db.close(); });
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM executions").get()!.count, 0);
+});
+
+test("a completed run publishes the input identity it verified", async (context) => {
+  const { dataDir, manager, workspace } = await managerFixture(context, "input-publish", {
+    research: syntheticExecutor([], async () => status({
+      outcome: "completed", phase: "finished", process: "spawned-then-terminated", report: "ready",
+    })),
+  });
+  manager.submitResearch(researchRequest("run-input-publish", workspace));
+  await until(() => manager.get("run-input-publish", owner).state === "completed");
+  const record = manager.get("run-input-publish", owner);
+  assert.deepEqual(record.research?.inputs, INPUT.evidence);
+  assert.ok(record.version);
+  // The published WorkspaceExecution carries the same identity, so a reader
+  // that never saw the operation can still name the frozen input version.
+  const published = await new VersionStore(dataDir)
+    .readRecord<{ researchInputs?: ResearchInputEvidence }>(record.version!, "WorkspaceExecution");
+  assert.deepEqual(published.value.researchInputs, INPUT.evidence);
+});
+
+test("verified inputs never upgrade a failed research result, and foreign evidence is not published", async (context) => {
+  const failed = await managerFixture(context, "input-failed", {
+    research: syntheticExecutor([], async () => status({
+      outcome: "failed", phase: "finished", process: "spawned-then-terminated", report: "failed",
+    })),
+  });
+  failed.manager.submitResearch(researchRequest("run-input-failed", failed.workspace));
+  await until(() => failed.manager.get("run-input-failed", owner).state === "failed");
+  const failedRecord = failed.manager.get("run-input-failed", owner);
+  assert.equal(failedRecord.research?.outcome, "failed");
+  assert.equal(failedRecord.research?.inputs?.state, "verified");
+
+  // Evidence that names another bundle is not this execution's input. The
+  // record keeps only the declaration, so nothing is published as consumed.
+  const foreign = await managerFixture(context, "input-foreign", {
+    research: syntheticExecutor([], async () => status({
+      outcome: "completed", phase: "finished", process: "spawned-then-terminated", report: "ready",
+      inputs: { ...INPUT.evidence, bundleDigest: "e".repeat(64) },
+    })),
+  });
+  foreign.manager.submitResearch(researchRequest("run-input-foreign", foreign.workspace));
+  await until(() => foreign.manager.get("run-input-foreign", owner).state === "unknown");
+  const foreignRecord = foreign.manager.get("run-input-foreign", owner);
+  assert.equal(foreignRecord.research?.inputs?.state, "declared");
+  assert.equal(foreignRecord.version, undefined);
+  assert.match(foreignRecord.error ?? "", /verified input set/);
+});
+
+test("changing the input identity under one execution id is a conflict, not a second run", async (context) => {
+  const calls: string[] = [];
+  const { manager, workspace } = await managerFixture(context, "input-conflict", {
+    research: syntheticExecutor(calls, async () => status({
+      outcome: "completed", phase: "finished", process: "spawned-then-terminated", report: "ready",
+    })),
+  });
+  const request = researchRequest("run-input-conflict", workspace);
+  manager.submitResearch(request);
+  manager.submitResearch({ ...request });
+  await until(() => manager.get("run-input-conflict", owner).state === "completed");
+  assert.deepEqual(calls, ["run-input-conflict"]);
+  // The two digests are part of the request digest: another bundle is another
+  // request under the same id, so the existing execution is never reused.
+  assert.throws(() => manager.submitResearch({ ...request,
+    inputs: { ...request.inputs!, bundleDigest: "b".repeat(64) } }),
+  (error: unknown) => (error as { code?: string }).code === "EXECUTION_ID_CONFLICT");
+  assert.deepEqual(calls, ["run-input-conflict"]);
+  // A record written before input consumption existed still publishes on the
+  // same terms as before; the new rule only constrains records that name inputs.
+  const legacy = { ...status({ outcome: "completed", phase: "finished",
+    process: "spawned-then-terminated", report: "ready" }) };
+  delete (legacy as { inputs?: unknown }).inputs;
+  assert.equal(researchPublishable(legacy), true);
 });
 
 test("a spawned run without a proven boundary or terminal record stays unknown and fenced", async (context) => {

@@ -1020,13 +1020,22 @@ directory and commits the whole tree with one rename into
 `<dataDir>/.scienceflow-input-bundles/<bundleDigest>/`, outside every workspace
 and workload-writable bind. Concurrent publishers of the same bytes share one
 tree; an existing but damaged snapshot is reported as `corrupt` and refused,
-never overwritten or re-blessed. Reads verify the stored tree again: no
-symlinks, no extra files, no hardlink alias (a link count above one means the
-bytes are writable outside the tree), exact sizes, and digests recomputed
-through a held descriptor that is opened `O_NOFOLLOW`/`O_NONBLOCK` and checked
-again against its pre-open identity. The stored manifest is read the same way
-and bounded to 64 KiB. There is no GC, TTL, reference counting, or mount step
-this round: unreferenced content is a cache object, not a business record.
+never overwritten or re-blessed. Reads resolve every name under a directory
+descriptor held for the whole read: parent components are opened one at a time
+with `O_NOFOLLOW`, the final file with `O_NOFOLLOW`/`O_NONBLOCK`, and the opened
+descriptor — not an earlier `lstat` — decides the type, link count and size
+(no symlink, no hardlink alias, exact size), with the digest recomputed from the
+bytes actually read. The stored manifest is read the same way and bounded to
+64 KiB. There is no GC, TTL, reference counting, or automatic repair:
+unreferenced content is a cache object, not a business record.
+
+The same module exposes a Runner-internal `snapshot(bundleDigest)` door. It
+takes only the content identity, re-verifies the tree through that held
+descriptor chain, and returns the buffers that were checked. A new research
+execution uses it to build a private copy for its execution id and mounts that
+copy read-only; the shared cache directory itself is never mounted. A request
+cannot name a path, a file list, replacement bytes, a mount point, or a
+substitute source.
 
 ### Receipt and storage
 
@@ -1108,10 +1117,13 @@ stored row.
   puts one Git checkout on `sys.path`. Wheels, archives, editable installs, and
   import hooks are `unsupported` rather than guessed. Its result is a
   point-in-time observation, not a health check or a start gate.
-- Prepared input bundles are evidence of the enumerated files only. They are
-  not mounted, are not rewritten into the engine launch manifest, and prove
-  neither the dependency closure nor that an evaluator or a research run can
-  execute. There is no GC, TTL, reference counting, or manual download.
+- Prepared input bundles are evidence of the enumerated files only. The API
+  never mounts them and never rewrites them into an engine launch manifest. The
+  Runner's fixed internal workload verifies one named bundle and materializes a
+  per-execution read-only copy; there is still no research start route, and a
+  consumed copy proves neither the dependency closure nor that the evaluator or
+  a real research engine ran. There is no GC, TTL, reference counting, or manual
+  download.
 
 ## Manual verification checklist (liyuan)
 
