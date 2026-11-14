@@ -1330,6 +1330,17 @@ export class ExecutionManager {
         if (durableInputs?.state === "verified" && execution.research.inputs?.state !== "verified") {
           execution.research = { ...execution.research, inputs: durableInputs };
         }
+        // The engine association is the first durable one, exactly like the
+        // verified input set. Every save path carries a copy that predates it —
+        // the returning operation, an exception, a cancellation, an unprovable
+        // boundary — and none of them may drop or replace what the ledger
+        // recorded. A conflict keeps the recorded association here; the
+        // operation's result path reports a contradictory return separately.
+        const durableEngine = previous.research.engine;
+        if (durableEngine !== undefined) {
+          const merged = mergeResearchEngine(durableEngine, execution.research.engine);
+          execution.research = { ...execution.research, engine: merged.engine ?? durableEngine };
+        }
       }
       if (execution.receipt) {
         if (previous?.receipt) {

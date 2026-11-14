@@ -31,6 +31,7 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import type {
   ResearchEngineEvidence,
@@ -260,4 +261,68 @@ test("an invalid association never enters the ledger", async (context) => {
   await until(() => manager.get("invalid-engine", OWNER).state === "failed" || manager.get("invalid-engine", OWNER).state === "unknown");
   const record = manager.get("invalid-engine", OWNER);
   assert.equal(record.research?.engine, undefined);
+});
+
+test("an association observed before the operation throws is not erased by the error save", async (context) => {
+  const { root, workspace } = await fixture(context);
+  const research: ResearchRunExecutor = {
+    run: async (_submitted, launch) => {
+      // The durable association is written through the real ledger, and then
+      // the operation fails before it can return its own copy.
+      launch.lifecycle?.observed?.({ research: { engine: engine() } });
+      throw new Error("operation failed after the association was recorded");
+    },
+  };
+  const manager = new ExecutionManager(root, undefined, { research });
+  context.after(async () => { await manager.close().catch(() => undefined); await rm(root, { force: true, recursive: true }); });
+  manager.submitResearch(request("observed-then-threw", workspace));
+  await until(() => manager.get("observed-then-threw", OWNER).state === "unknown");
+  const record = manager.get("observed-then-threw", OWNER);
+  // The operation never returned verified inputs, so the run is not
+  // publishable — but the association the ledger accepted is still there. An
+  // older in-memory copy must not delete it.
+  assert.equal(record.state, "unknown");
+  assert.deepEqual(record.research?.engine, engine());
+});
+
+test("a failed durable write never claims the association and disables new work", async (context) => {
+  const { root, workspace } = await fixture(context);
+  const research: ResearchRunExecutor = {
+    run: async (submitted, launch) => {
+      // The observation reaches the real ledger, whose write is made to fail.
+      assert.throws(
+        () => launch.lifecycle?.observed?.({ research: { engine: engine() } }),
+        /injected engine write failure/u,
+      );
+      return { research: status(engine()), result: result(submitted.executionId) };
+    },
+  };
+  const manager = new ExecutionManager(root, undefined, { research });
+  const hook = new DatabaseSync(resolve(root, "runner-executions", "executions.sqlite"));
+  context.after(async () => {
+    hook.close();
+    await manager.close().catch(() => undefined);
+    await rm(root, { force: true, recursive: true });
+  });
+  // Only a row that carries an engine association is refused; the ledger's
+  // earlier lifecycle writes still succeed. This is a write failure, not an
+  // invalid input.
+  hook.exec(`CREATE TRIGGER refuse_engine_update BEFORE UPDATE ON executions
+    WHEN instr(NEW.record, '"engine"') > 0
+    BEGIN SELECT RAISE(ABORT, 'injected engine write failure'); END;`);
+  manager.submitResearch(request("write-failed", workspace));
+  await until(() => {
+    try {
+      manager.assertResourcesAvailable({ npuDevices: [], workspaceRoot: workspace });
+      return false;
+    } catch {
+      return true;
+    }
+  });
+  // Nothing in the ledger claims an association that was never written, and
+  // the manager stops accepting work because its storage can no longer be
+  // trusted.
+  assert.equal(manager.get("write-failed", OWNER).research?.engine, undefined);
+  assert.throws(() => manager.submitResearch(request("after-write-failure", workspace)),
+    /cannot be trusted/u);
 });
