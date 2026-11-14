@@ -1,7 +1,7 @@
 From cda7d275f3ccaf3272096d78fe4ad9ec5e565732 Mon Sep 17 00:00:00 2001
 From: liyuan <liyuan390@huawei.com>
 Date: Sat, 14 Nov 2026 18:21:04 +0800
-Subject: [PATCH 2/2] test(control): cover prepare-only arming, adoption, stops
+Subject: [PATCH 2/3] test(control): cover prepare-only arming, adoption, stops
  and reporting
 
 Exercise the real service arming half, the real supervisor and the real
@@ -14,6 +14,7 @@ the natural path leaving no waiter; and the unchanged legacy 'stopping' path.
 ---
  tests/test_managed_lifecycle.py | 324 ++++++++++++++++++++++++++++++++
  1 file changed, 324 insertions(+)
+ create mode 100644 tests/test_managed_lifecycle.py
 
 diff --git a/tests/test_managed_lifecycle.py b/tests/test_managed_lifecycle.py
 new file mode 100644
@@ -345,6 +346,3 @@ index 0000000..7ac8212
 +
 +if __name__ == "__main__":
 +    unittest.main()
--- 
-2.34.1
-

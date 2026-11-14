@@ -1,15 +1,15 @@
 # ScienceFlow managed-lifecycle patch
 
 This directory pins the engine change the Runner's research workload depends on.
-It is a reproducible dependency, not a copy of the engine: the two patches apply
-to the base commit and rebuild the exact tree recorded in `manifest.json`.
+It is a reproducible dependency, not a copy of the engine: the three patches
+apply to the base commit and rebuild the exact tree recorded in `manifest.json`.
 
 | item | value |
 | --- | --- |
 | base commit | `0ef229de1ae126ea04387ce74ae94ffacc437df6` |
-| patched commit | `cda7d275f3ccaf3272096d78fe4ad9ec5e565732` |
-| patched tree | `e8dff1ec922b5496606d21841f5295150f539361` |
-| patches | `0001-…` (`feat(control)`), `0002-…` (`test(control)`) |
+| patched commit | `d6d4b77f93061ced9ae3e3d8c10c0f70f28113a9` |
+| patched tree | `ec041398d2ce81f432d39be2784c27bb4f94bc01` |
+| patches | `0001-…` (`feat(control)`), `0002-…` (`test(control)`), `0003-…` (`fix(control)`) |
 
 `manifest.json` also pins each patch's SHA-256.
 
@@ -33,15 +33,22 @@ to the base commit and rebuild the exact tree recorded in `manifest.json`.
   task is cancelled and awaited in `finally` on the natural, cancelled and failed
   paths. With no `stop_event` the function behaves exactly as the detached CLI
   worker did.
-- **E4 — report-phase cancellation.** A stop consumed while reports are being
-  generated keeps the research outcome and writes `report_status="incomplete"`
-  instead of letting `CancelledError` escape unrecorded.
+- **E4 — report-phase cancellation.** `finalize_reports()` always reaps the
+  report process group first. It re-raises a cancellation only when the caller
+  asks for it (`raise_on_cancel=True`, which `worker.supervise()` does), so a
+  stop consumed while reports are being generated keeps the research outcome and
+  writes `report_status="incomplete"`. A direct caller that owns no supervisor
+  state keeps the historical result contract (`timed_out=True`). A report that
+  spends its own budget is still a timeout (`generation_failed`) and a report
+  process that exits non-zero is still its own failure; the three facts are no
+  longer collapsed.
 
-Two seams exist for hosts and tests only, and neither replaces the supervisor,
-the registry or a state transition: `research=` (default: the engine's own
-`run_manifest`, still reachable as the `worker.run_manifest` module attribute)
-and the report generator, which is imported from
-`scienceflow.runtime.parallel.control.reporting`.
+Three seams exist for hosts and tests only, and none replaces the supervisor, the
+registry or a state transition: `research=` (default: the engine's own
+`run_manifest`, still reachable as the `worker.run_manifest` module attribute),
+the report generator process (`reporting.spawn_report_process`) and the report
+content read (`read_report_manifest`, imported lazily from
+`scienceflow.research.reporting`).
 
 ## Verify and apply
 
@@ -52,8 +59,9 @@ node scienceflow/patches/0ef229de1ae126ea04387ce74ae94ffacc437df6/verify.mjs /pa
 # Apply to a disposable checkout.
 git clone --no-hardlinks /path/to/scienceflow /tmp/engine
 git -C /tmp/engine checkout 0ef229de1ae126ea04387ce74ae94ffacc437df6
-git -C /tmp/engine apply scienceflow/patches/0ef229de1ae126ea04387ce74ae94ffacc437df6/0001-*.patch
-git -C /tmp/engine apply scienceflow/patches/0ef229de1ae126ea04387ce74ae94ffacc437df6/0002-*.patch
+for patch in scienceflow/patches/0ef229de1ae126ea04387ce74ae94ffacc437df6/0*.patch; do
+  git -C /tmp/engine apply "$patch"
+done
 ```
 
 `verify.mjs` refuses a checkout that is not the base commit, a dirty checkout, a
@@ -70,10 +78,12 @@ own package path:
 PYTHONPATH=/tmp/engine python3 -m unittest tests.test_managed_lifecycle -v
 ```
 
-They exercise the real arming half, the real supervisor and the real registry,
-substituting only the expensive research step and the report generator. The
-engine itself declares `requires-python = ">=3.11,<3.14"`; a 3.10 interpreter is
-not engine-compatible evidence.
+They exercise the real arming half, the real supervisor, the real registry and —
+for the reporting-stop cases — the real `finalize_reports` wait, deadline,
+cancellation and process-group cleanup, substituting only the report child
+process and the report content read. The engine itself declares
+`requires-python = ">=3.11,<3.14"`; a 3.10 interpreter is not engine-compatible
+evidence.
 
 `prepare_run()` additionally parses a manifest through `ParallelRunner`, whose
 import graph needs the engine's full dependency set (for example `omegaconf`).

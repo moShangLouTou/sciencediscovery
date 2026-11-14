@@ -2,16 +2,20 @@
   "schemaVersion": 1,
   "engine": "scienceflow",
   "baseRevision": "0ef229de1ae126ea04387ce74ae94ffacc437df6",
-  "patchedRevision": "cda7d275f3ccaf3272096d78fe4ad9ec5e565732",
-  "patchedTree": "e8dff1ec922b5496606d21841f5295150f539361",
+  "patchedRevision": "d6d4b77f93061ced9ae3e3d8c10c0f70f28113a9",
+  "patchedTree": "ec041398d2ce81f432d39be2784c27bb4f94bc01",
   "patches": [
     {
       "path": "0001-feat-control-prepare-a-managed-run-without-spawning-.patch",
-      "sha256": "8543cd7406d43d3e3475fa77263531248a598c3985b38de5b05e061dc9cc6bba"
+      "sha256": "02eafdbb1eb34a066ce8e5a54aeb265fe90d14b7bef24174bb84bed00556ae30"
     },
     {
       "path": "0002-test-control-cover-prepare-only-arming-adoption-stop.patch",
-      "sha256": "686e3b074b79cdbed2063fcb3387163d2a575f2c3edc62be15b060b341f430c4"
+      "sha256": "df1fe154d974e4c499c46c4d2d774c3da75f1b063050071fd10cb254d6148580"
+    },
+    {
+      "path": "0003-fix-control-tell-a-reporting-stop-apart-from-a-repor.patch",
+      "sha256": "35f3445df67c24e9cfbbe6a1ace6e58492322e7a530db19d89135cc450f84728"
     }
   ]
 }

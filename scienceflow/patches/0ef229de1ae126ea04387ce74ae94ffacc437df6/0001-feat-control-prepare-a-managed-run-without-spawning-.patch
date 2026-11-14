@@ -1,7 +1,7 @@
 From 4c3c949324c9b764db886d14a63383ff68af0f7e Mon Sep 17 00:00:00 2001
 From: liyuan <liyuan390@huawei.com>
 Date: Sat, 14 Nov 2026 18:20:45 +0800
-Subject: [PATCH 1/2] feat(control): prepare a managed run without spawning and
+Subject: [PATCH 1/3] feat(control): prepare a managed run without spawning and
  let a host adopt it
 
 Extract the record-creating half of start_run() into prepare_run(), which
@@ -473,6 +473,3 @@ index fbea46a..3e8a723 100644
  
  
  if __name__ == "__main__":
--- 
-2.34.1
-

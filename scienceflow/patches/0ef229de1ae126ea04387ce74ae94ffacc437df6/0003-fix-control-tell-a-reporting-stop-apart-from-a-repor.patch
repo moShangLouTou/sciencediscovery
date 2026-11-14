@@ -1,0 +1,356 @@
+From d6d4b77f93061ced9ae3e3d8c10c0f70f28113a9 Mon Sep 17 00:00:00 2001
+From: liyuan <liyuan390@huawei.com>
+Date: Sat, 14 Nov 2026 19:58:30 +0800
+Subject: [PATCH 3/3] fix(control): tell a reporting stop apart from a report
+ timeout
+
+finalize_reports swallowed CancelledError together with TimeoutError, so a
+stop consumed while reports were generating returned as an ordinary timeout:
+the supervisor's own cancellation branch was unreachable, and a run whose
+research completed was recorded as failed with a generation failure.
+
+The report process group is still reaped first. The supervisor now asks for
+the cancellation to be re-raised (`raise_on_cancel=True`) so it can record
+`report_status="incomplete"` while keeping the research outcome; a caller that
+owns no supervisor state keeps the historical result contract, and a report
+timeout, its SIGALRM deadline and a non-zero generator keep their own
+semantics. The report generator stays a module seam so a test can replace
+exactly that child process and keep the real wait, deadline, cancellation and
+cleanup.
+---
+ .../parallel/control/reporting/__init__.py    |  32 ++-
+ .../runtime/parallel/control/worker.py        |   5 +-
+ tests/test_managed_lifecycle.py               | 196 +++++++++++++++++-
+ 3 files changed, 220 insertions(+), 13 deletions(-)
+
+diff --git a/scienceflow/runtime/parallel/control/reporting/__init__.py b/scienceflow/runtime/parallel/control/reporting/__init__.py
+index c7e5c71..6bbe89d 100644
+--- a/scienceflow/runtime/parallel/control/reporting/__init__.py
++++ b/scienceflow/runtime/parallel/control/reporting/__init__.py
+@@ -8,6 +8,12 @@ import os
+ import signal
+ import sys
+ 
++# The report generator itself is an expensive boundary of the engine, not the
++# lifecycle this module owns. It stays a module attribute so a test can replace
++# exactly that child process while the wait, the deadline, the cancellation and
++# the cleanup below remain the production ones.
++spawn_report_process = asyncio.create_subprocess_exec
++
+ 
+ def report_budget(payload: dict) -> float:
+     value = payload.get("report_budget_sec", 300)
+@@ -22,10 +28,22 @@ def report_budget(payload: dict) -> float:
+     return budget
+ 
+ 
+-async def finalize_reports(record: dict) -> tuple[list[dict], bool]:
+-    """Reap the report process at its own deadline; inspect committed files."""
++async def finalize_reports(
++    record: dict, *, raise_on_cancel: bool = False
++) -> tuple[list[dict], bool]:
++    """Reap the report process at its own deadline; inspect committed files.
++
++    A cancellation (the host stopped this attempt while reports were being
++    written) is reaped before it is reported, so no report process outlives the
++    attempt. The supervisor asks for it to be re-raised
++    (``raise_on_cancel=True``) because "stopped" and "timed out" are different
++    facts: a canceled report keeps the research outcome and is recorded as
++    incomplete. The default keeps the historical standalone contract — a
++    canceled report is an interrupted report — for callers that own no
++    supervisor state.
++    """
+     budget = report_budget(record.get("manifest_payload") or {})
+-    process = await asyncio.create_subprocess_exec(
++    process = await spawn_report_process(
+         sys.executable,
+         "-m",
+         __name__,
+@@ -40,7 +58,13 @@ async def finalize_reports(record: dict) -> tuple[list[dict], bool]:
+     try:
+         await asyncio.wait_for(process.wait(), timeout=budget)
+         timed_out = process.returncode == -signal.SIGALRM
+-    except (TimeoutError, asyncio.CancelledError):
++    except asyncio.CancelledError:
++        # Reaped in the ``finally`` below, then re-raised: "stopped" and "timed
++        # out" are different facts and must not be collapsed here.
++        if raise_on_cancel:
++            raise
++        timed_out = True
++    except TimeoutError:
+         timed_out = True
+     finally:
+         if process.returncode is None:
+diff --git a/scienceflow/runtime/parallel/control/worker.py b/scienceflow/runtime/parallel/control/worker.py
+index 3e8a723..89ebcca 100644
+--- a/scienceflow/runtime/parallel/control/worker.py
++++ b/scienceflow/runtime/parallel/control/worker.py
+@@ -233,7 +233,10 @@ async def supervise(
+         )
+         report_cancelled = False
+         try:
+-            reports, timed_out = await finalize_reports(record)
++            # The supervisor asks the real finalizer for the distinction it
++            # needs: a cancelled report is re-raised after its process group is
++            # reaped, while its own timeout stays an ordinary result.
++            reports, timed_out = await finalize_reports(record, raise_on_cancel=True)
+         except asyncio.CancelledError:
+             # A stop consumed while reports are generating keeps the research
+             # outcome already stated and records the report as incomplete. It
+diff --git a/tests/test_managed_lifecycle.py b/tests/test_managed_lifecycle.py
+index 7ac8212..ec93f81 100644
+--- a/tests/test_managed_lifecycle.py
++++ b/tests/test_managed_lifecycle.py
+@@ -2,8 +2,11 @@
+ 
+ These tests exercise the real control plane (``service._prepare_launch``,
+ ``worker.supervise`` and ``registry``) with only the expensive boundaries
+-substituted: the research step and the report generator. The supervisor, the
+-registry's durable record and every state transition are the production code.
++substituted: the research step, the report generator process and the report
++content read. The supervisor, the registry's durable record, every state
++transition and — in the reporting-stop cases below — the real
++``finalize_reports`` wait, deadline, cancellation and process-group cleanup are
++the production code.
+ 
+ ``prepare_run()`` itself parses a manifest through ``ParallelRunner``, whose
+ import graph needs the engine's third-party dependencies; a checkout without
+@@ -26,8 +29,9 @@ from pathlib import Path
+ from unittest import mock
+ 
+ from scienceflow.runtime.parallel.control import PreparedRun, prepare_run, service
+-from scienceflow.runtime.parallel.control import worker
++from scienceflow.runtime.parallel.control import reporting, worker
+ from scienceflow.runtime.parallel.control.registry import read_record, run_dir
++from scienceflow.runtime.parallel.control.reporting import report_budget
+ 
+ 
+ def _record(root: Path, run_id: str, **extra) -> dict:
+@@ -111,7 +115,7 @@ class ManagedLifecycleTest(unittest.IsolatedAsyncioTestCase):
+             self.assertEqual(read_record(run_dir("adopt"))["pid"], os.getpid())
+             return _Summary()
+ 
+-        async def finalize(record: dict):
++        async def finalize(record: dict, **_options):
+             return [{"status": "ready"}], False
+ 
+         with mock.patch(
+@@ -192,7 +196,7 @@ class ManagedLifecycleTest(unittest.IsolatedAsyncioTestCase):
+             await asyncio.sleep(0.1)
+             stop_event.set()
+ 
+-        async def finalize(record: dict):
++        async def finalize(record: dict, **_options):
+             return [], False
+ 
+         starter = asyncio.create_task(stop_later())
+@@ -226,7 +230,7 @@ class ManagedLifecycleTest(unittest.IsolatedAsyncioTestCase):
+         async def research(manifest: str):
+             return _Summary()
+ 
+-        async def finalize(record: dict):
++        async def finalize(record: dict, **_options):
+             started.set()
+             try:
+                 await asyncio.sleep(30)
+@@ -263,7 +267,7 @@ class ManagedLifecycleTest(unittest.IsolatedAsyncioTestCase):
+             await asyncio.sleep(0)
+             return _Summary()
+ 
+-        async def finalize(record: dict):
++        async def finalize(record: dict, **_options):
+             return [{"status": "generation_failed"}], False
+ 
+         before = len(asyncio.all_tasks())
+@@ -299,7 +303,7 @@ class ManagedLifecycleTest(unittest.IsolatedAsyncioTestCase):
+                 cancelled.append(1)
+                 raise
+ 
+-        async def finalize(record: dict):
++        async def finalize(record: dict, **_options):
+             return [], False
+ 
+         with mock.patch(
+@@ -314,6 +318,182 @@ class ManagedLifecycleTest(unittest.IsolatedAsyncioTestCase):
+         self.assertEqual(record["research_status"], "stopped")
+         self.assertEqual(record["phase"], "finished")
+ 
++    async def test_a_real_report_stop_is_incomplete_not_a_failure(self) -> None:
++        """E4 over the real finalizer: a stop keeps completed research.
++
++        Only the expensive report generator is replaced, by a real long-running
++        child in its own session. The wait, the cancellation, the process-group
++        kill and the await that reaps it are ``finalize_reports``' own code, so
++        this is the behaviour the bridge's stop actually meets.
++        """
++        prepared = self._prepare("report-real-stop", manifest_payload={"report_budget_sec": 30})
++        stop_event = asyncio.Event()
++        spawned: list[asyncio.subprocess.Process] = []
++        started = asyncio.Event()
++
++        async def fake_spawn(*_args, **_kwargs):
++            process = await asyncio.create_subprocess_exec(
++                "/bin/sleep", "30",
++                stdin=asyncio.subprocess.DEVNULL,
++                start_new_session=True,
++            )
++            spawned.append(process)
++            started.set()
++            return process
++
++        async def research(manifest: str):
++            return _Summary()
++
++        async def stop_later():
++            await started.wait()
++            stop_event.set()
++
++        reports = types.ModuleType("scienceflow.research.reporting")
++        reports.read_report_manifest = lambda root: None
++        starter = asyncio.create_task(stop_later())
++        with mock.patch.dict(sys.modules, {"scienceflow.research.reporting": reports}), \
++                mock.patch(
++                    "scienceflow.runtime.parallel.control.reporting.spawn_report_process",
++                    fake_spawn,
++                ):
++            await worker.supervise(
++                "report-real-stop", prepared.launch_token, stop_event=stop_event, research=research,
++            )
++        await starter
++        record = read_record(run_dir("report-real-stop"))
++        self.assertEqual(record["research_status"], "completed")
++        self.assertEqual(record["report_status"], "incomplete")
++        self.assertEqual(record["status"], "completed")
++        self.assertEqual(record["phase"], "finished")
++        self.assertFalse(record["report_timed_out"])
++        # The report process was reaped before the record was written, so no
++        # generator outlives the attempt it belonged to.
++        self.assertEqual(len(spawned), 1)
++        self.assertIsNotNone(spawned[0].returncode)
++        with self.assertRaises(ProcessLookupError):
++            os.kill(spawned[0].pid, 0)
++
++    async def test_a_real_report_timeout_still_fails_generation(self) -> None:
++        """A report that spends its own budget is a timeout, not a stop."""
++        prepared = self._prepare("report-real-timeout", manifest_payload={"report_budget_sec": 0.05})
++        spawned: list[asyncio.subprocess.Process] = []
++
++        async def fake_spawn(*_args, **_kwargs):
++            process = await asyncio.create_subprocess_exec(
++                "/bin/sleep", "30",
++                stdin=asyncio.subprocess.DEVNULL,
++                start_new_session=True,
++            )
++            spawned.append(process)
++            return process
++
++        async def research(manifest: str):
++            return _Summary()
++
++        reports = types.ModuleType("scienceflow.research.reporting")
++        reports.read_report_manifest = lambda root: None
++        with mock.patch.dict(sys.modules, {"scienceflow.research.reporting": reports}), \
++                mock.patch(
++                    "scienceflow.runtime.parallel.control.reporting.spawn_report_process",
++                    fake_spawn,
++                ):
++            await worker.supervise("report-real-timeout", prepared.launch_token, research=research)
++        record = read_record(run_dir("report-real-timeout"))
++        self.assertEqual(record["research_status"], "completed")
++        self.assertEqual(record["report_status"], "generation_failed")
++        self.assertEqual(record["status"], "failed")
++        self.assertTrue(record["report_timed_out"])
++        self.assertEqual(len(spawned), 1)
++        self.assertIsNotNone(spawned[0].returncode)
++
++    async def test_a_real_report_child_failure_keeps_its_own_semantics(self) -> None:
++        """A generator that exits non-zero is a failed report, not a stop."""
++        prepared = self._prepare("report-real-failed")
++        spawned: list[asyncio.subprocess.Process] = []
++
++        async def fake_spawn(*_args, **_kwargs):
++            process = await asyncio.create_subprocess_exec(
++                "/bin/sh", "-c", "exit 1",
++                stdin=asyncio.subprocess.DEVNULL,
++                start_new_session=True,
++            )
++            spawned.append(process)
++            return process
++
++        async def research(manifest: str):
++            return _Summary()
++
++        reports = types.ModuleType("scienceflow.research.reporting")
++        reports.read_report_manifest = lambda root: None
++        with mock.patch.dict(sys.modules, {"scienceflow.research.reporting": reports}), \
++                mock.patch(
++                    "scienceflow.runtime.parallel.control.reporting.spawn_report_process",
++                    fake_spawn,
++                ):
++            await worker.supervise("report-real-failed", prepared.launch_token, research=research)
++        record = read_record(run_dir("report-real-failed"))
++        self.assertEqual(record["research_status"], "completed")
++        self.assertEqual(record["report_status"], "generation_failed")
++        self.assertEqual(record["status"], "failed")
++        self.assertFalse(record["report_timed_out"])
++        # A non-zero return code is not the report's SIGALRM deadline.
++        self.assertEqual(spawned[0].returncode, 1)
++
++    async def test_the_standalone_finalizer_keeps_its_cancel_contract(self) -> None:
++        """A direct caller still gets a result; only the supervisor raises.
++
++        ``worker.supervise`` asks for ``raise_on_cancel=True`` because it has a
++        record to finish. A caller that owns no supervisor state keeps the
++        historical contract: the report process is reaped and the call returns
++        ``timed_out=True`` instead of raising.
++        """
++        record = {
++            "attempt": 1,
++            "launch_token": "standalone-token",
++            "manifest_payload": {"report_budget_sec": 30},
++            "run_id": "standalone-report",
++            "task_roots": [],
++        }
++        spawned: list[asyncio.subprocess.Process] = []
++
++        async def fake_spawn(*_args, **_kwargs):
++            process = await asyncio.create_subprocess_exec(
++                "/bin/sleep", "30",
++                stdin=asyncio.subprocess.DEVNULL,
++                start_new_session=True,
++            )
++            spawned.append(process)
++            return process
++
++        reports = types.ModuleType("scienceflow.research.reporting")
++        reports.read_report_manifest = lambda root: None
++        with mock.patch.dict(sys.modules, {"scienceflow.research.reporting": reports}), \
++                mock.patch(
++                    "scienceflow.runtime.parallel.control.reporting.spawn_report_process",
++                    fake_spawn,
++                ):
++            pending = asyncio.create_task(reporting.finalize_reports(record))
++            await asyncio.sleep(0.05)
++            pending.cancel()
++            reports, timed_out = await pending
++        self.assertTrue(timed_out)
++        self.assertEqual(reports, [])
++        self.assertEqual(len(spawned), 1)
++        self.assertIsNotNone(spawned[0].returncode)
++
++    def test_the_report_budget_is_read_only_from_the_manifest_top_level(self) -> None:
++        """The contract the Runner derives a manifest for: one top-level key.
++
++        ``finalize_reports`` passes ``record["manifest_payload"]`` whole, so a
++        budget nested under ``defaults`` (or anywhere else) is silently ignored
++        and the 300 s default applies. A derived manifest must therefore put the
++        key at the top level.
++        """
++        self.assertEqual(report_budget({"report_budget_sec": 2}), 2.0)
++        self.assertEqual(report_budget({"report_budget_sec": 0.5}), 0.5)
++        self.assertEqual(report_budget({}), 300.0)
++        self.assertEqual(report_budget({"defaults": {"report_budget_sec": 2}}), 300.0)
++
+     def test_the_public_entry_points_keep_their_shapes(self) -> None:
+         self.assertTrue(callable(prepare_run))
+         self.assertIsInstance(worker.run_manifest, type(None))
