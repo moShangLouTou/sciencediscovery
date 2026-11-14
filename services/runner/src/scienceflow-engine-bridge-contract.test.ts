@@ -318,32 +318,168 @@ print(json.dumps({
 
 test("a frozen contract outside the single-task subset is refused, never reduced", async (context) => {
   if (requiresEngine(context)) return;
-  const cases: { label: string; entries: readonly Entry[] }[] = [
+  const cases: { label: string; entries: readonly Entry[]; reason: string }[] = [
     {
       entries: frozenContract({
         manifest: "tasks:\n  - exp_id: alpha\n  - exp_id: beta\ndefaults:\n  workspace_base: /srv\n",
       }),
       label: "two-tasks",
+      reason: "manifest-task-count",
     },
     {
       entries: frozenContract({
         manifest: "tasks:\n  - exp_id: alpha\n    input_data_dir: /srv/data\ndefaults:\n  workspace_base: /srv\n",
       }),
-      label: "dataset",
+      label: "task-dataset",
+      reason: "manifest-dataset",
+    },
+    {
+      // The same binding under its legacy alias, at the task level.
+      entries: frozenContract({
+        manifest: "tasks:\n  - exp_id: alpha\n    data_dir: /srv/data\ndefaults:\n  workspace_base: /srv\n",
+      }),
+      label: "task-dataset-alias",
+      reason: "manifest-dataset",
+    },
+    {
+      // And at the defaults level, under both names: the engine reads all four
+      // positions, so a bridge that only checked the task key would silently
+      // run without the data the contract named.
+      entries: frozenContract({
+        manifest: "defaults:\n  input_data_dir: /srv/data\n  workspace_base: /srv\ntasks:\n  - exp_id: alpha\n",
+      }),
+      label: "defaults-dataset",
+      reason: "manifest-dataset",
+    },
+    {
+      entries: frozenContract({
+        manifest: "defaults:\n  data_dir: /srv/data\n  workspace_base: /srv\ntasks:\n  - exp_id: alpha\n",
+      }),
+      label: "defaults-dataset-alias",
+      reason: "manifest-dataset",
     },
     {
       entries: frozenContract({
         manifest: "config: shared.yaml\ntasks:\n  - exp_id: alpha\ndefaults:\n  workspace_base: /srv\n",
       }),
       label: "include",
+      reason: "manifest-include",
     },
     {
       entries: frozenContract({
         manifest: "tasks:\n  - exp_id: alpha\n    config: other.yaml\ndefaults:\n  workspace_base: /srv\n",
       }),
       label: "task-include",
+      reason: "manifest-include",
     },
-    { entries: frozenContract({ taskYaml: "id: alpha\ndataset: kaggle\n" }), label: "task-dataset" },
+    {
+      entries: frozenContract({
+        manifest:
+          "tasks:\n  - exp_id: alpha\n    lnr:\n      num_workers: 4\ndefaults:\n  workspace_base: /srv\n",
+      }),
+      label: "workers",
+      reason: "manifest-workers",
+    },
+    {
+      entries: frozenContract({
+        manifest:
+          "tasks:\n  - exp_id: alpha\n    lnr:\n      max_steps: 10\ndefaults:\n  workspace_base: /srv\n",
+      }),
+      label: "lnr-unsupported",
+      reason: "manifest-lnr",
+    },
+    {
+      entries: frozenContract({
+        manifest: "model: unsupported\ntasks:\n  - exp_id: alpha\ndefaults:\n  workspace_base: /srv\n",
+      }),
+      label: "unknown-root-key",
+      reason: "manifest-key",
+    },
+    {
+      entries: frozenContract({
+        manifest: "defaults:\n  models: [a]\n  workspace_base: /srv\ntasks:\n  - exp_id: alpha\n",
+      }),
+      label: "model-gateway",
+      reason: "manifest-key",
+    },
+    {
+      entries: frozenContract({
+        manifest: "tasks:\n  - exp_id: alpha\n    task: inline text\ndefaults:\n  workspace_base: /srv\n",
+      }),
+      label: "inline-text",
+      reason: "manifest-task-text",
+    },
+    {
+      entries: frozenContract({
+        manifest: "tasks:\n  - exp_id: alpha\n    run_id: other\ndefaults:\n  workspace_base: /srv\n",
+      }),
+      label: "run-id",
+      reason: "manifest-run-id",
+    },
+    {
+      entries: frozenContract({
+        manifest: "tasks:\n  - exp_id: alpha\n    gpu_list: '0'\ndefaults:\n  workspace_base: /srv\n",
+      }),
+      label: "devices",
+      reason: "manifest-devices",
+    },
+    {
+      entries: frozenContract({
+        manifest: "tasks:\n  - exp_id: alpha\n    num_drafts: 2\ndefaults:\n  workspace_base: /srv\n",
+      }),
+      label: "drafts",
+      reason: "manifest-drafts",
+    },
+    {
+      entries: frozenContract({
+        manifest: "resume: true\ntasks:\n  - exp_id: alpha\ndefaults:\n  workspace_base: /srv\n",
+      }),
+      label: "resume",
+      reason: "manifest-resume",
+    },
+    {
+      // The engine never reads defaults.time_limit, and the frozen subset does
+      // not carry it either; accepting it would imply a budget it does not set.
+      entries: frozenContract({
+        manifest: "defaults:\n  time_limit: 4000\n  workspace_base: /srv\ntasks:\n  - exp_id: alpha\n",
+      }),
+      label: "defaults-time-limit",
+      reason: "manifest-key",
+    },
+    {
+      entries: frozenContract({ manifest: "tasks:\n  - exp_id: alpha\n" }),
+      label: "workspace-missing",
+      reason: "manifest-workspace",
+    },
+    {
+      entries: frozenContract({ taskYaml: "id: alpha\ndataset: kaggle\n" }),
+      label: "task-package-dataset",
+      reason: "task-key",
+    },
+    {
+      entries: frozenContract({
+        taskYaml:
+          "id: alpha\ndescription: description.md\nartifact:\n  path: submission.csv\nmetric:\n  name: m\n  lower_is_better: false\nevaluator:\n  entrypoint: evaluate.py:main\ninputs:\n  required: false\n  path: /srv/data\n",
+      }),
+      label: "task-inputs-path",
+      reason: "task-dataset",
+    },
+    {
+      entries: frozenContract({
+        taskYaml:
+          "id: alpha\ndescription: description.md\nartifact:\n  path: submission.csv\nmetric:\n  name: m\n  lower_is_better: false\nevaluator:\n  entrypoint: evaluate.py:main\n  command: run.sh\n",
+      }),
+      label: "task-evaluator-command",
+      reason: "task-evaluator",
+    },
+    {
+      entries: frozenContract({
+        taskYaml:
+          "id: alpha\ndescription: description.md\nartifact:\n  path: submission.csv\nmetric:\n  name: m\n  lower_is_better: false\nevaluator:\n  entrypoint: evaluate.py:main\ngate:\n  policy: strict\n",
+      }),
+      label: "task-gate",
+      reason: "task-evaluator",
+    },
   ];
   for (const item of cases) {
     const scenario = await scratch(item.label, item.entries);
@@ -357,13 +493,72 @@ test("a frozen contract outside the single-task subset is refused, never reduced
     assert.equal(answer.refusal.code, "unsupported", item.label);
     assert.equal(answer.refusal.execution, "run-contract", item.label);
     assert.equal(answer.refusal.version, 1);
-    assert.match(answer.refusal.reason, /^[a-z][a-z0-9-]*$/, item.label);
+    assert.equal(answer.refusal.reason, item.reason, item.label);
     // The run is terminated positively: a refused contract is a definite
     // failure, never a missing record the Runner would have to guess about.
     assert.equal(answer.status.outcome, "failed", item.label);
     assert.equal(answer.status.phase, "finished", item.label);
     assert.equal(answer.status.report, "failed", item.label);
   }
+});
+
+test("supported manifest fields keep the engine's own precedence", async (context) => {
+  if (requiresEngine(context)) return;
+  // lnr merges root < defaults < task, time_limit is task then root (the engine
+  // never reads defaults.time_limit), and one worker stays one worker.
+  const layered = await scratch("priority-layered", frozenContract({
+    manifest: [
+      "max_concurrent: 1",
+      "time_limit: 9000",
+      "lnr:",
+      "  wall_clock_budget_sec: 100",
+      "  num_workers: 1",
+      "tasks:",
+      "  - exp_id: alpha",
+      "    time_limit: 7200",
+      "    lnr:",
+      "      wall_clock_budget_sec: 300",
+      "defaults:",
+      "  phase: run",
+      "  type: lnr",
+      "  workspace_base: /srv/workspaces",
+      "  lnr:",
+      "    wall_clock_budget_sec: 200",
+      "",
+    ].join("\n"),
+  }));
+  context.after(() => rm(layered.root, { force: true, recursive: true }));
+  const layeredResult = runPython(DERIVE, bridgeArgs(layered));
+  assert.equal(layeredResult.status, 0, layeredResult.stderr);
+  const layeredAnswer = JSON.parse(layeredResult.stdout) as { payload: Record<string, any> };
+  const layeredTask = (layeredAnswer.payload.tasks as Record<string, any>[])[0]!;
+  assert.equal(layeredTask.time_limit, 7200, "the task time_limit wins over the root and defaults");
+  assert.equal(layeredTask.lnr.wall_clock_budget_sec, 300, "task lnr wins over defaults and root");
+  assert.equal(layeredTask.lnr.num_workers, 1);
+
+  // Without a task value the root's budget applies, and a defaults lnr value
+  // fills in exactly as the engine's own merge does.
+  const rootOnly = await scratch("priority-root", frozenContract({
+    manifest: [
+      "time_limit: 9000",
+      "tasks:",
+      "  - exp_id: alpha",
+      "defaults:",
+      "  phase: run",
+      "  type: lnr",
+      "  workspace_base: /srv/workspaces",
+      "  lnr:",
+      "    wall_clock_budget_sec: 200",
+      "",
+    ].join("\n"),
+  }));
+  context.after(() => rm(rootOnly.root, { force: true, recursive: true }));
+  const rootResult = runPython(DERIVE, bridgeArgs(rootOnly));
+  assert.equal(rootResult.status, 0, rootResult.stderr);
+  const rootAnswer = JSON.parse(rootResult.stdout) as { payload: Record<string, any> };
+  const rootTask = (rootAnswer.payload.tasks as Record<string, any>[])[0]!;
+  assert.equal(rootTask.time_limit, 9000);
+  assert.equal(rootTask.lnr.wall_clock_budget_sec, 200, "defaults lnr applies when the task declares none");
 });
 
 const READY = String.raw`
@@ -469,8 +664,8 @@ test("the bridge's ready callback is synchronous and runs once under the real su
 });
 
 test("the bridge mapping version is a Runner constant the link must repeat", () => {
-  assert.equal(SCIENCEFLOW_LAUNCH_MAPPING_VERSION, 2);
-  assert.match(SCIENCEFLOW_ENGINE_BRIDGE_SOURCE, /MAPPING_VERSION = 2/);
+  assert.equal(SCIENCEFLOW_LAUNCH_MAPPING_VERSION, 3);
+  assert.match(SCIENCEFLOW_ENGINE_BRIDGE_SOURCE, /MAPPING_VERSION = 3/);
   assert.match(SCIENCEFLOW_ENGINE_BRIDGE_SOURCE, /"report_budget_sec": report_seconds/);
   assert.match(SCIENCEFLOW_ENGINE_BRIDGE_SOURCE, /if __name__ == "__main__":/);
   assert.match(SCIENCEFLOW_ENGINE_BRIDGE_SOURCE, /def ready\(\):/);

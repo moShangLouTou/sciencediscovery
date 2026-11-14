@@ -44,12 +44,17 @@ import {
 } from "@sciencediscovery/schema";
 
 import { createResearchRunExecutor, type ResearchEngineBinding, type ResearchRunWiring } from "./research-run.js";
+import { pythonRequirementAllows, readRequiresPython } from "./scienceflow-runtime-check.js";
 import type { EnvironmentRuntime } from "./environment-store.js";
 
 // The fixture prefix copies a host interpreter the way the runtime-identity
 // check's own fixtures do. It proves the binding path, not engine
-// compatibility: the engine itself is not imported in these cases.
+// compatibility: the engine itself is not imported in these cases. The
+// compliant interpreter is the one the engine's own `requires-python` allows;
+// without it only the refusal paths can run here.
 const PYTHON = process.env.SCIENCEFLOW_FIXTURE_PYTHON ?? "/usr/bin/python3";
+const COMPLIANT_PYTHON = process.env.SCIENCEFLOW_TEST_PYTHON;
+const REQUIRES_PYTHON = ">=3.11,<3.14";
 const VERSION = "0.2.0";
 const SCHEDULE: ResearchTimeSchedule = {
   drainGraceMs: 100, reportBudgetMs: 500, researchBudgetMs: 5_000,
@@ -59,10 +64,40 @@ const SCHEDULE: ResearchTimeSchedule = {
 const INPUTS = (() => {
   const contractDigest = "a".repeat(64);
   const entries = [
-    { content: "contract\n", path: "manifest.yaml", roles: ["manifest"] as const },
-    { content: "id: probe\n", path: "package/task.yaml", roles: ["task_yaml"] as const },
+    {
+      content: [
+        "max_concurrent: 1",
+        "time_limit: 9000",
+        "tasks:",
+        "  - exp_id: probe",
+        "defaults:",
+        "  phase: run",
+        "  type: lnr",
+        "  workspace_base: /srv/workspaces",
+        "",
+      ].join("\n"),
+      path: "manifest.yaml",
+      roles: ["manifest"] as const,
+    },
+    {
+      content: [
+        "id: probe",
+        "description: description.md",
+        "artifact:",
+        "  path: submission.csv",
+        "metric:",
+        "  name: probe_score",
+        "  lower_is_better: false",
+        "evaluator:",
+        "  entrypoint: evaluate.py:main",
+        "",
+      ].join("\n"),
+      path: "package/task.yaml",
+      roles: ["task_yaml"] as const,
+    },
     { content: "description\n", path: "package/description.md", roles: ["description"] as const },
-    { content: "def evaluate():\n    return 1\n", path: "package/evaluate.py", roles: ["evaluator"] as const },
+    { content: "def main():\n    return 1\n", path: "package/evaluate.py", roles: ["evaluator"] as const },
+    { content: "inputs:\n  required: false\n", path: "package/_shared/task_defaults.yaml", roles: ["shared_task_defaults"] as const },
   ];
   const files = entries.map((entry) => ({
     path: entry.path,
@@ -92,39 +127,68 @@ function git(cwd: string, args: readonly string[]): string {
   return result.stdout.trim();
 }
 
-async function fixture(context: { after: (fn: () => Promise<void>) => void }) {
+async function fixture(
+  context: { after: (fn: () => Promise<void>) => void },
+  python = PYTHON,
+) {
   const root = await mkdtemp(resolve(tmpdir(), "engine-source-binding-"));
   context.after(() => rm(root, { force: true, recursive: true }));
   const checkout = resolve(root, "checkout");
   await mkdir(resolve(checkout, "scienceflow"), { recursive: true });
   await writeFile(resolve(checkout, "scienceflow/__init__.py"), 'raise RuntimeError("not a runnable engine")\n');
-  await writeFile(resolve(checkout, "pyproject.toml"), `[project]\nname = "scienceflow"\nversion = "${VERSION}"\n`);
+  await writeFile(
+    resolve(checkout, "pyproject.toml"),
+    `[project]\nname = "scienceflow"\nversion = "${VERSION}"\nrequires-python = "${REQUIRES_PYTHON}"\n`,
+  );
   git(checkout, ["init", "--quiet"]);
   git(checkout, ["add", "-A"]);
   git(checkout, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "fixture"]);
   const revision = git(checkout, ["rev-parse", "HEAD"]);
 
-  // A controlled environment prefix: a copied interpreter, its stdlib and one
-  // `.pth` path line. This is the "controlled source mount" assembly a test may
-  // build itself; production leases such an environment and never copies one.
+  // A controlled environment prefix: a copied interpreter, its stdlib, one
+  // `.pth` path line and the PyYAML package the bridge's derivation needs
+  // before it imports the engine. This is the "controlled source mount"
+  // assembly a test may build itself; production leases such an environment and
+  // never copies one.
   const prefix = resolve(root, "prefix");
-  const build = spawnSync(PYTHON, ["-I", "-B", "-c", `
-import os, shutil, sys, sysconfig
+  const build = spawnSync(python, ["-I", "-B", "-c", `
+import os, shutil, site, sys, sysconfig
 prefix = ${JSON.stringify(prefix)}
 source = ${JSON.stringify(checkout)}
 version = "%d.%d" % sys.version_info[:2]
 lib = os.path.join(prefix, "lib", "python" + version)
 os.makedirs(os.path.join(prefix, "bin"))
-os.makedirs(os.path.join(lib, "dist-packages"))
+os.makedirs(lib)
 shutil.copyfile(sys.executable, os.path.join(prefix, "bin", "python"))
 os.chmod(os.path.join(prefix, "bin", "python"), 0o755)
 stdlib = sysconfig.get_path("stdlib")
 for entry in os.listdir(stdlib):
-    if entry not in ("site-packages", "dist-packages", "sitecustomize.py", "usercustomize.py"):
-        os.symlink(os.path.join(stdlib, entry), os.path.join(lib, entry))
-with open(os.path.join(lib, "dist-packages", "scienceflow.pth"), "w") as handle:
+    if entry in ("site-packages", "dist-packages", "sitecustomize.py", "usercustomize.py"):
+        continue
+    source_entry = os.path.join(stdlib, entry)
+    target_entry = os.path.join(lib, entry)
+    if stdlib.startswith("/usr/"):
+        # The sandbox already mounts /usr read-only; a link stays valid there.
+        os.symlink(source_entry, target_entry)
+    elif os.path.isdir(source_entry) and not os.path.islink(source_entry):
+        # Outside the host mounts the sandbox provides, the fixture carries the
+        # stdlib itself; a link would dangle inside the sandbox.
+        shutil.copytree(source_entry, target_entry, symlinks=True)
+    else:
+        shutil.copy2(source_entry, target_entry, follow_symlinks=False)
+site_dir = os.path.join(lib, os.path.basename(site.getsitepackages()[0]))
+os.makedirs(site_dir)
+try:
+    import yaml
+    yaml_dir = os.path.dirname(yaml.__file__)
+except ImportError:
+    yaml_dir = os.path.join(sysconfig.get_path("purelib"), "yaml")
+if not os.path.isdir(yaml_dir):
+    raise SystemExit("PyYAML is required for the engine bridge fixture")
+shutil.copytree(yaml_dir, os.path.join(site_dir, "yaml"))
+with open(os.path.join(site_dir, "scienceflow.pth"), "w") as handle:
     handle.write(source + "\\n")
-print(".".join(version.split(".")) + " " + os.path.join(lib, "dist-packages"))
+print(".".join(version.split(".")) + " " + site_dir)
 `], { encoding: "utf8" });
   assert.equal(build.error, undefined);
   assert.equal(build.status, 0, build.stderr);
@@ -147,7 +211,7 @@ print(".".join(version.split(".")) + " " + os.path.join(lib, "dist-packages"))
       snapshot: { hash: "fixture", size: 0 },
     },
   };
-  return { checkout, dataDir, prefix, revision, root, runtime, sitePackages, workspace };
+  return { checkout, dataDir, languageVersion, prefix, revision, root, runtime, sitePackages, workspace };
 }
 
 function request(id: string, workspace: string): ResearchRunRequest {
@@ -186,8 +250,33 @@ function wiring(
   };
 }
 
+test("the engine's requires-python range is decided before the spawn", () => {
+  const requirement = readRequiresPython('[project]\nname = "scienceflow"\nrequires-python = ">=3.11,<3.14"\n');
+  assert.equal(requirement, REQUIRES_PYTHON);
+  for (const version of ["3.11.0", "3.12.12", "3.13.9"]) {
+    assert.equal(pythonRequirementAllows(requirement!, version), true, version);
+  }
+  for (const version of ["3.10.12", "3.14.0", "4.0.0"]) {
+    assert.equal(pythonRequirementAllows(requirement!, version), false, version);
+  }
+  // A specifier this Runner does not evaluate is never treated as satisfied.
+  assert.equal(pythonRequirementAllows("!=3.13", "3.12.0"), null);
+  assert.equal(pythonRequirementAllows(">=3.11", "3.14.0"), true);
+  assert.equal(pythonRequirementAllows("~=3.11", "3.12.1"), true);
+  assert.equal(pythonRequirementAllows("~=3.11", "4.0.0"), false);
+  assert.equal(pythonRequirementAllows("==3.12", "3.12.9"), true);
+  assert.equal(pythonRequirementAllows("==3.12.1", "3.12.9"), false);
+  // Only one plain declaration in `[project]` is a contract.
+  assert.equal(readRequiresPython('[project]\nrequires-python = ">=3.11"\nrequires-python = ">=3.12"\n'), null);
+  assert.equal(readRequiresPython('[tool.other]\nrequires-python = ">=3.11,<3.14"\n'), null);
+});
+
 test("a matching source binding is proven in the lease and the engine starts", async (context) => {
-  const f = await fixture(context);
+  if (COMPLIANT_PYTHON === undefined) {
+    context.skip?.("SCIENCEFLOW_TEST_PYTHON does not name an interpreter inside the engine's range");
+    return;
+  }
+  const f = await fixture(context, COMPLIANT_PYTHON);
   const engine = { revision: f.revision, runtimeBindingId: "binding", sourceRoot: f.checkout, version: VERSION };
   const executor = createResearchRunExecutor(wiring(
     f,
@@ -202,6 +291,28 @@ test("a matching source binding is proven in the lease and the engine starts", a
   assert.notEqual(outcome.research.refusal, "RESEARCH_ENGINE_NOT_CONFIGURED");
   assert.equal(outcome.research.process, "unverified");
   assert.equal(outcome.research.outcome, "unknown");
+});
+
+test("an interpreter outside the engine's declared range is refused before spawn", async (context) => {
+  const f = await fixture(context);
+  const [major, minor] = f.languageVersion.split(".").map(Number) as [number, number];
+  if (major === 3 && minor >= 11 && minor < 14) {
+    context.skip?.(`the fixture interpreter ${f.languageVersion} is inside the engine's declared range`);
+    return;
+  }
+  const engine = { revision: f.revision, runtimeBindingId: "binding", sourceRoot: f.checkout, version: VERSION };
+  const executor = createResearchRunExecutor(wiring(
+    f,
+    engine,
+    { bindingFor: (id) => ({ bindingId: id, expectedRevision: f.revision, sourceRoot: f.checkout }) },
+  ));
+  const outcome = await executor.run(request("python-range", f.workspace), { signal: new AbortController().signal });
+  // The source binding and revision are fine; the interpreter is not in the
+  // contract the checkout declares, so no research process may exist.
+  assert.equal(outcome.research.process, "not_started", JSON.stringify(outcome.research));
+  assert.equal(outcome.research.refusal, "RESEARCH_ENGINE_UNAVAILABLE");
+  assert.equal(outcome.research.spawnedAt, undefined);
+  await assert.rejects(stat(resolve(f.dataDir, "runner-research-engine")));
 });
 
 test("a production engine without a source binding is refused before spawn", async (context) => {
@@ -234,7 +345,11 @@ test("a binding that names another checkout or revision is refused before spawn"
 });
 
 test("an interpreter that resolves another copy of the package is refused", async (context) => {
-  const f = await fixture(context);
+  if (COMPLIANT_PYTHON === undefined) {
+    context.skip?.("SCIENCEFLOW_TEST_PYTHON does not name an interpreter inside the engine's range");
+    return;
+  }
+  const f = await fixture(context, COMPLIANT_PYTHON);
   // The binding is well formed, but the environment's `.pth` points somewhere
   // that is not the trusted checkout: the static proof must see that and
   // refuse instead of accepting the configured path on faith.

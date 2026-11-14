@@ -40,7 +40,7 @@
  * - every answer is a fixed check code and status. Host paths, `sys.path`
  *   entries, Git output, and probe stderr never leave this module.
  */
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -811,6 +811,106 @@ export interface ScienceFlowSourceBindingVerdict {
   readonly boundary?: ExecutionBoundaryHandle | "unproven";
 }
 
+/** Bound on the engine's own `pyproject.toml`; only one line is read. */
+const ENGINE_PYPROJECT_MAX_BYTES = 256 * 1024;
+
+/**
+ * The `requires-python` value declared by the engine's `[project]` table.
+ *
+ * The file is the pinned checkout's own declaration, not a Runner constant: a
+ * revision that changes its supported range changes this answer. Only a single
+ * plain `requires-python = "..."` line inside `[project]` is understood;
+ * anything else is `null`, which the caller refuses rather than guesses.
+ */
+export function readRequiresPython(text: string): string | null {
+  let inProject = false;
+  let found = 0;
+  let value: string | null = null;
+  for (const raw of text.split(/\r?\n/u)) {
+    const line = raw.trim();
+    if (line.startsWith("[") && line.endsWith("]")) {
+      inProject = line === "[project]";
+      continue;
+    }
+    if (!inProject) continue;
+    const match = /^requires-python\s*=\s*(["'])([^"'\n]{1,128})\1$/u.exec(line);
+    if (match === null) continue;
+    found += 1;
+    value = match[2] ?? null;
+  }
+  return found === 1 ? value : null;
+}
+
+type VersionTuple = readonly [number, number, number];
+
+function parseVersionTuple(text: string): VersionTuple | null {
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*))?$/u.exec(text);
+  if (match === null) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3] ?? 0)];
+}
+
+function compareVersions(left: VersionTuple, right: VersionTuple): number {
+  for (let index = 0; index < 3; index += 1) {
+    const delta = left[index]! - right[index]!;
+    if (delta !== 0) return delta;
+  }
+  return 0;
+}
+
+/**
+ * Whether an observed interpreter version satisfies a PEP 440 range.
+ *
+ * Only the clause forms an engine's `requires-python` realistically uses are
+ * evaluated (`>=`, `>`, `<=`, `<`, `==` and `~=`); a specifier outside that set
+ * is `null`, and the caller refuses instead of treating it as satisfied. A
+ * bare `==X.Y` matches that minor series, and `~=X.Y` is `>=X.Y,<X+1`.
+ */
+export function pythonRequirementAllows(requirement: string, version: string): boolean | null {
+  const observed = parseVersionTuple(version);
+  if (observed === null) return null;
+  const clauses = requirement
+    .split(",")
+    .map((clause) => clause.trim())
+    .filter((clause) => clause.length > 0);
+  if (clauses.length === 0) return null;
+  for (const clause of clauses) {
+    const match = /^(>=|<=|==|~=|>|<)\s*(\d+)\.(\d+)(?:\.(\d+))?$/u.exec(clause);
+    if (match === null) return null;
+    const operator = match[1]!;
+    const numbers: VersionTuple = [
+      Number(match[2]),
+      Number(match[3]),
+      match[4] === undefined ? 0 : Number(match[4]),
+    ];
+    const exactMinor = match[4] === undefined;
+    const order = compareVersions(observed, numbers);
+    let satisfied: boolean;
+    if (operator === ">=") satisfied = order >= 0;
+    else if (operator === ">") satisfied = order > 0;
+    else if (operator === "<=") satisfied = order <= 0;
+    else if (operator === "<") satisfied = order < 0;
+    else if (operator === "==") {
+      satisfied = exactMinor
+        ? observed[0] === numbers[0] && observed[1] === numbers[1]
+        : order === 0;
+    } else {
+      satisfied = compareVersions(observed, [numbers[0], numbers[1], 0]) >= 0
+        && compareVersions(observed, [numbers[0] + 1, 0, 0]) < 0;
+    }
+    if (!satisfied) return false;
+  }
+  return true;
+}
+
+/** Read the pinned checkout's own Python requirement, bounded and unfollowed. */
+async function enginePythonRequirement(sourceRoot: string): Promise<string | null> {
+  const path = resolve(sourceRoot, "pyproject.toml");
+  const info = await stat(path).catch(() => undefined);
+  if (info === undefined || !info.isFile() || info.size > ENGINE_PYPROJECT_MAX_BYTES) return null;
+  const text = await readFile(path, "utf8").catch(() => undefined);
+  return text === undefined ? null : readRequiresPython(text);
+}
+
 /**
  * Prove, inside the lease that will run the research workload, that this
  * environment's interpreter resolves `scienceflow` from the pinned checkout.
@@ -867,6 +967,17 @@ export async function verifyScienceFlowSourceBinding(options: {
   const overrides = revisionStatusOverrides(revision);
   if (overrides.source_revision !== "passed" || overrides.source_cleanliness !== "passed") {
     return { reason: "revision", status: "refused" };
+  }
+  // The checkout's own Python contract is part of the engine, not a Runner
+  // preference. Comparing the environment's declared version with the
+  // interpreter's observed version only proves the two agree; it says nothing
+  // about whether the engine supports either. The range is read from the pinned
+  // checkout at the revision just verified, and checked against this lease's
+  // real interpreter before any research process may start.
+  const requirement = await enginePythonRequirement(binding.sourceRoot);
+  if (requirement === null) return { reason: "python-requirement-missing", status: "refused" };
+  if (pythonRequirementAllows(requirement, probe.facts.python.version) !== true) {
+    return { reason: "python-requirement", status: "refused" };
   }
   return { status: "verified" };
 }

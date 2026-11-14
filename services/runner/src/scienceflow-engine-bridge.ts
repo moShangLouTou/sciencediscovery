@@ -34,10 +34,14 @@
  *
  * The derivation is a bounded projection of the frozen contract, not a
  * re-invention of the task. Only a single-task, dataset-free contract is
- * accepted; the task package is relocated byte-for-byte into the Runner-owned
- * engine state directory and named explicitly (`package_source`), so the engine
- * reads the frozen task.yaml, description and evaluator rather than any
- * same-named task in its own checkout.
+ * accepted, and every key of the frozen manifest and task package is checked
+ * against the subset this round carries: a construct whose behavior would be
+ * lost (a dataset alias, an include, another worker or draft count, a model
+ * gateway, an inline task text) is refused, never reduced. The task package is
+ * relocated byte-for-byte into the Runner-owned engine state directory and
+ * named explicitly (`package_source`), so the engine reads the frozen
+ * task.yaml, description and evaluator rather than any same-named task in its
+ * own checkout.
  */
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
@@ -52,8 +56,11 @@ export const SCIENCEFLOW_BRIDGE_PROTOCOL_VERSION = 1;
  * Version 2: the frozen task package is relocated and named explicitly, the
  * report budget is a top-level manifest key, and the launch task identity is
  * derived so the engine cannot resolve a same-named task of its own.
+ *
+ * Version 3: the derivation follows the engine's own field sources and refuses
+ * every key outside the supported manifest subset instead of reducing it.
  */
-export const SCIENCEFLOW_LAUNCH_MAPPING_VERSION = 2;
+export const SCIENCEFLOW_LAUNCH_MAPPING_VERSION = 3;
 /** Fixed mount of the revision-pinned engine checkout (read-only). */
 export const SCIENCEFLOW_ENGINE_MOUNT = "/scienceflow-engine";
 /** Fixed mount of the Runner-owned directory the engine writes its state in. */
@@ -199,7 +206,7 @@ STOP = CONTROL / "stop"
 CONSUMED = CONTROL / "stop.consumed"
 REFUSED = ENGINE_STATE / "contract.refused"
 # Must match SCIENCEFLOW_LAUNCH_MAPPING_VERSION in the Runner module.
-MAPPING_VERSION = 2
+MAPPING_VERSION = 3
 POLL_SECONDS = 0.05
 PROJECT_SECONDS = 0.05
 # The only task.yaml keys this bridge forwards; anything else is a construct
@@ -208,6 +215,33 @@ PROJECT_SECONDS = 0.05
 SUPPORTED_TASK_KEYS = frozenset({
     "id", "category", "provider", "profile", "description", "artifact",
     "metric", "problem", "evaluator", "validation", "inputs",
+})
+# The frozen manifest subset, mirroring the API's execution contract. A key
+# outside these sets is refused, never dropped: the engine gives the same key
+# different meaning at the root, in defaults and in a task, and a value this
+# bridge cannot carry would otherwise disappear.
+MANIFEST_ROOT_KEYS = frozenset({
+    "defaults", "lnr", "max_concurrent", "resume", "resume_budget_policy",
+    "tasks", "time_limit",
+})
+MANIFEST_DEFAULT_KEYS = frozenset({
+    "data_dir", "draft_parallel", "evaluator", "input_data_dir", "lnr",
+    "num_drafts", "phase", "type", "workspace_base",
+})
+MANIFEST_TASK_KEYS = frozenset({
+    "cpu_list", "data_dir", "draft_parallel", "exp_id", "gpu_list",
+    "input_data_dir", "lnr", "num_drafts", "phase", "run_id", "time_limit",
+    "type", "workspace", "workspace_base",
+})
+MANIFEST_LNR_KEYS = frozenset({
+    "max_steps", "num_workers", "omp_threads_cap", "resource_control_mode",
+    "resource_gpu_pool", "seed", "wall_clock_budget_sec",
+})
+# The lnr keys this bridge carries. The rest change the engine's resource
+# behavior and are refused instead of being replaced by one fixed worker.
+UNSUPPORTED_LNR_KEYS = frozenset({
+    "max_steps", "omp_threads_cap", "resource_control_mode", "resource_gpu_pool",
+    "seed",
 })
 SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
@@ -421,14 +455,79 @@ def relocate_package(package_prefix, target_dir, shared_role):
     return target
 
 
+def check_block(block, allowed):
+    for key in block:
+        if key not in allowed:
+            refuse("manifest-key")
+
+
+def positive_int(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value != int(value) or value < 1:
+        return None
+    return int(value)
+
+
+def dataset_bound(block):
+    """Any read-only data root, under either the current or the legacy key."""
+    for key in ("input_data_dir", "data_dir"):
+        value = block.get(key)
+        if value is not None and str(value).strip():
+            return True
+    return False
+
+
+def merge_lnr(*blocks):
+    """The engine's own precedence: manifest root < defaults < task."""
+    merged = {}
+    for block in blocks:
+        value = block.get("lnr")
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            refuse("manifest-lnr")
+        for key, item in value.items():
+            if key not in MANIFEST_LNR_KEYS:
+                refuse("manifest-lnr")
+            merged[key] = item
+    return merged
+
+
+def declared_workspace(task, defaults):
+    """The engine's workspace precedence, kept as a declaration.
+
+    The Runner owns the sandbox workspace and mounts it at /workspace, so the
+    frozen host path itself is never carried. What must not vanish is the fact
+    that the contract declares a workspace; the engine refuses a manifest
+    without one and so does this bridge.
+    """
+    values = (
+        task.get("workspace"),
+        task.get("workspace_base"),
+        defaults.get("workspace_base"),
+    )
+    for value in values:
+        if value is not None and not isinstance(value, str):
+            refuse("manifest-workspace")
+    for value in values:
+        if str(value or "").strip():
+            return
+    refuse("manifest-workspace")
+
+
 def build_launch_manifest():
     """Derive one launch manifest from the frozen contract, never from a host path.
 
     The frozen bytes stay as they are. Only a fixed set of references is mapped:
     the description becomes the inline task text, the package is relocated to a
     Runner-owned directory and named explicitly, and the workspace is the mount
-    the Runner owns. Shapes outside this round's subset are refused, never
-    quietly reduced.
+    the Runner owns. This is a bounded projection, not a general task system:
+    every key of the frozen manifest and of the task package is checked against
+    the subset below, and a construct this round cannot carry is refused rather
+    than reduced. The engine's own field sources are followed: lnr merges root <
+    defaults < task, time_limit is the task's then the root's (defaults never
+    supplies it), and the dataset aliases are read with the same precedence.
     """
     roles = role_paths()
     for role in ("manifest", "task_yaml", "description", "evaluator"):
@@ -439,6 +538,11 @@ def build_launch_manifest():
     # The task package: shared defaults first, the task file on top.
     shared = load_yaml(roles["shared_task_defaults"]) if "shared_task_defaults" in roles else {}
     config = merge_defaults(shared, load_yaml(task_yaml_path))
+    if "gate" in config:
+        # A gate policy is engine-side evaluation configuration this round does
+        # not model; the bridge must not pretend the default policy is the
+        # frozen one.
+        refuse("task-evaluator")
     if set(config) - SUPPORTED_TASK_KEYS:
         refuse("task-key")
     description_path = package_reference(config.get("description"))
@@ -446,31 +550,93 @@ def build_launch_manifest():
         refuse("input-role")
     frozen = load_yaml(roles["manifest"])
 
-    # The supported subset: one task, no dataset binding, no include.
-    for block in (frozen, frozen.get("defaults"), frozen.get("tasks")):
-        if isinstance(block, dict) and "config" in block:
-            refuse("manifest-include")
+    # The frozen manifest, checked key by key before any value is interpreted.
+    if "config" in frozen:
+        refuse("manifest-include")
+    check_block(frozen, MANIFEST_ROOT_KEYS)
+    defaults = frozen.get("defaults")
+    if defaults is None:
+        defaults = {}
+    if not isinstance(defaults, dict):
+        refuse("manifest-defaults")
+    if "config" in defaults:
+        refuse("manifest-include")
+    if "task" in defaults:
+        refuse("manifest-task-text")
+    if "gate" in defaults:
+        refuse("manifest-evaluator")
+    check_block(defaults, MANIFEST_DEFAULT_KEYS)
     tasks = frozen.get("tasks")
     if not isinstance(tasks, list) or len(tasks) != 1:
         refuse("manifest-task-count")
-    if not isinstance(tasks[0], dict):
-        refuse("manifest-task")
     task = tasks[0]
+    if not isinstance(task, dict):
+        refuse("manifest-task")
     if "config" in task:
         refuse("manifest-include")
-    defaults = frozen.get("defaults") or {}
-    if not isinstance(defaults, dict):
-        refuse("manifest-defaults")
+    if "task" in task:
+        # An inline task text would replace the frozen description role; the
+        # bridge never accepts two descriptions for one task.
+        refuse("manifest-task-text")
+    if "gate" in task:
+        refuse("manifest-evaluator")
+    check_block(task, MANIFEST_TASK_KEYS)
+
     for block in (defaults, task):
         if str(block.get("type") or "").strip().lower() not in ("", "lnr"):
             refuse("manifest-type")
         if str(block.get("phase") or "").strip().lower() not in ("", "run"):
             refuse("manifest-phase")
-    if str(task.get("input_data_dir") or "").strip():
-        refuse("manifest-dataset")
+    # Values whose form implies behavior this round does not run.
+    if "resume" in frozen and frozen.get("resume") is not False:
+        refuse("manifest-resume")
+    if "resume_budget_policy" in frozen:
+        refuse("manifest-resume")
     concurrent = frozen.get("max_concurrent")
-    if concurrent not in (None, 1):
+    if concurrent is not None and positive_int(concurrent) != 1:
         refuse("manifest-concurrency")
+    for block in (frozen, defaults, task):
+        if "time_limit" in block and positive_seconds(block.get("time_limit")) is None:
+            refuse("manifest-budget")
+    # A dataset binding under any alias at either level: the contract would be
+    # run without the data it names.
+    if dataset_bound(defaults) or dataset_bound(task):
+        refuse("manifest-dataset")
+    if str(task.get("run_id") or "").strip():
+        # The launch run id is derived from the execution so the engine cannot
+        # resolve its own task; a frozen run id would be silently replaced.
+        refuse("manifest-run-id")
+    for key in ("cpu_list", "gpu_list"):
+        if str(task.get(key) or "").strip():
+            refuse("manifest-devices")
+    for block in (defaults, task):
+        for key in ("num_drafts", "draft_parallel"):
+            if key in block and positive_int(block.get(key)) != 1:
+                refuse("manifest-drafts")
+    declared_workspace(task, defaults)
+    evaluator_defaults = defaults.get("evaluator")
+    if evaluator_defaults is not None:
+        if not isinstance(evaluator_defaults, dict):
+            refuse("manifest-evaluator")
+        for key in evaluator_defaults:
+            if key not in ("enabled", "backend"):
+                refuse("manifest-evaluator")
+        if evaluator_defaults.get("enabled") is not None and evaluator_defaults.get("enabled") is not True:
+            refuse("manifest-evaluator")
+        if str(evaluator_defaults.get("backend") or "task_package") != "task_package":
+            refuse("manifest-evaluator")
+    lnr = merge_lnr(frozen, defaults, task)
+    for key in UNSUPPORTED_LNR_KEYS:
+        if key in lnr:
+            refuse("manifest-lnr")
+    if "num_workers" in lnr and positive_int(lnr.get("num_workers")) != 1:
+        refuse("manifest-workers")
+    wall_clock = None
+    if "wall_clock_budget_sec" in lnr:
+        wall_clock = positive_seconds(lnr.get("wall_clock_budget_sec"))
+        if wall_clock is None:
+            refuse("manifest-budget")
+
     exp_id = str(task.get("exp_id") or "").strip()
     if not SAFE_NAME.fullmatch(exp_id):
         refuse("manifest-task-id")
@@ -479,8 +645,13 @@ def build_launch_manifest():
     if str(config.get("id") or "").strip() != exp_id:
         refuse("task-identity")
     inputs_block = config.get("inputs")
-    if isinstance(inputs_block, dict) and inputs_block.get("required") is not False:
+    if inputs_block is not None and not isinstance(inputs_block, dict):
         refuse("task-dataset")
+    if isinstance(inputs_block, dict):
+        if inputs_block.get("required") is not False:
+            refuse("task-dataset")
+        if str(inputs_block.get("path") or "").strip():
+            refuse("task-dataset")
     metric = config.get("metric")
     if not isinstance(metric, dict):
         refuse("task-metric")
@@ -496,6 +667,10 @@ def build_launch_manifest():
     artifact_kind = str(artifact.get("kind") or "artifact").strip()
     evaluator = config.get("evaluator")
     if not isinstance(evaluator, dict):
+        refuse("task-evaluator")
+    if "command" in evaluator:
+        # A command evaluator selects another backend; the frozen package's
+        # entrypoint would then be ignored.
         refuse("task-evaluator")
     entrypoint = str(evaluator.get("entrypoint") or "").strip()
     separator = entrypoint.rfind(":")
@@ -525,20 +700,13 @@ def build_launch_manifest():
     digest = hashlib.sha256(("scienceflow-task\\n" + EXECUTION).encode("utf-8")).hexdigest()
     launch_exp_id = "sf-" + digest[:16]
     launch_run_id = "sf-run-" + digest[16:40]
-    task_lnr = task.get("lnr") if isinstance(task.get("lnr"), dict) else {}
-    defaults_lnr = defaults.get("lnr") if isinstance(defaults.get("lnr"), dict) else {}
+    # The engine reads the task's time_limit first and the manifest root's
+    # second; defaults.time_limit is never consulted.
     research_seconds = (
         positive_seconds(task.get("time_limit"))
-        or positive_seconds(defaults.get("time_limit"))
         or positive_seconds(frozen.get("time_limit"))
-        or positive_seconds(defaults_lnr.get("wall_clock_budget_sec"))
-        or positive_seconds(task_lnr.get("wall_clock_budget_sec"))
+        or wall_clock
         or max(1.0, float(BUDGETS.get("researchBudgetMs", 0)) / 1000.0)
-    )
-    wall_clock = (
-        positive_seconds(task_lnr.get("wall_clock_budget_sec"))
-        or positive_seconds(defaults_lnr.get("wall_clock_budget_sec"))
-        or research_seconds
     )
     report_seconds = max(0.001, float(BUDGETS.get("reportBudgetMs", 0)) / 1000.0)
     profile = str(
@@ -548,6 +716,8 @@ def build_launch_manifest():
         "exp_id": launch_exp_id,
         "run_id": launch_run_id,
         "task": description,
+        # The Runner owns the execution workspace; the frozen declaration was
+        # checked above and its host path cannot exist inside the sandbox.
         "workspace": "/workspace",
         "type": "lnr",
         "time_limit": research_seconds,
@@ -563,7 +733,10 @@ def build_launch_manifest():
                 "lower_is_better": lower_is_better,
             },
         },
-        "lnr": {"num_workers": 1, "wall_clock_budget_sec": wall_clock},
+        "lnr": {
+            "num_workers": 1,
+            "wall_clock_budget_sec": wall_clock if wall_clock is not None else research_seconds,
+        },
     }
     payload = {
         # The engine's report budget is read from the manifest top level only;
@@ -655,21 +828,25 @@ def ready():
 async def main():
     os.environ["XDG_STATE_HOME"] = str(ENGINE_STATE / "state")
     (ENGINE_STATE / "state").mkdir(parents=True, exist_ok=True)
-    # The interpreter runs with -I, so PYTHONPATH and user site are ignored and
-    # the engine is reached only through this explicit, Runner-fixed mount.
-    sys.path.insert(0, str(ENGINE))
-    from scienceflow.runtime.parallel.control import worker
-    from scienceflow.runtime.parallel.control.service import prepare_run
-
-    if RESEARCH_MODULE:
-        # A Runner-owned test module can replace exactly the research step.
-        worker.run_manifest = __import__(RESEARCH_MODULE, fromlist=["run"]).run
     state = {"stopId": None}
     stop_event = asyncio.Event()
     watcher = asyncio.create_task(watch_stop(stop_event, state))
     projector = None
     try:
+        # The frozen contract is judged before the engine is imported: a
+        # contract this round cannot carry is refused without touching the
+        # checkout, so the refusal never depends on the engine's dependencies.
         manifest, run_id, manifest_digest = build_launch_manifest()
+        # The interpreter runs with -I, so PYTHONPATH and user site are ignored
+        # and the engine is reached only through this explicit, Runner-fixed
+        # mount.
+        sys.path.insert(0, str(ENGINE))
+        from scienceflow.runtime.parallel.control import worker
+        from scienceflow.runtime.parallel.control.service import prepare_run
+
+        if RESEARCH_MODULE:
+            # A Runner-owned test module can replace exactly the research step.
+            worker.run_manifest = __import__(RESEARCH_MODULE, fromlist=["run"]).run
         try:
             prepared = await asyncio.to_thread(prepare_run, manifest)
         except SystemExit:

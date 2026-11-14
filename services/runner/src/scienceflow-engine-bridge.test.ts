@@ -154,10 +154,40 @@ test("a wiring must name exactly one program source", () => {
 function inputFixture() {
   const contractDigest = "a".repeat(64);
   const entries = [
-    { content: "contract\n", path: "manifest.yaml", roles: ["manifest"] as const },
-    { content: "id: probe\n", path: "package/task.yaml", roles: ["task_yaml"] as const },
+    {
+      content: [
+        "max_concurrent: 1",
+        "time_limit: 9000",
+        "tasks:",
+        "  - exp_id: probe",
+        "defaults:",
+        "  phase: run",
+        "  type: lnr",
+        "  workspace_base: /srv/workspaces",
+        "",
+      ].join("\n"),
+      path: "manifest.yaml",
+      roles: ["manifest"] as const,
+    },
+    {
+      content: [
+        "id: probe",
+        "description: description.md",
+        "artifact:",
+        "  path: submission.csv",
+        "metric:",
+        "  name: probe_score",
+        "  lower_is_better: false",
+        "evaluator:",
+        "  entrypoint: evaluate.py:main",
+        "",
+      ].join("\n"),
+      path: "package/task.yaml",
+      roles: ["task_yaml"] as const,
+    },
     { content: "description\n", path: "package/description.md", roles: ["description"] as const },
-    { content: "def evaluate():\n    return 1\n", path: "package/evaluate.py", roles: ["evaluator"] as const },
+    { content: "def main():\n    return 1\n", path: "package/evaluate.py", roles: ["evaluator"] as const },
+    { content: "inputs:\n  required: false\n", path: "package/_shared/task_defaults.yaml", roles: ["shared_task_defaults"] as const },
   ].sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
   const files = entries.map((entry) => ({
     path: entry.path,
