@@ -858,12 +858,11 @@ function compareVersions(left: VersionTuple, right: VersionTuple): number {
 }
 
 /**
- * Whether an observed interpreter version satisfies a PEP 440 range.
+ * Whether an observed interpreter version satisfies the supported range subset.
  *
- * Only the clause forms an engine's `requires-python` realistically uses are
- * evaluated (`>=`, `>`, `<=`, `<`, `==` and `~=`); a specifier outside that set
- * is `null`, and the caller refuses instead of treating it as satisfied. A
- * bare `==X.Y` matches that minor series, and `~=X.Y` is `>=X.Y,<X+1`.
+ * Only ordered comparisons (`>=`, `>`, `<=`, `<`) are evaluated. Other
+ * specifiers return `null`, so the caller refuses instead of guessing at
+ * unsupported matching rules.
  */
 export function pythonRequirementAllows(requirement: string, version: string): boolean | null {
   const observed = parseVersionTuple(version);
@@ -874,7 +873,7 @@ export function pythonRequirementAllows(requirement: string, version: string): b
     .filter((clause) => clause.length > 0);
   if (clauses.length === 0) return null;
   for (const clause of clauses) {
-    const match = /^(>=|<=|==|~=|>|<)\s*(\d+)\.(\d+)(?:\.(\d+))?$/u.exec(clause);
+    const match = /^(>=|<=|>|<)\s*(\d+)\.(\d+)(?:\.(\d+))?$/u.exec(clause);
     if (match === null) return null;
     const operator = match[1]!;
     const numbers: VersionTuple = [
@@ -882,21 +881,12 @@ export function pythonRequirementAllows(requirement: string, version: string): b
       Number(match[3]),
       match[4] === undefined ? 0 : Number(match[4]),
     ];
-    const exactMinor = match[4] === undefined;
     const order = compareVersions(observed, numbers);
     let satisfied: boolean;
     if (operator === ">=") satisfied = order >= 0;
     else if (operator === ">") satisfied = order > 0;
     else if (operator === "<=") satisfied = order <= 0;
-    else if (operator === "<") satisfied = order < 0;
-    else if (operator === "==") {
-      satisfied = exactMinor
-        ? observed[0] === numbers[0] && observed[1] === numbers[1]
-        : order === 0;
-    } else {
-      satisfied = compareVersions(observed, [numbers[0], numbers[1], 0]) >= 0
-        && compareVersions(observed, [numbers[0] + 1, 0, 0]) < 0;
-    }
+    else satisfied = order < 0;
     if (!satisfied) return false;
   }
   return true;

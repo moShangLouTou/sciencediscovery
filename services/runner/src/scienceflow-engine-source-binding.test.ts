@@ -262,10 +262,16 @@ test("the engine's requires-python range is decided before the spawn", () => {
   // A specifier this Runner does not evaluate is never treated as satisfied.
   assert.equal(pythonRequirementAllows("!=3.13", "3.12.0"), null);
   assert.equal(pythonRequirementAllows(">=3.11", "3.14.0"), true);
-  assert.equal(pythonRequirementAllows("~=3.11", "3.12.1"), true);
-  assert.equal(pythonRequirementAllows("~=3.11", "4.0.0"), false);
-  assert.equal(pythonRequirementAllows("==3.12", "3.12.9"), true);
-  assert.equal(pythonRequirementAllows("==3.12.1", "3.12.9"), false);
+  for (const [range, version] of [
+    ["~=3.11", "3.12.1"],
+    ["~=3.11.5", "3.11.0"],
+    ["~=3.11.5", "3.12.0"],
+    ["==3.11", "3.11.9"],
+    ["==3.12.1", "3.12.1"],
+    [">=3.11,~=3.11.5", "3.12.0"],
+  ] as const) {
+    assert.equal(pythonRequirementAllows(range, version), null, `${range}: ${version}`);
+  }
   // Only one plain declaration in `[project]` is a contract.
   assert.equal(readRequiresPython('[project]\nrequires-python = ">=3.11"\nrequires-python = ">=3.12"\n'), null);
   assert.equal(readRequiresPython('[tool.other]\nrequires-python = ">=3.11,<3.14"\n'), null);
