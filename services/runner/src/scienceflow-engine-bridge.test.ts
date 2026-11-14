@@ -101,7 +101,7 @@ test("an engine link is evidence only for this execution at the pinned identity"
     link({ version: 2 }),
     link({ pid: 42 }),
     link({ derivedManifestDigest: "short" }),
-    link({ mappingVersion: 2 }),
+    link({ mappingVersion: 1 }),
     link({ mappingVersion: "1" }),
     "{not json",
     "[]",

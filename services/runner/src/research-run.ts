@@ -53,7 +53,7 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { constants as FS } from "node:fs";
-import { lstat, mkdir, open, realpath, rename, rm, stat, unlink, writeFile, type FileHandle } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, realpath, rename, rm, stat, unlink, writeFile, type FileHandle } from "node:fs/promises";
 import { basename, dirname, resolve, sep } from "node:path";
 
 import {
@@ -80,14 +80,16 @@ import {
 } from "@sciencediscovery/schema";
 import { SYSTEM_SHELL_ENVIRONMENT_REVISION_ID } from "@sciencediscovery/schema";
 import { checkEngineRevision } from "@sciencediscovery/scienceflow-reader";
-
 import {
   scienceFlowInputBundleDigest,
   verifyScienceFlowInputCopy,
   type ScienceFlowInputSnapshot,
 } from "./scienceflow-input-bundles.js";
 import {
+  ENGINE_CONTRACT_REFUSAL_FILE,
+  ENGINE_REFUSAL_MAX_BYTES,
   parseScienceFlowEngineLink,
+  parseScienceFlowEngineRefusal,
   researchEngineStateRoot,
   SCIENCEFLOW_ENGINE_BRIDGE_SOURCE,
   SCIENCEFLOW_ENGINE_MOUNT,
@@ -115,6 +117,10 @@ import {
   type SandboxLaunch,
 } from "./executor.js";
 import { RUNNER_VERSION } from "./version.js";
+import {
+  verifyScienceFlowSourceBinding,
+} from "./scienceflow-runtime-check.js";
+import type { ScienceFlowRuntimeBindings } from "./scienceflow-runtime-config.js";
 
 /** The protocol the fixed program and this module share. */
 export const RESEARCH_CONTROL_PROTOCOL_VERSION = 1;
@@ -177,10 +183,10 @@ const REFUSAL_MESSAGES: Readonly<Record<ResearchRefusalCode, string>> = {
   RESEARCH_ENGINE_NOT_CONFIGURED: "This Runner has no revision-pinned ScienceFlow engine to run",
   RESEARCH_ENGINE_UNAVAILABLE: "The pinned ScienceFlow checkout is not the verified revision this Runner requires",
   RESEARCH_ENGINE_IDENTITY_MISMATCH: "The engine run does not match the pinned revision and version this Runner requires",
+  RESEARCH_ENGINE_CONTRACT_UNSUPPORTED: "The frozen ScienceFlow contract is outside the single-task, dataset-free subset this Runner supports",
 };
 
-/** A fixed refusal. The message is from the table above, never an inner one. */
-export class ResearchRunError extends Error {
+/** A fixed refusal. The message is from the table above, never an inner one. */export class ResearchRunError extends Error {
   readonly code: ResearchRefusalCode;
 
   constructor(code: ResearchRefusalCode) {
@@ -864,6 +870,14 @@ export interface ResearchEngineBinding {
   /** The package version the checkout must declare and the bridge must report. */
   readonly version: string;
   /**
+   * The administrator-declared source binding this checkout is served under.
+   * Production requires it; the spawn then proves, in the same environment
+   * lease that runs the workload, that the interpreter resolves `scienceflow`
+   * from this checkout. A test wiring that names a fixture runtime is the
+   * explicit test-only assembly and may omit it.
+   */
+  readonly runtimeBindingId?: string;
+  /**
    * Test-only seam: an importable module inside the sandbox that supplies the
    * research step (`run(manifest)`). Production never sets it; the engine's own
    * `run_manifest` is then the only research step.
@@ -885,6 +899,14 @@ export interface ResearchRunWiring {
    * lifecycle is what runs inside the sandbox.
    */
   readonly engine?: ResearchEngineBinding;
+  /**
+   * The Runner's administrator-declared source bindings. A production engine
+   * wiring names one by id so the research spawn can prove, inside its own
+   * environment lease, that the interpreter resolves `scienceflow` from the
+   * pinned checkout. Absent (or naming an unknown binding) is a fixed refusal
+   * before the spawn, never a fallback to a bare Git check.
+   */
+  readonly runtimeBindings?: ScienceFlowRuntimeBindings;
   readonly config: ExecutorConfig;
   /**
    * The real store leases the environment and keeps its mutation gate for the
@@ -1110,6 +1132,8 @@ export function createResearchRunExecutor(wiring: ResearchRunWiring): ResearchRu
     if (!engine.sourceRoot.startsWith("/") || engine.sourceRoot.split("/").includes("..")
       || !/^[0-9a-f]{40}$/.test(engine.revision)
       || typeof engine.version !== "string" || engine.version.trim().length === 0
+      || (engine.runtimeBindingId !== undefined
+        && !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$/.test(engine.runtimeBindingId))
       || (engine.researchStepModule !== undefined
         && !/^[A-Za-z_][A-Za-z0-9_.]*$/.test(engine.researchStepModule))) {
       throw new ResearchRunError("RESEARCH_ENGINE_NOT_CONFIGURED");
@@ -1200,6 +1224,26 @@ export function researchPublishable(status: ResearchRunStatus | undefined): bool
   // A stop outcome without the durable intent behind it is a claim, not a fact.
   if ((status.outcome === "stopped" || status.outcome === "not-started") && status.stop === "none") return false;
   return true;
+}
+
+/**
+ * Read the bridge's contract refusal for this execution, if it wrote one.
+ *
+ * The record lives in the Runner-owned engine state directory; it is bounded,
+ * parsed with a fixed whitelist and bound to this execution id. Anything else
+ * (absent, oversized, foreign, malformed) is not a refusal and leaves the run
+ * to its ordinary record handling.
+ */
+async function readEngineContractRefusal(
+  root: string,
+  executionId: string,
+): Promise<{ readonly reason: string } | null> {
+  const path = resolve(root, ENGINE_CONTRACT_REFUSAL_FILE);
+  const info = await stat(path).catch(() => undefined);
+  if (info === undefined || !info.isFile() || info.size > ENGINE_REFUSAL_MAX_BYTES) return null;
+  const text = await readFile(path, "utf8").catch(() => undefined);
+  if (text === undefined) return null;
+  return parseScienceFlowEngineRefusal(text, executionId);
 }
 
 /** Mutable observation state for one run, so failures keep their owner. */
@@ -1554,6 +1598,64 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
   const engine = wiring.engine;
   let engineRoot: string | undefined;
   if (engine !== undefined) {
+    // In a production wiring the checkout is served under an administrator
+    // binding, and this spawn proves in its own environment lease that the
+    // interpreter resolves `scienceflow` from that checkout. A Git identity
+    // check alone cannot answer that question, and no historical probe is an
+    // authorization for this attempt: without the binding and a fresh proof
+    // the run is refused before any process exists. A fixture wiring is the
+    // explicit test-only assembly and is the only shape that skips the proof.
+    if (environment !== undefined) {
+      const binding = engine.runtimeBindingId === undefined
+        ? undefined
+        : wiring.runtimeBindings?.bindingFor(engine.runtimeBindingId);
+      if (binding === undefined
+        || binding.sourceRoot !== engine.sourceRoot
+        || binding.expectedRevision !== engine.revision) {
+        options.diagnose("research_engine_source_binding_missing");
+        return {
+          research: statusOf("not_started", {
+            phase: "unknown",
+            outcome: null,
+            refusal: engine.runtimeBindingId === undefined
+              ? "RESEARCH_ENGINE_NOT_CONFIGURED"
+              : "RESEARCH_ENGINE_UNAVAILABLE",
+          }),
+          result: options.emptyResult(1, environment),
+        };
+      }
+      const verdict = await verifyScienceFlowSourceBinding({
+        binding,
+        config,
+        environment,
+        procRoot: wiring.procRoot,
+      });
+      if (verdict.status !== "verified") {
+        options.diagnose("research_engine_source_binding_refused", {
+          reason: verdict.reason ?? verdict.status,
+        });
+        // A probe whose own termination was not proven leaves the environment
+        // fenced through the store's reservation, exactly as the runtime check
+        // does; without a store the diagnostic is the only record and the run
+        // is still refused.
+        if (verdict.boundary !== undefined && request.environmentId !== undefined) {
+          const store = wiring.environmentStore as
+            | { reserveRuntimeCheck?: (id: string, boundary: ExecutionBoundaryHandle | "unproven") => void }
+            | undefined;
+          try {
+            store?.reserveRuntimeCheck?.(request.environmentId, verdict.boundary);
+          } catch {
+            options.diagnose("research_engine_binding_fence_failed");
+          }
+        }
+        return {
+          research: statusOf("not_started", {
+            phase: "unknown", outcome: null, refusal: "RESEARCH_ENGINE_UNAVAILABLE",
+          }),
+          result: options.emptyResult(1, environment),
+        };
+      }
+    }
     let check: Awaited<ReturnType<typeof checkEngineRevision>> | undefined;
     try {
       check = await checkEngineRevision({ path: engine.sourceRoot, expectedRevision: engine.revision });
@@ -1903,6 +2005,17 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
         }
       } else if (link.status === "refused") {
         invalidate(link.code);
+      }
+    }
+    // A contract the bridge refused is a definite answer, not a missing
+    // result: the frozen inputs were read, found outside the supported subset,
+    // and no engine run was prepared. It is read from the Runner-owned engine
+    // state directory, so the refusal can only describe this execution.
+    if (engineRoot !== undefined && state.refusal === undefined && !state.invalid) {
+      const refusal = await readEngineContractRefusal(engineRoot, request.executionId);
+      if (refusal !== null) {
+        state.refusal = "RESEARCH_ENGINE_CONTRACT_UNSUPPORTED";
+        options.diagnose("research_engine_contract_refused", { reason: refusal.reason });
       }
     }
     if (!settled) await delay(POLL_MS);

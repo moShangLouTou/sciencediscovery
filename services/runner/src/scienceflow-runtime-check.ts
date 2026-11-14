@@ -803,6 +803,74 @@ function revisionStatusOverrides(
   return { source_cleanliness: "unknown", source_revision: "unknown" };
 }
 
+/** The fixed answer of one source-binding proof; reasons are diagnostics only. */
+export interface ScienceFlowSourceBindingVerdict {
+  readonly status: "verified" | "refused" | "unavailable";
+  readonly reason?: string;
+  /** Present when the probe's own termination could not be proven. */
+  readonly boundary?: ExecutionBoundaryHandle | "unproven";
+}
+
+/**
+ * Prove, inside the lease that will run the research workload, that this
+ * environment's interpreter resolves `scienceflow` from the pinned checkout.
+ *
+ * This is the R11 static half reused as it is: the same fixed probe launched
+ * through the same supervised sandbox path, the same `assessStaticProbeFacts`
+ * judgement, and the same Git revision check. The second, normal-start phase is
+ * deliberately not repeated: the research launch itself is that normal start,
+ * and its own record is judged separately, so a run cannot be authorized by a
+ * probe it then contradicts.
+ *
+ * Nothing here is a cached or historical answer: the probe runs under this
+ * environment lease, against this checkout, immediately before the spawn.
+ */
+export async function verifyScienceFlowSourceBinding(options: {
+  readonly binding: ScienceFlowRuntimeBinding;
+  readonly config: ExecutorConfig;
+  readonly environment: EnvironmentRuntime;
+  readonly procRoot?: string;
+}): Promise<ScienceFlowSourceBindingVerdict> {
+  const { binding, config, environment } = options;
+  if (environment.revision.language !== "python") {
+    return { reason: "environment-language", status: "refused" };
+  }
+  const probe = await runProbe({
+    binding,
+    config,
+    environment,
+    mode: "static",
+    procRoot: options.procRoot,
+  });
+  if (probe.status === "termination-unverified") {
+    return { boundary: probe.handle, reason: "termination-unverified", status: "unavailable" };
+  }
+  if (probe.status === "unavailable") return { reason: probe.reason, status: "unavailable" };
+  if (probe.facts.mode !== "static") return { reason: "protocol-error", status: "unavailable" };
+  const assessment = assessStaticProbeFacts({
+    environmentPrefix: environment.prefixPath,
+    facts: probe.facts,
+    languageVersion: environment.revision.languageVersion,
+    sourceRoot: binding.sourceRoot,
+  });
+  if (!assessment.ready) return { reason: "static-binding", status: "refused" };
+  let revision: EngineRevisionCheckResult;
+  try {
+    revision = await checkEngineRevision({
+      expectedRevision: binding.expectedRevision,
+      path: binding.sourceRoot,
+      timeoutMs: DEFAULT_REVISION_TIMEOUT_MS,
+    });
+  } catch {
+    return { reason: "revision-unavailable", status: "unavailable" };
+  }
+  const overrides = revisionStatusOverrides(revision);
+  if (overrides.source_revision !== "passed" || overrides.source_cleanliness !== "passed") {
+    return { reason: "revision", status: "refused" };
+  }
+  return { status: "verified" };
+}
+
 function anyTruncation(truncation: ScienceFlowRuntimeProbeTruncation): boolean {
   return truncation.path || truncation.site || truncation.pth || truncation.lines
     || truncation.names || truncation.text || truncation.distributions || truncation.budget;
