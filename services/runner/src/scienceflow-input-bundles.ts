@@ -29,8 +29,11 @@
  * staging is a private sibling directory, the commit is one rename, a
  * concurrent publisher of the same bytes is reused, and an existing but
  * damaged snapshot is reported rather than overwritten or re-blessed.
- * Verification reads each file through a descriptor this process holds, with
- * no symlink or hardlink alias, a bounded read, and a final digest check.
+ * Verification walks a directory descriptor held for the read, opening each
+ * parent with `O_NOFOLLOW`, checking type, link count and size through the
+ * opened descriptor, reading a bounded amount and recomputing the digest.
+ * `snapshot()` returns those exact buffers to the fixed research workload,
+ * which materializes a per-execution copy; the cache is never mounted.
  *
  * This round deliberately has no GC, TTL, reference counting, or mount step:
  * an unreferenced bundle is a cache object, not a resurrected business record.
@@ -45,11 +48,13 @@ import {
   rename,
   rm,
   writeFile,
+  type FileHandle,
 } from "node:fs/promises";
 import { dirname, resolve, sep } from "node:path";
 
 import {
   canonicalScienceFlowInputBundleManifest,
+  isScienceFlowInputBundlePath,
   parseScienceFlowInputBundleManifest,
   parseScienceFlowInputBundleRequest,
   SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
@@ -92,6 +97,18 @@ export function scienceFlowInputBundleDigest(
     .digest("hex");
 }
 
+/**
+ * One verified snapshot, read through a held directory descriptor.
+ *
+ * The contents are the exact buffers this Runner checked against the manifest;
+ * a consumer materializes these bytes instead of re-opening the shared path
+ * later. This value stays inside the Runner: it names no host path.
+ */
+export interface ScienceFlowInputSnapshot {
+  readonly manifest: ScienceFlowInputBundleManifest;
+  readonly contents: ReadonlyMap<string, Buffer>;
+}
+
 export class RunnerScienceFlowInputBundles {
   constructor(private readonly dataDir: string) {}
 
@@ -130,23 +147,83 @@ export class RunnerScienceFlowInputBundles {
     if (!info.isDirectory() || info.isSymbolicLink()) {
       return corrupt(bundleDigest);
     }
-    let manifest: ScienceFlowInputBundleManifest;
+    let reader: SnapshotDirectory;
     try {
-      manifest = await this.readManifest(root, bundleDigest);
-      await verifySnapshot(root, manifest);
+      reader = await SnapshotDirectory.open(root);
+    } catch {
+      return corrupt(bundleDigest);
+    }
+    try {
+      const manifest = await this.readManifest(reader, bundleDigest);
+      await verifySnapshot(root, reader, manifest);
+      return {
+        schemaVersion: SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
+        bundleDigest,
+        status: "ready",
+        contractDigest: manifest.contractDigest,
+        fileCount: manifest.files.length,
+        totalBytes: scienceFlowInputBundleTotalBytes(manifest),
+      };
     } catch {
       // Verification failures are all one fixed answer: the tree is not the
       // exact file set its digest names. No message escapes this method.
       return corrupt(bundleDigest);
+    } finally {
+      await reader.close();
     }
-    return {
-      schemaVersion: SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
-      bundleDigest,
-      status: "ready",
-      contractDigest: manifest.contractDigest,
-      fileCount: manifest.files.length,
-      totalBytes: scienceFlowInputBundleTotalBytes(manifest),
-    };
+  }
+
+  /**
+   * Verify one published bundle and return the bytes that were checked.
+   *
+   * This is the Runner-internal door a consuming execution uses instead of
+   * `status` plus a later re-read by path: every entry is read through the
+   * directory descriptor held here, its type, link count, size and digest are
+   * checked, and the returned buffer is the one those checks describe. The
+   * shared cache is never mounted; the caller writes these bytes into a private
+   * per-execution copy.
+   */
+  async snapshot(bundleDigest: string): Promise<ScienceFlowInputSnapshot> {
+    if (!/^[a-f0-9]{64}$/.test(bundleDigest)) {
+      throw new ScienceFlowInputBundleError("invalid");
+    }
+    const root = resolve(await this.parent(), bundleDigest);
+    let info: Awaited<ReturnType<typeof lstat>>;
+    try {
+      info = await lstat(root);
+    } catch {
+      // A consuming execution needs one answer for "this identity is not
+      // materialized here" whether the tree is absent or unreadable: the
+      // caller refuses before spawn. The public `status` keeps its own
+      // `missing` state for observation.
+      throw new ScienceFlowInputBundleError("unavailable");
+    }
+    if (!info.isDirectory() || info.isSymbolicLink()) {
+      throw new ScienceFlowInputBundleError("corrupt");
+    }
+    let reader: SnapshotDirectory;
+    try {
+      reader = await SnapshotDirectory.open(root);
+    } catch {
+      throw new ScienceFlowInputBundleError("corrupt");
+    }
+    try {
+      const manifest = await this.readManifest(reader, bundleDigest);
+      const contents = new Map<string, Buffer>();
+      for (const file of manifest.files) {
+        const bytes = await reader.read(file.path, { exact: file.size });
+        if (digestBytes(bytes) !== file.sha256) {
+          throw new ScienceFlowInputBundleError("corrupt");
+        }
+        contents.set(file.path, bytes);
+      }
+      return { manifest, contents };
+    } catch (error) {
+      if (error instanceof ScienceFlowInputBundleError) throw error;
+      throw new ScienceFlowInputBundleError("corrupt");
+    } finally {
+      await reader.close();
+    }
   }
 
   /**
@@ -250,13 +327,12 @@ export class RunnerScienceFlowInputBundles {
   }
 
   private async readManifest(
-    root: string,
+    reader: SnapshotDirectory,
     bundleDigest: string,
   ): Promise<ScienceFlowInputBundleManifest> {
-    const path = resolve(root, MANIFEST);
     // The manifest is read through the same held-descriptor path as content:
     // bounded, no symlink or hardlink alias, and no unbounded parse.
-    const bytes = await readSnapshotFile(path, { maxBytes: MAX_MANIFEST_BYTES });
+    const bytes = await reader.read(MANIFEST, { maxBytes: MAX_MANIFEST_BYTES });
     let value: unknown;
     try {
       value = JSON.parse(bytes.toString("utf8")) as unknown;
@@ -293,6 +369,7 @@ function parseStoredManifest(
  */
 async function verifySnapshot(
   root: string,
+  reader: SnapshotDirectory,
   manifest: ScienceFlowInputBundleManifest,
 ): Promise<void> {
   const expected = new Set(manifest.files.map((file) => file.path));
@@ -331,18 +408,38 @@ async function verifySnapshot(
   }
 
   for (const file of manifest.files) {
-    const target = resolve(root, file.path);
-    if (!target.startsWith(`${root}${sep}`)) {
-      throw new ScienceFlowInputBundleError("corrupt");
-    }
-    // Every directory between the root and the file must still be a plain
-    // directory: a component swapped for a symlink after the walk would
-    // otherwise redirect this read.
-    await assertPlainParents(root, file.path);
-    const bytes = await readSnapshotFile(target, { exact: file.size });
+    const bytes = await reader.read(file.path, { exact: file.size });
     if (digestBytes(bytes) !== file.sha256) {
       throw new ScienceFlowInputBundleError("corrupt");
     }
+  }
+}
+
+/**
+ * Re-check a materialized copy against the manifest it was written from.
+ *
+ * The copy is Runner-owned and private, but it is verified anyway before it is
+ * published: a partially written or externally damaged staging tree must never
+ * become the directory a workload mounts.
+ */
+export async function verifyScienceFlowInputCopy(
+  root: string,
+  files: readonly {
+    readonly path: string;
+    readonly size: number;
+    readonly sha256: string;
+  }[],
+): Promise<void> {
+  const reader = await SnapshotDirectory.open(root);
+  try {
+    for (const file of files) {
+      const bytes = await reader.read(file.path, { exact: file.size });
+      if (digestBytes(bytes) !== file.sha256) {
+        throw new ScienceFlowInputBundleError("corrupt");
+      }
+    }
+  } finally {
+    await reader.close();
   }
 }
 
@@ -355,55 +452,97 @@ function corruptFile(): ScienceFlowInputBundleError {
 }
 
 /**
- * Read one published file through a descriptor this process holds.
+ * A directory descriptor held for the length of one verification.
  *
- * The path is lstat'ed, opened with `O_NOFOLLOW` (and `O_NONBLOCK`, so a FIFO
- * cannot hang the open), then checked again through the descriptor: same
- * device and inode, still a regular file, and a link count of one. The read is
- * bounded by the expected size — or by the manifest limit — and the caller
- * compares the digest with the manifest. A link count above one means the
- * bytes can also be written through an alias outside this tree, which is not a
- * controlled snapshot.
+ * Every name is resolved under the descriptor with `O_NOFOLLOW`: a parent
+ * component replaced by a link is refused instead of followed, the final file
+ * is opened with `O_NONBLOCK` so a FIFO cannot park the read, and the opened
+ * descriptor — not an earlier `lstat` — decides the type, link count and size.
+ * A link count above one means the bytes can also be written through an alias
+ * outside this tree, which is not a controlled snapshot.
  */
-async function readSnapshotFile(
-  target: string,
-  bound: ReadBound,
-): Promise<Buffer> {
-  const before = await lstat(target);
-  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1) {
-    throw corruptFile();
-  }
-  const limit = "exact" in bound ? bound.exact : bound.maxBytes;
-  if (before.size > limit) throw corruptFile();
-  if ("exact" in bound && before.size !== bound.exact) throw corruptFile();
+class SnapshotDirectory {
+  private constructor(private readonly directory: FileHandle) {}
 
-  let handle: Awaited<ReturnType<typeof open>>;
-  try {
-    handle = await open(
-      target,
-      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-    );
-  } catch {
-    throw corruptFile();
-  }
-  try {
-    const after = await handle.stat();
-    // The identity inspected before the open must still be the file the
-    // descriptor names: a replacement in that window is refused, not read.
-    if (
-      !after.isFile() ||
-      after.nlink !== 1 ||
-      after.dev !== before.dev ||
-      after.ino !== before.ino ||
-      after.size !== before.size
-    ) {
+  static async open(root: string): Promise<SnapshotDirectory> {
+    let directory: FileHandle;
+    try {
+      directory = await open(
+        root,
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+      );
+    } catch {
       throw corruptFile();
     }
-    const bytes = await readHandleBounded(handle, limit);
-    if ("exact" in bound && bytes.length !== bound.exact) throw corruptFile();
-    return bytes;
-  } finally {
-    await handle.close();
+    try {
+      if (!(await directory.stat()).isDirectory()) throw corruptFile();
+      return new SnapshotDirectory(directory);
+    } catch (error) {
+      await directory.close().catch(() => undefined);
+      throw error instanceof ScienceFlowInputBundleError ? error : corruptFile();
+    }
+  }
+
+  /**
+   * Read one file below the root through descriptors held for the whole walk.
+   * Parent components are opened one at a time as directories and stay open
+   * until the file is read, so no component can be re-resolved mid-path.
+   */
+  async read(relativePath: string, bound: ReadBound): Promise<Buffer> {
+    if (!isScienceFlowInputBundlePath(relativePath)) throw corruptFile();
+    const segments = relativePath.split("/");
+    const parents: FileHandle[] = [];
+    try {
+      let prefix = `/proc/self/fd/${this.directory.fd}`;
+      for (const segment of segments.slice(0, -1)) {
+        let parent: FileHandle;
+        try {
+          parent = await open(
+            `${prefix}/${segment}`,
+            constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+          );
+        } catch {
+          throw corruptFile();
+        }
+        try {
+          if (!(await parent.stat()).isDirectory()) throw corruptFile();
+        } catch {
+          await parent.close().catch(() => undefined);
+          throw corruptFile();
+        }
+        parents.push(parent);
+        prefix = `/proc/self/fd/${parent.fd}`;
+      }
+      let handle: FileHandle;
+      try {
+        handle = await open(
+          `${prefix}/${segments[segments.length - 1]}`,
+          constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+        );
+      } catch {
+        throw corruptFile();
+      }
+      try {
+        const info = await handle.stat();
+        if (!info.isFile() || info.nlink !== 1) throw corruptFile();
+        const limit = "exact" in bound ? bound.exact : bound.maxBytes;
+        if (info.size > limit) throw corruptFile();
+        if ("exact" in bound && info.size !== bound.exact) throw corruptFile();
+        const bytes = await readHandleBounded(handle, limit);
+        if ("exact" in bound && bytes.length !== bound.exact) throw corruptFile();
+        return bytes;
+      } finally {
+        await handle.close().catch(() => undefined);
+      }
+    } finally {
+      for (const parent of parents.reverse()) {
+        await parent.close().catch(() => undefined);
+      }
+    }
+  }
+
+  async close(): Promise<void> {
+    await this.directory.close().catch(() => undefined);
   }
 }
 
@@ -413,7 +552,7 @@ async function readSnapshotFile(
  * instead of silently truncated.
  */
 async function readHandleBounded(
-  handle: Awaited<ReturnType<typeof open>>,
+  handle: FileHandle,
   limit: number,
 ): Promise<Buffer> {
   const buffer = Buffer.allocUnsafe(limit + 1);
@@ -430,25 +569,6 @@ async function readHandleBounded(
   }
   if (total > limit) throw corruptFile();
   return buffer.subarray(0, total);
-}
-
-/** Every directory component of a bundle path must still be a plain dir. */
-async function assertPlainParents(
-  root: string,
-  relativePath: string,
-): Promise<void> {
-  const parts = relativePath.split("/").slice(0, -1);
-  let current = root;
-  for (const part of parts) {
-    current = resolve(current, part);
-    let info: Awaited<ReturnType<typeof lstat>>;
-    try {
-      info = await lstat(current);
-    } catch {
-      throw corruptFile();
-    }
-    if (!info.isDirectory() || info.isSymbolicLink()) throw corruptFile();
-  }
 }
 
 // --- small helpers ---------------------------------------------------------

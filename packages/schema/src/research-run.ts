@@ -28,12 +28,53 @@
  * process exit code is an operating-system fact, not a research result.
  */
 import type { PermissionEpoch } from "./permission.js";
+import type { ScienceFlowInputFileRole } from "./scienceflow-input-bundle.js";
 
 export const RESEARCH_RUN_SCHEMA_VERSION = 1;
 
 /** Workloads the Runner may run. One fixed workload exists; nothing is generic. */
 export const RESEARCH_WORKLOAD_KINDS = ["scienceflow-fixed"] as const;
 export type ResearchWorkloadKind = typeof RESEARCH_WORKLOAD_KINDS[number];
+
+/**
+ * The input evidence bundle one new research execution is bound to.
+ *
+ * Both digests are chosen by the trusted internal caller from a frozen plan; a
+ * request can never name a bundle root, a mount path, a file list, replacement
+ * bytes, a command, an interpreter or an environment. The Runner verifies the
+ * named bundle against its own content-addressed store before anything is
+ * launched, so this is an identity to check, not a locator to trust.
+ */
+export interface ResearchInputIdentity {
+  readonly contractDigest: string;
+  readonly bundleDigest: string;
+}
+
+/** One verified byte set, in canonical manifest order. */
+export interface ResearchInputFileEvidence {
+  /** Logical bundle path: never a host path. */
+  readonly path: string;
+  readonly roles: readonly ScienceFlowInputFileRole[];
+  readonly size: number;
+  readonly sha256: string;
+}
+
+/**
+ * What the ledger knows about a run's inputs.
+ *
+ * `declared` is the caller's claim, recorded at acceptance. `verified` means
+ * this Runner instance opened the bundle itself, re-derived its identity from
+ * the canonical manifest, read every byte through a descriptor it held and
+ * materialized the execution's private copy. A spawned execution must reach
+ * `verified`; the declaration alone is never published as a consumed input.
+ */
+export type ResearchInputState = "declared" | "verified";
+
+export interface ResearchInputEvidence extends ResearchInputIdentity {
+  readonly state: ResearchInputState;
+  /** Present only for `verified`: the exact set this execution reads. */
+  readonly files?: readonly ResearchInputFileEvidence[];
+}
 
 /**
  * Bounded monotonic schedule for one run.
@@ -94,6 +135,12 @@ export interface ResearchRunRequest {
   readonly npuDevices?: number[];
   readonly maxOutputBytes?: number;
   readonly maxWorkspaceBytes?: number;
+  /**
+   * The prepared-input bundle this execution consumes. Optional only so records
+   * and requests written before input consumption existed keep their meaning; a
+   * new execution without it is refused before anything reaches the ledger.
+   */
+  readonly inputs?: ResearchInputIdentity;
   readonly schedule: ResearchTimeSchedule;
 }
 
@@ -151,6 +198,9 @@ export const RESEARCH_REFUSAL_CODES = [
   "RESEARCH_ENVIRONMENT_REVISION_MISMATCH",
   "RESEARCH_SANDBOX_UNSUPPORTED",
   "RESEARCH_LAUNCH_FAILED",
+  "RESEARCH_INPUT_REQUIRED",
+  "RESEARCH_INPUT_UNAVAILABLE",
+  "RESEARCH_INPUT_COPY_FAILED",
 ] as const;
 export type ResearchRefusalCode = typeof RESEARCH_REFUSAL_CODES[number];
 
@@ -199,6 +249,12 @@ export interface ResearchRunStatus {
   readonly deadlineViolated: boolean;
   /** Poll bound the Runner used before declaring the boundary unproven. */
   readonly verificationWindowMs: number;
+  /**
+   * The input identity this run was accepted under and, once this instance has
+   * checked the bundle and materialized the execution's copy, the verified file
+   * set. Absent on records written before input consumption existed.
+   */
+  readonly inputs?: ResearchInputEvidence;
   readonly refusal?: ResearchRefusalCode;
   readonly observedAt: string;
 }
