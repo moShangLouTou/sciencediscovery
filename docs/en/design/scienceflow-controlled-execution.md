@@ -209,6 +209,15 @@ Consequences to accept explicitly:
   it exists, **B2 and B3 stay blocked**, and the next implementation slice does
   not build the gateway.
 
+Round 17 update (2026-11-14, design only): the transport, the egress contract,
+the identity tuple and the reservation ledger are now specified in
+[`scienceflow-model-gateway-budget.md`](./scienceflow-model-gateway-budget.md).
+That note selects a bind-mounted Unix socket behind the existing sandbox
+forwarder, adds one seccomp variant with an address-family domain filter, and
+keeps spend explicitly unenforceable. It is **not implemented**, it clears no
+blocker, and the paragraph above remains the state of the code: B2 and B3 stay
+blocked until the real-provider evidence named there exists.
+
 ### 2.2 Budget: who enforces what
 
 | Dimension | Enforcer today | Covers engine-derived calls | Covers the report phase | Enforceable for a first attempt |
@@ -1211,6 +1220,9 @@ Resolved in this revision (no longer open questions):
    (§5.6). No restart extends a deadline.
 6. **The gateway is not enforceable yet.** Attribution is not enforcement, and
    the no-bypass egress contract is undesigned (§2.1). B2 and B3 stay blocked.
+   Round 17 designs that contract
+   ([`scienceflow-model-gateway-budget.md`](./scienceflow-model-gateway-budget.md))
+   without implementing it; the decisions above are unaffected.
 7. **The slice is separable from the vision, and its production assembly refuses
    unconditionally.** There is no config switch that enables the routes; only the
    test harness wires the operation (§6.2, §7).
