@@ -25,7 +25,13 @@ import { DatabaseSync } from "node:sqlite";
 import type {
   ScienceFlowInputBundlePublication,
   ScienceFlowInputBundleRequest,
+  ScienceFlowPreparedInputFileDto,
   ScienceFlowPreparedInputsDto,
+} from "@sciencediscovery/schema";
+import {
+  canonicalScienceFlowInputBundleManifest,
+  SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
+  SCIENCE_FLOW_INPUT_FILE_ROLES,
 } from "@sciencediscovery/schema";
 import {
   RunnerScienceFlowInputBundles,
@@ -109,6 +115,49 @@ const DESCRIPTION = "# Circle packing\n";
 
 const sha256 = (bytes: Uint8Array): string =>
   createHash("sha256").update(bytes).digest("hex");
+
+const ROLE_INDEX = new Map(
+  SCIENCE_FLOW_INPUT_FILE_ROLES.map((role, index) => [role, index]),
+);
+
+/** The digest of the canonical manifest a role summary describes. */
+function bundleDigestFor(
+  contractDigest: string,
+  list: readonly ScienceFlowPreparedInputFileDto[],
+): string {
+  const merged = new Map<
+    string,
+    { roles: ScienceFlowPreparedInputFileDto["role"][]; size: number; sha256: string }
+  >();
+  for (const file of list) {
+    const existing = merged.get(file.path);
+    if (existing === undefined) {
+      merged.set(file.path, {
+        roles: [file.role],
+        size: file.size,
+        sha256: file.sha256,
+      });
+      continue;
+    }
+    existing.roles.push(file.role);
+  }
+  const manifest = {
+    schemaVersion: SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
+    contractDigest,
+    files: [...merged.entries()]
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .map(([path, file]) => ({
+        path,
+        roles: [...file.roles].sort(
+          (left, right) =>
+            (ROLE_INDEX.get(left) as number) - (ROLE_INDEX.get(right) as number),
+        ),
+        size: file.size,
+        sha256: file.sha256,
+      })),
+  };
+  return sha256(Buffer.from(canonicalScienceFlowInputBundleManifest(manifest), "utf8"));
+}
 
 const BINDING: ScienceFlowRuntimeBinding = Object.freeze({
   bindingId: "binding-1",
@@ -665,4 +714,41 @@ test("PREP-17 one file serving two roles is one byte set with both roles kept", 
     { ...files[3]!, sha256: "e".repeat(64) },
   ]);
   assert.equal(inconsistent.status, "contract-changed");
+});
+
+test("PREP-18 a receipt from another contract is not this plan's history", async (context) => {
+  const { service, body } = await harness(context);
+  const preparedResult = await service.prepare(IDENTITY, "plan-1");
+  if (preparedResult.status !== "ok") {
+    assert.fail(`unexpected ${preparedResult.status}`);
+  }
+  const database = body.preparedRepository.database;
+  const row = database
+    .prepare(
+      "SELECT record_json FROM science_flow_prepared_inputs WHERE plan_id = ?",
+    )
+    .get("plan-1") as { record_json: string };
+  const stored = JSON.parse(row.record_json) as {
+    contractDigest: string;
+    bundleDigest: string;
+    files: readonly ScienceFlowPreparedInputFileDto[];
+  };
+  // Rewrite only the contract binding, keeping the record self-consistent so
+  // the repository accepts it: the service must still refuse it for this plan.
+  stored.contractDigest = "b".repeat(64);
+  stored.bundleDigest = bundleDigestFor(stored.contractDigest, stored.files);
+  database
+    .prepare(
+      "UPDATE science_flow_prepared_inputs SET record_json = ? WHERE plan_id = ?",
+    )
+    .run(JSON.stringify(stored), "plan-1");
+
+  const asRepository = body.preparedRepository.latest(
+    IDENTITY.projectId,
+    IDENTITY.sessionId,
+    "plan-1",
+  );
+  assert.ok(asRepository, "the repository sees a self-consistent record");
+  const latest = await service.latest(IDENTITY, "plan-1");
+  assert.equal(latest.status, "corrupt");
 });

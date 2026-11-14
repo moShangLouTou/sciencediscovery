@@ -343,12 +343,22 @@ export function createScienceFlowPrepareInputsService(
         // The plan must exist; a row without one is never served. Current
         // configuration is deliberately not consulted: a withdrawn binding does
         // not erase history, and it is never described as currently available.
-        if (!dependencies.plans().get(query.projectId, query.sessionId, planId)) {
-          return { status: "not-found", resource: "plan" };
-        }
+        const plan = dependencies
+          .plans()
+          .get(query.projectId, query.sessionId, planId);
+        if (!plan) return { status: "not-found", resource: "plan" };
         const stored = dependencies
           .store()
           .latest(query.projectId, query.sessionId, planId);
+        // A receipt is history for exactly the frozen contract it names. A row
+        // recorded under another contract is not this plan's preparation and
+        // is never served as one.
+        if (
+          stored !== undefined &&
+          stored.prepared.contractDigest !== plan.plan.contractDigest
+        ) {
+          return { status: "corrupt" };
+        }
         return { status: "ok", state: preparedInputsState(planId, stored) };
       } catch (error) {
         return mapFailure(error);

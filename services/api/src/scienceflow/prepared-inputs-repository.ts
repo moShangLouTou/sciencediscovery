@@ -29,15 +29,23 @@
  * share one database lock with deletion, so a Session or Project removed while
  * a Runner call was in flight cannot be resurrected by the late receipt.
  * Every read re-validates the row: a corrupt or unknown-version record throws
- * instead of being skipped, repaired, or erased.
+ * instead of being skipped, repaired, or erased. A record must also still be a
+ * bundle — the four required roles, one byte set per path, counts that follow
+ * from the files, and a `bundleDigest` recomputed from the canonical manifest —
+ * and the same check runs before a write.
  */
+import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
 import {
-  SCIENCE_FLOW_INPUT_FILE_ROLES,
+  canonicalScienceFlowInputBundleManifest,
   SCIENCE_FLOW_INPUT_BUNDLE_LIMITS,
+  SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
+  SCIENCE_FLOW_INPUT_FILE_ROLES,
+  SCIENCE_FLOW_INPUT_REQUIRED_ROLES,
   SCIENCE_FLOW_PREPARED_INPUTS_DTO_VERSION,
   isScienceFlowInputBundlePath,
+  type ScienceFlowInputBundleManifest,
   type ScienceFlowPreparedInputFileDto,
   type ScienceFlowPreparedInputsDto,
   type ScienceFlowPreparedInputsStateDto,
@@ -51,6 +59,10 @@ interface PreparedInputRow {
   prepared_at: string;
   record_json: string;
 }
+
+const ROLE_INDEX = new Map(
+  SCIENCE_FLOW_INPUT_FILE_ROLES.map((role, index) => [role, index] as const),
+);
 
 interface GenerationRow {
   plan_id: string;
@@ -226,6 +238,13 @@ export class ScienceFlowPreparedInputsRepository
     ) {
       throw new ScienceFlowPreparedInputsCorruptError();
     }
+    // A receipt is stored only if it describes one complete bundle: the fixed
+    // role set, one byte set per path, counts that follow from the files, and
+    // a bundle digest recomputed from the same canonical manifest the Runner
+    // hashed. A caller cannot persist a self-inconsistent record and have it
+    // read back as a successful preparation.
+    const record = reducePrepared(draft.prepared);
+    parseRecord(record, draft.prepared.preparedAt);
     // Share a write lock with deletion from validation through the returned
     // snapshot, so a late receipt cannot insert after a delete commits.
     this.database.exec("BEGIN IMMEDIATE");
@@ -252,7 +271,7 @@ export class ScienceFlowPreparedInputsRepository
         this.database.exec("COMMIT");
         return { saved: false };
       }
-      const record = JSON.stringify(reducePrepared(draft.prepared));
+      const serialized = JSON.stringify(record);
       const result = this.database
         .prepare(
           `INSERT INTO science_flow_prepared_inputs
@@ -272,7 +291,7 @@ export class ScienceFlowPreparedInputsRepository
           draft.sessionId,
           draft.generation,
           draft.prepared.preparedAt,
-          record,
+          serialized,
         );
       const saved = Number(result.changes) === 1;
       const row = this.select(
@@ -402,13 +421,31 @@ function parseRow(row: PreparedInputRow): ScienceFlowStoredPreparedInputs {
   ) {
     throw new ScienceFlowPreparedInputsCorruptError();
   }
-  const value = parseJson(row.record_json);
+  const record = parseRecord(parseJson(row.record_json), row.prepared_at);
+  const prepared: ScienceFlowPreparedInputsDto = Object.freeze({
+    schemaVersion: SCIENCE_FLOW_PREPARED_INPUTS_DTO_VERSION,
+    planId: row.plan_id,
+    ...record,
+    canStart: false as const,
+    generation: row.generation,
+  });
+  return Object.freeze({ prepared, generation: row.generation });
+}
+
+/**
+ * Validate one stored record against the bundle rules it claims to satisfy.
+ * The row's own `prepared_at` is authoritative for the timestamp, so a record
+ * whose time disagrees with the row is corrupt rather than a second opinion.
+ */
+function parseRecord(
+  value: unknown,
+  preparedAt: string,
+): StoredPreparedInputs {
   if (!isRecord(value)) throw new ScienceFlowPreparedInputsCorruptError();
-  const preparedAt = value.preparedAt;
   if (
     typeof preparedAt !== "string" ||
     preparedAt.trim().length === 0 ||
-    preparedAt !== row.prepared_at
+    value.preparedAt !== preparedAt
   ) {
     throw new ScienceFlowPreparedInputsCorruptError();
   }
@@ -425,51 +462,30 @@ function parseRow(row: PreparedInputRow): ScienceFlowStoredPreparedInputs {
     throw new ScienceFlowPreparedInputsCorruptError();
   }
   const files = parseFiles(value.files);
-  const fileCount = value.fileCount;
-  const totalBytes = value.totalBytes;
+  // The record must still describe one bundle: the distinct byte sets its
+  // roles name, their total, and the digest the Runner computed for exactly
+  // that canonical manifest. Nothing is repaired to make a row readable.
+  const manifest = receiptManifest(contractDigest, files);
+  const fileCount = manifest.files.length;
+  const totalBytes = manifest.files.reduce((total, file) => total + file.size, 0);
   if (
-    typeof fileCount !== "number" ||
-    !Number.isSafeInteger(fileCount) ||
-    fileCount < 1 ||
-    fileCount > SCIENCE_FLOW_INPUT_BUNDLE_LIMITS.maxFiles ||
-    typeof totalBytes !== "number" ||
-    !Number.isSafeInteger(totalBytes) ||
-    totalBytes < 0
+    value.fileCount !== fileCount ||
+    value.totalBytes !== totalBytes ||
+    totalBytes > SCIENCE_FLOW_INPUT_BUNDLE_LIMITS.maxTotalBytes ||
+    receiptDigest(manifest) !== bundleDigest
   ) {
     throw new ScienceFlowPreparedInputsCorruptError();
   }
-  // The summary must still describe the role list it was stored with: distinct
-  // byte sets and their total, not a second opinion.
-  const sizes = new Map<string, number>();
-  for (const file of files) {
-    const existing = sizes.get(file.path);
-    if (existing !== undefined && existing !== file.size) {
-      throw new ScienceFlowPreparedInputsCorruptError();
-    }
-    sizes.set(file.path, file.size);
-  }
-  if (
-    sizes.size !== fileCount ||
-    [...sizes.values()].reduce((total, size) => total + size, 0) !== totalBytes
-  ) {
-    throw new ScienceFlowPreparedInputsCorruptError();
-  }
-
-  const prepared: ScienceFlowPreparedInputsDto = Object.freeze({
-    schemaVersion: SCIENCE_FLOW_PREPARED_INPUTS_DTO_VERSION,
-    planId: row.plan_id,
+  return Object.freeze({
     contractDigest,
     bundleDigest,
     runnerId,
     preparedAt,
     outcome: "prepared" as const,
-    canStart: false as const,
     fileCount,
     totalBytes,
     files,
-    generation: row.generation,
   });
-  return Object.freeze({ prepared, generation: row.generation });
 }
 
 function parseFiles(
@@ -504,7 +520,76 @@ function parseFiles(
       sha256,
     });
   });
+  // Every receipt predates any optional shared defaults: the four required
+  // roles are always present, so a partial row is never a preparation.
+  for (const role of SCIENCE_FLOW_INPUT_REQUIRED_ROLES) {
+    if (!roles.has(role)) throw new ScienceFlowPreparedInputsCorruptError();
+  }
   return Object.freeze(files);
+}
+
+/** The canonical file set the stored roles describe, in protocol order. */
+function receiptManifest(
+  contractDigest: string,
+  files: readonly ScienceFlowPreparedInputFileDto[],
+): ScienceFlowInputBundleManifest {
+  const merged = new Map<
+    string,
+    {
+      readonly roles: ScienceFlowPreparedInputFileDto["role"][];
+      readonly size: number;
+      readonly sha256: string;
+    }
+  >();
+  for (const file of files) {
+    const existing = merged.get(file.path);
+    if (existing === undefined) {
+      merged.set(file.path, {
+        roles: [file.role],
+        size: file.size,
+        sha256: file.sha256,
+      });
+      continue;
+    }
+    // Two roles may share one byte set; they may never name two different ones.
+    if (existing.size !== file.size || existing.sha256 !== file.sha256) {
+      throw new ScienceFlowPreparedInputsCorruptError();
+    }
+    existing.roles.push(file.role);
+  }
+  return {
+    schemaVersion: SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
+    contractDigest,
+    files: Object.freeze(
+      [...merged.entries()]
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .map(([path, file]) =>
+          Object.freeze({
+            path,
+            roles: Object.freeze(
+              [...file.roles].sort(
+                (left, right) => roleOrder(left) - roleOrder(right),
+              ),
+            ),
+            size: file.size,
+            sha256: file.sha256,
+          }),
+        ),
+    ),
+  };
+}
+
+function roleOrder(role: ScienceFlowPreparedInputFileDto["role"]): number {
+  const index = ROLE_INDEX.get(role);
+  if (index === undefined) throw new ScienceFlowPreparedInputsCorruptError();
+  return index;
+}
+
+/** SHA-256 over the canonical manifest; the bundle's content identity. */
+function receiptDigest(manifest: ScienceFlowInputBundleManifest): string {
+  return createHash("sha256")
+    .update(canonicalScienceFlowInputBundleManifest(manifest), "utf8")
+    .digest("hex");
 }
 
 function parseJson(text: string): unknown {

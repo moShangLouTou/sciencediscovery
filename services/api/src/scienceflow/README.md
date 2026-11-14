@@ -1012,16 +1012,21 @@ GET  /scienceflow/input-bundles/:digest  # fixed ready | missing | corrupt
 ```
 
 The Runner re-derives `bundleDigest` from the manifest and compares it with the
-sender's claim, then re-checks every entry's size and SHA-256 from the decoded
-bytes. It writes a private staging directory under its own data directory and
-commits the whole tree with one rename into
+sender's claim. It then re-checks every entry's size and SHA-256 from the decoded
+bytes **before** it may answer `ready`, so an upload is verified on its own even
+when a tree for that digest already exists; only the client's body-less `GET` is
+a reuse shortcut. It writes a private staging directory under its own data
+directory and commits the whole tree with one rename into
 `<dataDir>/.scienceflow-input-bundles/<bundleDigest>/`, outside every workspace
 and workload-writable bind. Concurrent publishers of the same bytes share one
 tree; an existing but damaged snapshot is reported as `corrupt` and refused,
-never overwritten or re-blessed. Reads verify the stored tree again (no
-symlinks, no extra files, exact sizes and digests). There is no GC, TTL,
-reference counting, or mount step this round: unreferenced content is a cache
-object, not a business record.
+never overwritten or re-blessed. Reads verify the stored tree again: no
+symlinks, no extra files, no hardlink alias (a link count above one means the
+bytes are writable outside the tree), exact sizes, and digests recomputed
+through a held descriptor that is opened `O_NOFOLLOW`/`O_NONBLOCK` and checked
+again against its pre-open identity. The stored manifest is read the same way
+and bounded to 64 KiB. There is no GC, TTL, reference counting, or mount step
+this round: unreferenced content is a cache object, not a business record.
 
 ### Receipt and storage
 
@@ -1034,7 +1039,13 @@ tables of `catalog.sqlite` (the same generation pattern as Round 11):
   `fileCount`, `totalBytes`, and one `{role, path, size, sha256}` per role.
 
 It contains no raw manifest, evaluator source, host path, storage address, or
-remote error text. Gates are rechecked after the Runner await: a deleted
+remote error text. The repository validates a receipt both before writing it and
+on every read: the four required roles are present, one path serves exactly one
+byte set, the counts follow from the files, the canonical manifest is rebuilt and
+its digest must equal `bundleDigest`, and `GET` also requires the receipt's
+`contractDigest` to equal the frozen plan's. A row that fails any of these is
+`corrupt`, never repaired or partially returned. Gates are rechecked after the
+Runner await: a deleted
 Session/Project, a revoked write permission, a deselected Runner, a withdrawn
 profile or binding, or a changed plan records nothing. `POST` answers its own
 receipt when saved, a strictly newer receipt stored meanwhile (with its larger
@@ -1069,8 +1080,9 @@ stored row.
 4. Send a bundle with a missing/extra/duplicate file, a wrong size or digest,
    broken base64, or over a limit: the Runner refuses with fixed codes and
    leaves no published tree.
-5. Point a request at a traversal path or hand the Runner a damaged snapshot:
-   refusal, no overwrite, `corrupt` on read.
+5. Point a request at a traversal path, hand the Runner a damaged snapshot, or
+   hardlink a published file outside the tree: refusal, no overwrite,
+   `corrupt` on read.
 6. Same content twice or concurrently: one tree, no duplicate receipt rows; a
    lost response is recoverable by digest.
 7. Revoke the Runner selection, the write permission, or the binding during the
