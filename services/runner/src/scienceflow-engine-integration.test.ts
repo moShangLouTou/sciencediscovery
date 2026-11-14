@@ -52,6 +52,7 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import {
   canonicalScienceFlowInputBundleManifest,
@@ -71,7 +72,7 @@ import {
   type ResearchEngineBinding,
   type ResearchRunWiring,
 } from "./research-run.js";
-import { researchEngineStateRoot } from "./scienceflow-engine-bridge.js";
+import { researchEngineStateRoot, SCIENCEFLOW_ENGINE_STATE_MOUNT } from "./scienceflow-engine-bridge.js";
 import { ExecutionManager } from "./execution-manager.js";
 import type { EnvironmentRuntime } from "./environment-store.js";
 
@@ -267,7 +268,16 @@ async def report_process(*argv, **kwargs):
     process = await asyncio.create_subprocess_exec("/bin/sleep", seconds, **kwargs)
     marker("report.child", str(process.pid))
     marker("report.entered")
-    return process
+    class ObservedProcess:
+        def __getattr__(self, name):
+            return getattr(process, name)
+
+        async def wait(self):
+            result = await process.wait()
+            marker("report.reaped", str(result))
+            return result
+
+    return ObservedProcess()
 
 
 def read_report_manifest(root):
@@ -285,12 +295,19 @@ def export_success(current):
 
 
 async def run(manifest):
+    from scienceflow.runtime.parallel.execution.runner import ParallelRunner
     from scienceflow.runtime.parallel.control import reporting
     import scienceflow.research.reporting as research_reporting
     import scienceflow.research.onboarding.library.export as export_module
     reporting.spawn_report_process = report_process
     research_reporting.read_report_manifest = read_report_manifest
     export_module.export_success = export_success
+    parsed = ParallelRunner(manifest)._tasks[0]
+    marker("parsed-task.json", json.dumps({
+        "exp_id": parsed.exp_id,
+        "task": parsed.task,
+        "evaluator": (parsed.manifest_cfg_patch or {}).get("evaluator"),
+    }))
     marker("research.entered")
     if (GATE / "research.stop").exists():
         try:
@@ -645,9 +662,21 @@ test("prepare, supervision and completion drive the real engine lifecycle", { ti
   assert.equal(task.task, DESCRIPTION);
   assert.equal(task.evaluator.metric.name, FROZEN_METRIC);
   assert.equal(task.evaluator.candidate.artifact, "submission.csv");
-  const packageSource = resolve(task.evaluator.package_source);
+  // Inspect the real parser's consumed configuration as well as its input.
+  const parsedTask = JSON.parse(await readFile(gatePath(f.workspace, "parsed-task.json"), "utf8"));
+  assert.equal(parsedTask.exp_id, task.exp_id);
+  // The real manifest parser trims inline task text; frozen file bytes below
+  // remain unchanged by that normal parsing step.
+  assert.equal(parsedTask.task, DESCRIPTION.trim());
+  assert.deepEqual(parsedTask.evaluator, task.evaluator);
+  const sandboxPackageSource = task.evaluator.package_source;
+  assert.ok(sandboxPackageSource.startsWith(`${SCIENCEFLOW_ENGINE_STATE_MOUNT}/task-package/`));
+  const packageSource = resolve(
+    researchEngineStateRoot(f.dataDir, "engine-completed"),
+    sandboxPackageSource.slice(SCIENCEFLOW_ENGINE_STATE_MOUNT.length + 1),
+  );
   assert.ok(
-    packageSource.startsWith(resolve(researchEngineStateRoot(f.dataDir, "engine-completed"), "task-package")),
+    packageSource.startsWith(`${resolve(researchEngineStateRoot(f.dataDir, "engine-completed"), "task-package")}/`),
     packageSource,
   );
   // Relocation is byte-for-byte: the engine read exactly the frozen bytes.
@@ -789,9 +818,8 @@ test("a durable stop during reporting keeps research and marks the report incomp
   assert.equal(engineRun.status, "completed");
   assert.equal(engineRun.report_timed_out, false);
   // The report child was reaped before the manager released the resources.
-  const child = Number((await readFile(gatePath(f.workspace, "report.child"), "utf8")).trim());
-  assert.ok(Number.isInteger(child) && child > 1, String(child));
-  assert.equal(existsSync(`/proc/${child}`), false);
+  assert.equal((await readFile(gatePath(f.workspace, "report.reaped"), "utf8")).trim(), "-9");
+  assert.equal(record.evidence?.processTerminated, true);
 });
 
 // ---------------------------------------------------------------------------
@@ -840,6 +868,20 @@ test("a held export boundary keeps the manager from publishing or releasing", { 
   const conflict = manager.get("engine-window-conflict", OWNER);
   assert.equal(conflict.state, "cancelled");
   assert.equal(conflict.research?.outcome, "not-started");
+  // Drain queued dispatch cleanup before verifying the durable no-start fact.
+  await manager.close();
+  const ledger = new DatabaseSync(resolve(f.dataDir, "runner-executions", "executions.sqlite"), { readOnly: true });
+  try {
+    const row = ledger.prepare("SELECT record FROM executions WHERE id = ?").get("engine-window-conflict");
+    assert.ok(row);
+    const durable = JSON.parse(String(row.record)) as ManagedExecution;
+    assert.equal(durable.state, "cancelled");
+    assert.equal(durable.research?.outcome, "not-started");
+    assert.equal(durable.research?.process, "not_started");
+    assert.equal(durable.research?.spawnedAt, undefined);
+  } finally {
+    ledger.close();
+  }
 });
 
 // ---------------------------------------------------------------------------

@@ -1315,6 +1315,13 @@ export class ExecutionManager {
       // in-flight copy: cancellation reads the record separately and an
       // operation that finishes later must not erase what was asked of it.
       if (execution.research && previous?.research) {
+        // A cancelled queued run has a positive durable no-start fact. Later
+        // dispatch cleanup holds an older copy and must not erase that fact.
+        if (previous.state === "cancelled" && execution.state === "cancelled"
+          && previous.research.process === "not_started" && previous.research.outcome === "not-started"
+          && execution.research.process === "not_started") {
+          execution.research = { ...execution.research, outcome: "not-started", phase: "finished" };
+        }
         const durableStop = previous.research.stop;
         const durableCause = previous.research.stopCause;
         const stopStronger = STOP_RANK[durableStop] > STOP_RANK[execution.research.stop];
