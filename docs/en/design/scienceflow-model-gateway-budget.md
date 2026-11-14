@@ -393,10 +393,25 @@ Fixed constants:
 
 Lifetime:
 
-- **[todo]** The socketpair is created immediately before spawn and both ends
-  are closed after termination is proven; the gateway refuses frames from a
-  closed generation. Nothing is left on disk, so there is no path to unlink, no
-  `sun_path` length limit, and no mode to get wrong.
+- **[measured, round 18]** bubblewrap passes descriptor `4` through to the
+  payload. A real `bwrap 0.13.1` launch under this repository's own `--seccomp 3`
+  argument list delivered a connected `AF_UNIX` stream socket to a Python child,
+  which adopted it with `socket.socket(fileno=4)` and exchanged data in both
+  directions. Two facts came with it: the seccomp program on fd `3` also stays
+  open in the payload, and Node has no `socketpair()` binding, so the pair is
+  opened by listening on a Runner-owned name, connecting, accepting, and then
+  unlinking it — after which no filesystem socket exists at all, and there is no
+  path to unlink, no `sun_path` limit and no mode to get wrong.
+- **[measured, round 18]** `socket.socket(fileno=4)` issues no `socket()` call:
+  the child ran under the `research-gateway` filter, where `socket(AF_UNIX)`
+  returns `EPERM`, and still adopted the descriptor.
+- **[measured, round 18]** two lifecycle facts the design did not state. Node
+  hands the descriptor to the child **non-blocking**, so a relay that does not
+  call `setblocking(True)` sees `EAGAIN` on every `recv()`. And because the
+  Runner's copy of the sandbox end shares one open file description with the
+  child's, the Runner must close its own copy right after the spawn — otherwise
+  the host end never observes the sandbox closing and a finished run looks like
+  a live peer.
 - **[todo]** The forwarder binds the loopback port **before** forking, so the
   workload cannot take the port first; it exits when its child exits.
 - **[todo]** The forwarder enters through the existing `commandPrefix`
@@ -406,15 +421,12 @@ Lifetime:
   read-only mounts (`SD` `egress-bridge.ts:147-200`, `:235-253`). That is the
   only other mount this design adds, and it is the one the audited egress path
   already makes.
-- **[dyn]** Whether bwrap passes descriptor `4` through to the payload is not
-  verified by this round. If it does not, the launch fails closed with
-  `MODEL_GATEWAY_FD_UNAVAILABLE` (reported as the existing
-  `RESEARCH_LAUNCH_FAILED`, §6.3); there is **no** fallback to a bind-mounted
-  socket, because that would restore the hole this section closes.
-- **[dyn]** Wrapping the descriptor with `socket.socket(fileno=4)` must not
-  issue a `socket()` call, because that call is filtered (§3.4). CPython
-  adopts an existing descriptor without creating one, but this is measured by
-  G25 together with the bwrap hand-off rather than assumed.
+
+Round 18 built only the transport half of this: the pair, the descriptor
+hand-off, the fixed relay and its two directions. The relay forwards **one**
+connection with no framing, so it is a harness primitive, not the gateway. The
+frame codec, the demultiplexer, authorization, the ledger and the upstream leg
+are untouched.
 
 ### 3.3 How every client is configured
 
@@ -502,17 +514,19 @@ research failure.
 
 Exactly one new seccomp variant, Runner-selected for this workload kind:
 
-- **[todo]** `research-gateway` = the research variant plus **two**
-  argument-checked blocks, and *minus* the entries that block an ordinary TCP
-  client. Concretely, on x86_64 remove `41, 42, 43, 49, 50, 288` from the deny
-  list and prepend the `socket()` block for `41` and the `socketpair()` block
-  for `53`; on arm64 remove `198, 200, 201, 202, 203, 242` and prepend the
-  blocks for `198` and `199` (`SD` `services/runner/src/seccomp.ts:52-55`,
-  `:58-72`). The blocks reuse the existing `instruction()` builder, the
-  `socketpair` precedent (`:147-159`) and one `BPF_ALU_AND_K` helper: for
-  `socket()`, `domain == AF_INET` **and** `type & 0x0f == SOCK_STREAM`; for
-  `socketpair()`, `domain == AF_UNIX` **and** `type & 0x0f == SOCK_STREAM`
-  **and** `protocol == 0`. Anything else is `EPERM`.
+- **[built in round 18 as a harness profile]** `research-gateway` = the research
+  variant plus **two** argument-checked blocks, and *minus* the entries that
+  block an ordinary TCP client. Concretely, on x86_64 remove `41, 42, 43, 49,
+  50, 288` from the deny list and prepend the `socket()` block for `41` and the
+  `socketpair()` block for `53`; on arm64 remove `198, 200, 201, 202, 203, 242`
+  and prepend the blocks for `198` and `199` (`SD`
+  `services/runner/src/seccomp.ts:52-55`, `:58-72`). The blocks reuse the
+  existing `instruction()` builder, the `socketpair` precedent (`:147-159`) and
+  one `BPF_ALU_AND_K` helper: for `socket()`, `domain == AF_INET` **and**
+  `type & 0x0f == SOCK_STREAM`; for `socketpair()`, `domain == AF_UNIX` **and**
+  `type & 0x0f == SOCK_STREAM` **and** `protocol == 0`. Anything else is
+  `EPERM`. The profile is internal: no request, environment profile or route
+  selects it, and it is not wired into a research launch.
 - **The `socketpair` type/protocol check is new, and it is the point.** The
   current `research` variant checks only `socketpair`'s domain
   (`SD` `services/runner/src/seccomp.ts:147-159`), so
@@ -549,6 +563,16 @@ Exactly one new seccomp variant, Runner-selected for this workload kind:
   pair routes against a live host service. If any route reaches a host
   endpoint, the no-bypass claim stays **blocked** and the variant is not
   accepted; the design does not fall back to "the service was not running".
+  **Round 18 measured the sandbox half of this on one host** (real `bwrap`,
+  `x86_64`): every denied family and type returned `EPERM`; `asyncio`, a
+  loopback client and a stream pair worked; addressed `sendto`/`sendmsg`,
+  `connect`, `bind` and `listen` from a permitted pair never reached the live
+  host services, including a listener created during the run; the services kept
+  answering host-side probes. Those measurements do not authorize the claim:
+  G15's deployment matrix, the ledger and the product path are still missing,
+  and a labelled control showed the `network` profile *does* reach a filesystem
+  socket in the mounted workspace, which is precisely why this profile denies
+  `socket(AF_UNIX)`.
 - **Unchanged:** `--unshare-all`, `--unshare-user`, `--cap-drop ALL`,
   `--clearenv`, `--die-with-parent`, `--ro-bind /usr`, the interpreter masks,
   `--seccomp` at fd 3 (`SD` `executor.ts:962-998`). There is no `--share-net`,
@@ -746,9 +770,16 @@ entry, R never runs.
    otherwise return `/scienceflow-engine/.venv/bin/python` when the host
    checkout has one (`SF` `runtime/environment.py:27-54`). An empty tmpfs over
    `/scienceflow-engine/.venv` makes the walk fall back to `sys.executable`
-   deterministically. **[dyn]** bwrap must accept a `--tmpfs` whose target does
-   not exist; if it does not, the start is refused when the host checkout
-   carries a `.venv` — the design does not run an unverified interpreter.
+   deterministically. **[measured, round 18]** bubblewrap **cannot** place a
+   `--tmpfs` whose target does not exist inside the read-only source bind: it
+   fails with `bwrap: Can't create file /scienceflow-engine/.venv: Read-only
+   file system`, which would fail the whole launch. The mask is therefore
+   assembled conditionally from a host `stat`: a checkout with a `.venv`
+   directory gets the tmpfs, a checkout without one needs no mask because the
+   walk already falls back, and a `.venv` that is not a directory is refused
+   rather than approximated. Both cases were measured: with the mask the
+   probe's `resolve_project_python()` returns the leased interpreter, without it
+   the same checkout returns `/scienceflow-engine/.venv/bin/python`.
 
 The roles, after items 1–5, with the `sys.path` each actually sees (the lease's
 `.pth` line still names the host checkout path; in the research layout that
@@ -1508,6 +1539,18 @@ After this slice, and only with the real-provider evidence below:
 
 No token, spend or no-bypass claim may rest on mocks alone. The tests prove the
 mechanism; the product claim needs the real boundary.
+
+**Round 18 measured, and did not build.** One feasibility harness now runs the
+prerequisite half of G12–G16, G20, G23 and G25 on a real `bwrap` through this
+repository's own launch path: the descriptor hand-off, the fixed relay, the two
+`socket`/`socketpair` blocks (native on `x86_64`, rule generation on `aarch64`
+too), live host stream/datagram/abstract services that stayed unreachable while
+answering host-side probes, a mid-run listener, and proofs S then R in one lease
+with a pre-planted workspace package. EC6 is a tracked patch (`0004`) on the
+pinned engine revision. What the harness still cannot say: nothing about
+G1–G11, G17–G22, G26–G29, and nothing about a real start, a credential, a
+ledger or a provider. The rows above keep their status; the deliverable is the
+mechanism evidence, not an acceptance row.
 
 ## 8. Decisions and remaining blockers
 

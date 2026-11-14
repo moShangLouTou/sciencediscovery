@@ -228,6 +228,19 @@ and reconciles reservations without resuming. It is **not implemented**, it
 clears no blocker, and the paragraph above remains the state of the code: B2
 and B3 stay blocked until the real-provider evidence named there exists.
 
+Round 18 update (2026-11-15, feasibility only): the three enabling primitives
+of that design were measured on a real `bwrap` under this repository's own
+launch path. An inherited descriptor reaches the sandbox payload as fd `4`, a
+fixed stdlib relay adopts it without creating a socket and serves loopback, the
+`research-gateway` filter's two argument-checked blocks behave as intended on
+`x86_64` (rule generation is checked for `aarch64` too), and no permitted route
+from a stream pair — nor a socket created mid-run — reached a live host IPC
+service. EC6 is now carried by the tracked patch series, so the pinned engine
+revision launches its own `-m` children with `-P`. The full gateway, its ledger,
+its credential, the framing multiplexer and the public start route remain
+**not built**; the blocker matrix is unchanged, `canStart` stays `false`, and
+G1–G11 and G17–G22 of the gateway note are untouched.
+
 ### 2.2 Budget: who enforces what
 
 | Dimension | Enforcer today | Covers engine-derived calls | Covers the report phase | Enforceable for a first attempt |
@@ -549,6 +562,11 @@ existing behaviour of `start_run()`; one further change is optional:
   cannot replace the mounted engine entry. This is required by the round-17
   gateway design (§3.6 of that note); the checkout requires Python `>=3.11`,
   where the flag exists, and the engine's command classifier already parses it.
+  **Carried by the tracked patch series since round 18**: the pinned revision
+  `e1347021eaa497d2dc138d9e66ce36e09260568a` (tree
+  `f1f1567e17946e7d3d1c5fefe66ef811e24b7078`) adds it as patch `0004`, and the
+  engine's own tests assert the argv. Nothing in this document claims it is
+  deployed: a start still needs the environment lease whose source gate passes.
 
 E1 and E2 are required by §1.7; E3 follows from §3.5; EC6 follows from the
 source-identity requirement of the gateway design (§3.6 there); E4 only
