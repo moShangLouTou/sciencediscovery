@@ -209,19 +209,24 @@ Consequences to accept explicitly:
   it exists, **B2 and B3 stay blocked**, and the next implementation slice does
   not build the gateway.
 
-Round 17 update (2026-11-14, design only; revised after the round-17 review):
-the transport, the egress contract, the identity tuple and the reservation
-ledger are now specified in
+Round 17 update (2026-11-14, design only; revised after both round-17
+reviews): the transport, the egress contract, the identity tuple and the
+reservation ledger are now specified in
 [`scienceflow-model-gateway-budget.md`](./scienceflow-model-gateway-budget.md).
 That note selects an inherited socketpair descriptor behind the existing sandbox
-forwarder — so `AF_UNIX` stays denied inside the sandbox and a host socket left
-in a mounted directory is unreachable — adds one seccomp variant that permits
-only `socket(AF_INET, SOCK_STREAM)`, narrows the promise to requests, bytes,
-concurrency and time (reported tokens are accounting, spend is not
-enforceable), and requires a child interpreter/source probe before any run. It
-is **not implemented**, it clears no blocker, and the paragraph above remains
-the state of the code: B2 and B3 stay blocked until the real-provider evidence
-named there exists.
+forwarder — so `socket(AF_UNIX)` stays denied and `socketpair` is reduced to
+self-connected `SOCK_STREAM` pairs, leaving a host socket in a mounted
+directory unreachable — adds one seccomp variant that permits only
+`socket(AF_INET, SOCK_STREAM)` and `socketpair(AF_UNIX, SOCK_STREAM, 0)`,
+narrows the promise to requests, bytes, concurrency, time and transport bounds
+(reported tokens are accounting, spend is not enforceable), reads the request
+body outside the ledger transaction, and requires two child-side proofs before
+any run: the existing R11 source gate plus a research-layout probe, with `-P`
+on the engine's own `-m` children so the workspace cannot replace the engine
+entry (engine change EC6 below). A restart revokes the previous boot's authority
+and reconciles reservations without resuming. It is **not implemented**, it
+clears no blocker, and the paragraph above remains the state of the code: B2
+and B3 stay blocked until the real-provider evidence named there exists.
 
 ### 2.2 Budget: who enforces what
 
@@ -515,7 +520,7 @@ Other properties:
 
 ### 3.6 Engine changes and version dependency
 
-The managed path needs three small additive engine changes, all preserving every
+The managed path needs four small additive engine changes, all preserving every
 existing behaviour of `start_run()`; one further change is optional:
 
 - **E1 `prepare_run()`** — extract the record-creating half of `start_run()` +
@@ -538,9 +543,16 @@ existing behaviour of `start_run()`; one further change is optional:
   finalize_reports(...)` so a `CancelledError` writes `report_status=
   "incomplete"` instead of propagating. Without E4 the contract of §3.5 applies
   (no terminal record; `research_status` authoritative).
+- **EC6 `-P` on the engine's own `-m` children** — add `-P` before `-m` in
+  `child_cli_argv` (prep and task worker) and in the report child's argv, so
+  `cwd` is not prepended and a `scienceflow/` package in the writable workspace
+  cannot replace the mounted engine entry. This is required by the round-17
+  gateway design (§3.6 of that note); the checkout requires Python `>=3.11`,
+  where the flag exists, and the engine's command classifier already parses it.
 
-E1 and E2 are required by §1.7; E3 follows from §3.5; E4 only improves the
-record's completeness.
+E1 and E2 are required by §1.7; E3 follows from §3.5; EC6 follows from the
+source-identity requirement of the gateway design (§3.6 there); E4 only
+improves the record's completeness.
 
 Delivery constraint: a patched engine must be a **tracked, pinned revision**, not
 an edit in the untracked reference checkout. If the project refuses an engine
