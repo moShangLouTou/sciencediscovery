@@ -154,8 +154,11 @@ const INPUT = inputFixture();
 function stubInputSource(): { snapshot(bundleDigest: string): Promise<{
   manifest: InputFixture["manifest"];
   contents: ReadonlyMap<string, Buffer>;
-}> } {
+}>; hostRoots(): readonly string[] } {
   return {
+    // These fixtures materialize no shared cache; there is nothing for a
+    // writable bind to overlap.
+    hostRoots: () => [],
     snapshot: async (bundleDigest: string) => {
       if (bundleDigest !== INPUT.identity.bundleDigest) throw new Error("bundle is not materialized");
       return { manifest: INPUT.manifest, contents: INPUT.contents };
@@ -1094,7 +1097,10 @@ test("an unbound input, a missing bundle or another contract refuses before spaw
   // A wiring without the store, a store that does not hold the digest, and a
   // manifest whose contract is not the requested one are all one fixed refusal.
   assert.equal((await run({ inputBundles: undefined })).research.refusal, "RESEARCH_INPUT_UNAVAILABLE");
-  assert.equal((await run({ inputBundles: { snapshot: async () => { throw new Error("not materialized"); } } }))
+  assert.equal((await run({ inputBundles: {
+    hostRoots: () => [],
+    snapshot: async () => { throw new Error("not materialized"); },
+  } }))
     .research.refusal, "RESEARCH_INPUT_UNAVAILABLE");
   const otherContract = await run({}, researchRequest("run-input", workspace, {
     inputs: { contractDigest: "c".repeat(64), bundleDigest: INPUT.identity.bundleDigest },

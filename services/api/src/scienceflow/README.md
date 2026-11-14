@@ -1031,11 +1031,15 @@ unreferenced content is a cache object, not a business record.
 
 The same module exposes a Runner-internal `snapshot(bundleDigest)` door. It
 takes only the content identity, re-verifies the tree through that held
-descriptor chain, and returns the buffers that were checked. A new research
-execution uses it to build a private copy for its execution id and mounts that
-copy read-only; the shared cache directory itself is never mounted. A request
-cannot name a path, a file list, replacement bytes, a mount point, or a
-substitute source.
+descriptor chain — the same whole-tree check `status` performs, so the public
+query and the consuming door cannot disagree about a corrupt bundle — and
+returns the buffers that were checked. A new research execution uses it to
+build a private copy for its execution id and mounts that copy read-only; the
+shared cache directory itself is never mounted. Before the copy is made, the
+launcher refuses any writable bind whose host source overlaps the copy, its
+staging parent, or the shared cache, comparing resolved directory identities
+rather than requested spellings. A request cannot name a path, a file list,
+replacement bytes, a mount point, or a substitute source.
 
 ### Receipt and storage
 

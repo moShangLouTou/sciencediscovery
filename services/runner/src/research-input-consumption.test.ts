@@ -618,6 +618,143 @@ test("INPUT-SNAP-01 the snapshot door refuses aliases, non-files and missing tre
   assert.equal(refused, "corrupt");
 });
 
+test("INPUT-RUN-08 a bundle with an extra entry refuses before spawn, like status already says", async (context) => {
+  const { dataDir, manager, store, workspace } = await managerFixture(context, "extra-entry", {});
+  const bundle = bundleFixture();
+  await store.put(bundle.request);
+  // The published tree gains an entry the manifest does not name. `status`
+  // already answers corrupt; a consuming run must not accept what the public
+  // query rejects.
+  await writeFile(resolve(dataDir, ".scienceflow-input-bundles", bundle.bundleDigest, "unexpected.txt"), "extra\n");
+  assert.equal((await store.status(bundle.bundleDigest)).status, "corrupt");
+  manager.submitResearch(request("run-extra", workspace, bundle));
+  await until(() => ["failed", "unknown"].includes(manager.get("run-extra", owner).state));
+  const record = manager.get("run-extra", owner);
+  assert.equal(record.research?.process, "not_started");
+  assert.equal(record.research?.refusal, "RESEARCH_INPUT_UNAVAILABLE");
+  assert.equal(await pathExists(researchInputRoot(dataDir, "run-extra")), false);
+  assert.equal(await pathExists(resolve(workspace, "consumed.json")), false,
+    "no sandbox may have consumed a bundle the store calls corrupt");
+});
+
+test("INPUT-ALIAS-01 a workspace at the input parent exposes no writable alias and is refused", async (context) => {
+  const { close, dataDir } = await scratch(context, "alias-parent");
+  // The reviewer's alias: the execution's own writable workspace is the
+  // directory that holds private input copies, so the copy root would be
+  // reachable through `/workspace/<digest>` as well as `/research-inputs`.
+  const workspace = resolve(dataDir, "runner-research-inputs");
+  await mkdir(workspace, { recursive: true });
+  const store = new RunnerScienceFlowInputBundles(dataDir);
+  const manager = new ExecutionManager(dataDir, undefined, {
+    research: createResearchRunExecutor(wiring(dataDir, store, {})),
+  });
+  close(async () => { await manager.close().catch(() => undefined); });
+  const bundle = bundleFixture();
+  await store.put(bundle.request);
+  manager.submitResearch(request("run-alias-parent", workspace, bundle));
+  await until(() => ["failed", "unknown"].includes(manager.get("run-alias-parent", owner).state));
+  const record = manager.get("run-alias-parent", owner);
+  assert.equal(record.research?.process, "not_started");
+  assert.equal(record.research?.refusal, "RESEARCH_INPUT_COPY_FAILED");
+  assert.equal(await pathExists(researchInputRoot(dataDir, "run-alias-parent")), false);
+  assert.equal(await pathExists(resolve(workspace, "consumed.json")), false);
+  assert.equal((await store.status(bundle.bundleDigest)).status, "ready");
+});
+
+test("INPUT-ALIAS-02 a workspace at an ancestor of the data directory is refused", async (context) => {
+  const { dataDir, root } = await scratch(context, "alias-ancestor");
+  // Binding an ancestor of the data directory exposes the copy just as
+  // directly: `/workspace/data/runner-research-inputs/<digest>`. The executor
+  // is exercised directly here: with a workspace that contains the data
+  // directory, the manager's own workspace snapshot races the state root it
+  // creates, which would mask this refusal with an unrelated failure.
+  const store = new RunnerScienceFlowInputBundles(dataDir);
+  const bundle = bundleFixture();
+  await store.put(bundle.request);
+  const executor = createResearchRunExecutor(wiring(dataDir, store, {}));
+  const outcome = await executor.run(request("run-alias-ancestor", root, bundle), {
+    signal: new AbortController().signal,
+  });
+  assert.equal(outcome.research.process, "not_started");
+  assert.equal(outcome.research.refusal, "RESEARCH_INPUT_COPY_FAILED");
+  assert.equal(await pathExists(researchInputRoot(dataDir, "run-alias-ancestor")), false);
+  assert.equal(await pathExists(resolve(root, "consumed.json")), false);
+});
+
+test("INPUT-ALIAS-03 a workspace that is a host symlink to the data directory is refused", async (context) => {
+  const { dataDir, root } = await scratch(context, "alias-link");
+  const workspace = resolve(root, "linked-workspace");
+  await symlink(dataDir, workspace);
+  // The link is resolved before comparison, so the writable bind's real target
+  // is what is checked, not the spelling the request used.
+  const store = new RunnerScienceFlowInputBundles(dataDir);
+  const bundle = bundleFixture();
+  await store.put(bundle.request);
+  const executor = createResearchRunExecutor(wiring(dataDir, store, {}));
+  const outcome = await executor.run(request("run-alias-link", workspace, bundle), {
+    signal: new AbortController().signal,
+  });
+  assert.equal(outcome.research.process, "not_started");
+  assert.equal(outcome.research.refusal, "RESEARCH_INPUT_COPY_FAILED");
+  assert.equal(await pathExists(researchInputRoot(dataDir, "run-alias-link")), false);
+  assert.equal(await pathExists(resolve(dataDir, "consumed.json")), false);
+});
+
+test("INPUT-ALIAS-04 a workspace naming the not-yet-created copy root is refused", async (context) => {
+  const { dataDir } = await scratch(context, "alias-future-root");
+  // The caller can derive this path before the Runner creates it. Comparing
+  // only existing directories would see two missing paths and allow the run;
+  // the canonical future spelling must still be recognised as the same place.
+  const workspace = researchInputRoot(dataDir, "run-future-root");
+  const store = new RunnerScienceFlowInputBundles(dataDir);
+  const bundle = bundleFixture();
+  await store.put(bundle.request);
+  const executor = createResearchRunExecutor(wiring(dataDir, store, {}));
+  const outcome = await executor.run(request("run-future-root", workspace, bundle), {
+    signal: new AbortController().signal,
+  });
+  assert.equal(outcome.research.process, "not_started");
+  assert.equal(outcome.research.refusal, "RESEARCH_INPUT_COPY_FAILED");
+  assert.equal(await pathExists(workspace), false, "the refusal leaves no copy at the named workspace");
+});
+
+test("INPUT-SNAP-03 status and snapshot refuse the same extra entries", async (context) => {
+  const { dataDir, root } = await scratch(context, "extra-snapshot");
+  const store = new RunnerScienceFlowInputBundles(dataDir);
+  const corrupt = (error: unknown): boolean =>
+    error instanceof ScienceFlowInputBundleError && error.kind === "corrupt";
+
+  const extraFile = bundleFixture({ contractDigest: "a".repeat(64) });
+  await store.put(extraFile.request);
+  const extraFileRoot = resolve(dataDir, ".scienceflow-input-bundles", extraFile.bundleDigest);
+  await writeFile(resolve(extraFileRoot, "unexpected.txt"), "extra\n");
+  assert.equal((await store.status(extraFile.bundleDigest)).status, "corrupt");
+  await assert.rejects(store.snapshot(extraFile.bundleDigest), corrupt);
+
+  const extraDirectory = bundleFixture({ contractDigest: "b".repeat(64) });
+  await store.put(extraDirectory.request);
+  await mkdir(resolve(dataDir, ".scienceflow-input-bundles", extraDirectory.bundleDigest, "extra"));
+  assert.equal((await store.status(extraDirectory.bundleDigest)).status, "corrupt");
+  await assert.rejects(store.snapshot(extraDirectory.bundleDigest), corrupt);
+
+  const extraLink = bundleFixture({ contractDigest: "c".repeat(64) });
+  await store.put(extraLink.request);
+  await symlink(resolve(root, "elsewhere"),
+    resolve(dataDir, ".scienceflow-input-bundles", extraLink.bundleDigest, "link"));
+  assert.equal((await store.status(extraLink.bundleDigest)).status, "corrupt");
+  await assert.rejects(store.snapshot(extraLink.bundleDigest), corrupt);
+
+  const extraFifo = bundleFixture({ contractDigest: "d".repeat(64) });
+  await store.put(extraFifo.request);
+  execFileSync("mkfifo", [resolve(dataDir, ".scienceflow-input-bundles", extraFifo.bundleDigest, "pipe")]);
+  assert.equal((await store.status(extraFifo.bundleDigest)).status, "corrupt");
+  const refused = await Promise.race([
+    store.snapshot(extraFifo.bundleDigest).then(() => "ready" as const, corrupt),
+    delay(2_000).then(() => "timeout" as const),
+  ]);
+  assert.equal(refused, true);
+});
+
 test("INPUT-SNAP-02 a re-verified copy is byte-identical to the snapshot", async (context) => {
   const { dataDir } = await scratch(context, "copy");
   const store = new RunnerScienceFlowInputBundles(dataDir);

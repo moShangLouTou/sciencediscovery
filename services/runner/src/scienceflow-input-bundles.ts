@@ -32,6 +32,10 @@
  * Verification walks a directory descriptor held for the read, opening each
  * parent with `O_NOFOLLOW`, checking type, link count and size through the
  * opened descriptor, reading a bounded amount and recomputing the digest.
+ * `status` and `snapshot` share one check: the tree must be exactly the file
+ * set the manifest names — nothing extra, nothing linked, every entry present —
+ * and `snapshot` returns the buffers read during that same check. The public
+ * query and the consuming door cannot disagree about what is corrupt.
  * `snapshot()` returns those exact buffers to the fixed research workload,
  * which materializes a per-execution copy; the cache is never mounted.
  *
@@ -66,6 +70,12 @@ import {
 
 /** The stored manifest: the canonical digest input, copied verbatim. */
 const MANIFEST = ".input-bundle.json";
+
+/** Published content-addressed roots, beside — never inside — a workspace. */
+const BUNDLES_DIRECTORY = ".scienceflow-input-bundles";
+
+/** Staging for a publish, outside the published namespace until it is whole. */
+const STAGING_DIRECTORY = ".scienceflow-input-bundle-staging";
 
 /**
  * The largest stored manifest this Runner will read. A real one describes at
@@ -109,21 +119,46 @@ export interface ScienceFlowInputSnapshot {
   readonly contents: ReadonlyMap<string, Buffer>;
 }
 
+/** One file a verified tree must contain, with the facts recorded for it. */
+interface SnapshotFile {
+  readonly path: string;
+  readonly size: number;
+  readonly sha256: string;
+}
+
+/** A stored manifest plus the exact bytes it was parsed from. */
+interface StoredManifest {
+  readonly manifest: ScienceFlowInputBundleManifest;
+  readonly bytes: Buffer;
+}
+
 export class RunnerScienceFlowInputBundles {
   constructor(private readonly dataDir: string) {}
 
   /** Content-addressed roots, beside — never inside — the workspace tree. */
   private async parent(): Promise<string> {
     await directory(this.dataDir);
-    return await directory(resolve(this.dataDir, ".scienceflow-input-bundles"));
+    return await directory(resolve(this.dataDir, BUNDLES_DIRECTORY));
   }
 
   /** Staging sits outside the published namespace until its contents are whole. */
   private async stagingParent(): Promise<string> {
     await directory(this.dataDir);
     return await directory(
-      resolve(this.dataDir, ".scienceflow-input-bundle-staging"),
+      resolve(this.dataDir, STAGING_DIRECTORY),
     );
+  }
+
+  /**
+   * The host roots this store owns, for a launcher that must prove none of its
+   * writable binds covers them. Runner-internal: no route exposes these, and
+   * the copy a workload mounts is a separate per-execution tree.
+   */
+  hostRoots(): readonly string[] {
+    return [
+      resolve(this.dataDir, BUNDLES_DIRECTORY),
+      resolve(this.dataDir, STAGING_DIRECTORY),
+    ];
   }
 
   /**
@@ -154,15 +189,15 @@ export class RunnerScienceFlowInputBundles {
       return corrupt(bundleDigest);
     }
     try {
-      const manifest = await this.readManifest(reader, bundleDigest);
-      await verifySnapshot(root, reader, manifest);
+      const stored = await this.readManifest(reader, bundleDigest);
+      await reader.verify(stored.manifest.files, { collect: false, manifestBytes: stored.bytes });
       return {
         schemaVersion: SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
         bundleDigest,
         status: "ready",
-        contractDigest: manifest.contractDigest,
-        fileCount: manifest.files.length,
-        totalBytes: scienceFlowInputBundleTotalBytes(manifest),
+        contractDigest: stored.manifest.contractDigest,
+        fileCount: stored.manifest.files.length,
+        totalBytes: scienceFlowInputBundleTotalBytes(stored.manifest),
       };
     } catch {
       // Verification failures are all one fixed answer: the tree is not the
@@ -208,16 +243,12 @@ export class RunnerScienceFlowInputBundles {
       throw new ScienceFlowInputBundleError("corrupt");
     }
     try {
-      const manifest = await this.readManifest(reader, bundleDigest);
-      const contents = new Map<string, Buffer>();
-      for (const file of manifest.files) {
-        const bytes = await reader.read(file.path, { exact: file.size });
-        if (digestBytes(bytes) !== file.sha256) {
-          throw new ScienceFlowInputBundleError("corrupt");
-        }
-        contents.set(file.path, bytes);
-      }
-      return { manifest, contents };
+      const stored = await this.readManifest(reader, bundleDigest);
+      const contents = await reader.verify(stored.manifest.files, {
+        collect: true,
+        manifestBytes: stored.bytes,
+      });
+      return { manifest: stored.manifest, contents };
     } catch (error) {
       if (error instanceof ScienceFlowInputBundleError) throw error;
       throw new ScienceFlowInputBundleError("corrupt");
@@ -329,7 +360,7 @@ export class RunnerScienceFlowInputBundles {
   private async readManifest(
     reader: SnapshotDirectory,
     bundleDigest: string,
-  ): Promise<ScienceFlowInputBundleManifest> {
+  ): Promise<StoredManifest> {
     // The manifest is read through the same held-descriptor path as content:
     // bounded, no symlink or hardlink alias, and no unbounded parse.
     const bytes = await reader.read(MANIFEST, { maxBytes: MAX_MANIFEST_BYTES });
@@ -345,7 +376,7 @@ export class RunnerScienceFlowInputBundles {
     if (scienceFlowInputBundleDigest(parsed) !== bundleDigest) {
       throw new ScienceFlowInputBundleError("corrupt");
     }
-    return parsed;
+    return { manifest: parsed, bytes };
   }
 }
 
@@ -363,81 +394,20 @@ function parseStoredManifest(
 // --- snapshot verification -------------------------------------------------
 
 /**
- * Check that a published snapshot is exactly the file set its manifest
- * describes: no symlinks, no non-files, nothing extra, and every expected file
- * present with the size and SHA-256 claimed for it.
- */
-async function verifySnapshot(
-  root: string,
-  reader: SnapshotDirectory,
-  manifest: ScienceFlowInputBundleManifest,
-): Promise<void> {
-  const expected = new Set(manifest.files.map((file) => file.path));
-  const present = new Set<string>();
-  const walk = async (dir: string, prefix = ""): Promise<void> => {
-    for (const entry of await readdir(dir, { withFileTypes: true })) {
-      const name = prefix + entry.name;
-      if (entry.isSymbolicLink()) {
-        throw new ScienceFlowInputBundleError("corrupt");
-      }
-      if (entry.isDirectory()) {
-        if (![...expected].some((path) => path.startsWith(`${name}/`))) {
-          throw new ScienceFlowInputBundleError("corrupt");
-        }
-        await walk(resolve(dir, entry.name), `${name}/`);
-        continue;
-      }
-      if (!entry.isFile()) throw new ScienceFlowInputBundleError("corrupt");
-      if (name === MANIFEST) {
-        // Only the root manifest is a known file; the same name deeper in the
-        // tree is an unexpected entry, not something to skip.
-        if (prefix !== "") {
-          throw new ScienceFlowInputBundleError("corrupt");
-        }
-        continue;
-      }
-      if (!expected.has(name)) {
-        throw new ScienceFlowInputBundleError("corrupt");
-      }
-      present.add(name);
-    }
-  };
-  await walk(root);
-  for (const path of expected) {
-    if (!present.has(path)) throw new ScienceFlowInputBundleError("corrupt");
-  }
-
-  for (const file of manifest.files) {
-    const bytes = await reader.read(file.path, { exact: file.size });
-    if (digestBytes(bytes) !== file.sha256) {
-      throw new ScienceFlowInputBundleError("corrupt");
-    }
-  }
-}
-
-/**
  * Re-check a materialized copy against the manifest it was written from.
  *
  * The copy is Runner-owned and private, but it is verified anyway before it is
  * published: a partially written or externally damaged staging tree must never
- * become the directory a workload mounts.
+ * become the directory a workload mounts. The expected set is the whole tree —
+ * an entry the manifest does not name is as damaged as a missing one.
  */
 export async function verifyScienceFlowInputCopy(
   root: string,
-  files: readonly {
-    readonly path: string;
-    readonly size: number;
-    readonly sha256: string;
-  }[],
+  files: readonly SnapshotFile[],
 ): Promise<void> {
   const reader = await SnapshotDirectory.open(root);
   try {
-    for (const file of files) {
-      const bytes = await reader.read(file.path, { exact: file.size });
-      if (digestBytes(bytes) !== file.sha256) {
-        throw new ScienceFlowInputBundleError("corrupt");
-      }
-    }
+    await reader.verify(files, { collect: false });
   } finally {
     await reader.close();
   }
@@ -493,51 +463,135 @@ class SnapshotDirectory {
     const segments = relativePath.split("/");
     const parents: FileHandle[] = [];
     try {
-      let prefix = `/proc/self/fd/${this.directory.fd}`;
+      let directory = this.directory;
       for (const segment of segments.slice(0, -1)) {
-        let parent: FileHandle;
-        try {
-          parent = await open(
-            `${prefix}/${segment}`,
-            constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-          );
-        } catch {
-          throw corruptFile();
-        }
-        try {
-          if (!(await parent.stat()).isDirectory()) throw corruptFile();
-        } catch {
-          await parent.close().catch(() => undefined);
-          throw corruptFile();
-        }
-        parents.push(parent);
-        prefix = `/proc/self/fd/${parent.fd}`;
+        directory = await this.openChildDirectory(directory, segment);
+        parents.push(directory);
       }
-      let handle: FileHandle;
-      try {
-        handle = await open(
-          `${prefix}/${segments[segments.length - 1]}`,
-          constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-        );
-      } catch {
-        throw corruptFile();
-      }
-      try {
-        const info = await handle.stat();
-        if (!info.isFile() || info.nlink !== 1) throw corruptFile();
-        const limit = "exact" in bound ? bound.exact : bound.maxBytes;
-        if (info.size > limit) throw corruptFile();
-        if ("exact" in bound && info.size !== bound.exact) throw corruptFile();
-        const bytes = await readHandleBounded(handle, limit);
-        if ("exact" in bound && bytes.length !== bound.exact) throw corruptFile();
-        return bytes;
-      } finally {
-        await handle.close().catch(() => undefined);
-      }
+      const name = segments[segments.length - 1];
+      if (name === undefined) throw corruptFile();
+      return await this.readEntry(directory, name, bound);
     } finally {
       for (const parent of parents.reverse()) {
         await parent.close().catch(() => undefined);
       }
+    }
+  }
+
+  /**
+   * Check that the tree below the held descriptor is exactly the file set
+   * `files` names: no links, no non-files, nothing extra, every entry present
+   * with the size and digest recorded for it.
+   *
+   * Names are listed and opened relative to descriptors held for this walk, so
+   * a swapped root or a replaced parent cannot make the set check describe a
+   * different tree than the reads. `manifestBytes`, when given, is the manifest
+   * this set was parsed from; the root entry of that name must still hold those
+   * bytes, so the parsed set and the walked tree are one object. With
+   * `collect`, the verified bytes are returned to the caller that materializes
+   * them — the buffers the checks describe, not a later read by path.
+   */
+  async verify(
+    files: readonly SnapshotFile[],
+    options: { readonly collect: boolean; readonly manifestBytes?: Buffer },
+  ): Promise<Map<string, Buffer>> {
+    const expected = new Map<string, SnapshotFile>();
+    const directories = new Set<string>();
+    for (const file of files) {
+      expected.set(file.path, file);
+      const segments = file.path.split("/");
+      for (let index = 1; index < segments.length; index += 1) {
+        directories.add(segments.slice(0, index).join("/"));
+      }
+    }
+    const contents = new Map<string, Buffer>();
+    const present = new Set<string>();
+    let manifestSeen = false;
+    const walk = async (directory: FileHandle, prefix: string): Promise<void> => {
+      for (const name of await readdir(`/proc/self/fd/${directory.fd}`)) {
+        const relativePath = prefix === "" ? name : `${prefix}/${name}`;
+        // Only the root manifest is a known file. The same name deeper in the
+        // tree is an unexpected entry, not something to skip.
+        if (prefix === "" && name === MANIFEST && options.manifestBytes !== undefined) {
+          const bytes = await this.readEntry(directory, name, { maxBytes: MAX_MANIFEST_BYTES });
+          if (!bytes.equals(options.manifestBytes)) throw corruptFile();
+          manifestSeen = true;
+          continue;
+        }
+        if (directories.has(relativePath)) {
+          const child = await this.openChildDirectory(directory, name);
+          try {
+            await walk(child, relativePath);
+          } finally {
+            await child.close().catch(() => undefined);
+          }
+          continue;
+        }
+        const file = expected.get(relativePath);
+        // Anything the manifest does not name — an extra file, a link, a FIFO,
+        // a device — is refused at its name.
+        if (file === undefined) throw corruptFile();
+        const bytes = await this.readEntry(directory, name, { exact: file.size });
+        if (digestBytes(bytes) !== file.sha256) throw corruptFile();
+        present.add(relativePath);
+        if (options.collect) contents.set(relativePath, bytes);
+      }
+    };
+    try {
+      await walk(this.directory, "");
+    } catch (error) {
+      if (error instanceof ScienceFlowInputBundleError) throw error;
+      throw corruptFile();
+    }
+    if (options.manifestBytes !== undefined && !manifestSeen) throw corruptFile();
+    for (const path of expected.keys()) {
+      if (!present.has(path)) throw corruptFile();
+    }
+    return contents;
+  }
+
+  /** Open one child directory of a held descriptor, refusing links. */
+  private async openChildDirectory(directory: FileHandle, name: string): Promise<FileHandle> {
+    let child: FileHandle;
+    try {
+      child = await open(
+        `/proc/self/fd/${directory.fd}/${name}`,
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+      );
+    } catch {
+      throw corruptFile();
+    }
+    try {
+      if (!(await child.stat()).isDirectory()) throw corruptFile();
+      return child;
+    } catch (error) {
+      await child.close().catch(() => undefined);
+      throw error instanceof ScienceFlowInputBundleError ? error : corruptFile();
+    }
+  }
+
+  /** Read one named entry of a held descriptor under its bound. */
+  private async readEntry(directory: FileHandle, name: string, bound: ReadBound): Promise<Buffer> {
+    let handle: FileHandle;
+    try {
+      handle = await open(
+        `/proc/self/fd/${directory.fd}/${name}`,
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      );
+    } catch {
+      throw corruptFile();
+    }
+    try {
+      const info = await handle.stat();
+      if (!info.isFile() || info.nlink !== 1) throw corruptFile();
+      const limit = "exact" in bound ? bound.exact : bound.maxBytes;
+      if (info.size > limit) throw corruptFile();
+      if ("exact" in bound && info.size !== bound.exact) throw corruptFile();
+      const bytes = await readHandleBounded(handle, limit);
+      if ("exact" in bound && bytes.length !== bound.exact) throw corruptFile();
+      return bytes;
+    } finally {
+      await handle.close().catch(() => undefined);
     }
   }
 

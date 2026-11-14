@@ -53,8 +53,8 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { constants as FS } from "node:fs";
-import { lstat, mkdir, open, rename, rm, unlink, writeFile, type FileHandle } from "node:fs/promises";
-import { dirname, resolve, sep } from "node:path";
+import { lstat, mkdir, open, realpath, rename, rm, stat, unlink, writeFile, type FileHandle } from "node:fs/promises";
+import { basename, dirname, resolve, sep } from "node:path";
 
 import {
   canonicalScienceFlowInputBundleManifest,
@@ -347,6 +347,138 @@ export function researchStateRoot(dataDir: string, executionId: string): string 
 export function researchInputRoot(dataDir: string, executionId: string): string {
   const digest = createHash("sha256").update(`research-inputs\n${executionId}`, "utf8").digest("hex");
   return resolve(dataDir, INPUT_STATE_DIRECTORY, digest.slice(0, 32));
+}
+
+/** One directory identity, as the filesystem itself reports it. */
+interface HostDirectoryIdentity {
+  readonly dev: bigint;
+  readonly ino: bigint;
+}
+
+/** A path's ancestors, plus whether the path itself exists. */
+interface HostPathChain {
+  readonly exists: boolean;
+  /**
+   * The path with every existing component resolved and every missing one
+   * appended: two spellings of one future location compare equal even when
+   * neither exists yet.
+   */
+  readonly canonical: string;
+  readonly identities: readonly HostDirectoryIdentity[];
+}
+
+/**
+ * Resolve a path and every existing ancestor, following links once.
+ *
+ * A path that does not exist yet is anchored at its deepest existing ancestor:
+ * that chain still names every directory the future path would live in.
+ * Identities are device and inode numbers rather than strings, so a symlink or
+ * a bind mount naming the same directory compares equal. `undefined` means the
+ * question could not be answered, which callers treat as an overlap.
+ */
+async function hostPathChain(path: string): Promise<HostPathChain | undefined> {
+  let candidate = path;
+  let resolved: string | undefined;
+  const missing: string[] = [];
+  let exists = true;
+  for (;;) {
+    try {
+      resolved = await realpath(candidate);
+      break;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") return undefined;
+      // Only the first failure is about the requested path; its ancestors are
+      // being probed, so they do not make the requested path exist.
+      if (candidate === path) exists = false;
+      const parent = dirname(candidate);
+      if (parent === candidate) {
+        // Nothing on this path resolves: the root itself is unreadable.
+        return undefined;
+      }
+      missing.unshift(basename(candidate));
+      candidate = parent;
+    }
+  }
+  const identities: HostDirectoryIdentity[] = [];
+  for (let cursor = resolved; ; cursor = dirname(cursor)) {
+    let info: Awaited<ReturnType<typeof stat>>;
+    try {
+      info = await stat(cursor, { bigint: true });
+    } catch {
+      return undefined;
+    }
+    if (!info.isDirectory()) return undefined;
+    identities.push({ dev: info.dev, ino: info.ino });
+    if (dirname(cursor) === cursor) break;
+  }
+  return {
+    canonical: missing.length === 0 ? resolved : resolve(resolved, ...missing),
+    exists,
+    identities,
+  };
+}
+
+function sameDirectory(left: HostDirectoryIdentity, right: HostDirectoryIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+/** True when `descendant` is `ancestor` itself or lives below it. */
+function pathWithin(ancestor: string, descendant: string): boolean {
+  return descendant === ancestor || descendant.startsWith(`${ancestor}${sep}`);
+}
+
+/**
+ * True when one host path is at or below the other, through links and mounts.
+ *
+ * Existing directories are compared by device and inode, so a symlink or a
+ * bind mount naming the same directory is caught. A path that does not exist
+ * yet is compared by its canonical future spelling, so a request naming the
+ * copy root before the Runner creates it is still an overlap. A shared ancestor
+ * such as `/` is not. `undefined` withholds an answer when a path cannot be
+ * resolved, which callers treat as an overlap.
+ */
+async function hostPathsOverlap(left: string, right: string): Promise<boolean | undefined> {
+  const leftChain = await hostPathChain(left);
+  const rightChain = await hostPathChain(right);
+  if (leftChain === undefined || rightChain === undefined) return undefined;
+  const leftIdentity = leftChain.identities[0];
+  const rightIdentity = rightChain.identities[0];
+  if (leftIdentity === undefined || rightIdentity === undefined) return undefined;
+  if (rightChain.exists && leftChain.identities.some((entry) => sameDirectory(entry, rightIdentity))) {
+    return true;
+  }
+  if (leftChain.exists && rightChain.identities.some((entry) => sameDirectory(entry, leftIdentity))) {
+    return true;
+  }
+  return pathWithin(rightChain.canonical, leftChain.canonical)
+    || pathWithin(leftChain.canonical, rightChain.canonical);
+}
+
+/**
+ * Refuse a launch whose writable binds would expose the verified input bytes a
+ * second time.
+ *
+ * `--ro-bind /research-inputs` only removes writability through that mount
+ * point. A workspace or control bind that covers the same host directory still
+ * gives the workload a second, writable name for the same inode, and the
+ * workload runs as the owning account, so it can chmod the copy back. Neither
+ * a string comparison of requested paths nor file modes answer this: the
+ * comparison is by the filesystem's own directory identities, so a symlinked or
+ * bind-mounted alias compares equal, and a path that cannot be resolved is a
+ * refusal rather than an assumption.
+ */
+async function assertInputLocationsPrivate(
+  protectedPaths: readonly string[],
+  writableHostRoots: readonly string[],
+): Promise<void> {
+  for (const protectedPath of protectedPaths) {
+    for (const writable of writableHostRoots) {
+      if (await hostPathsOverlap(protectedPath, writable) !== false) {
+        throw new ResearchRunError("RESEARCH_INPUT_COPY_FAILED");
+      }
+    }
+  }
 }
 
 /** The fixed base this workload runs in. It manages no packages. */
@@ -724,7 +856,11 @@ export interface ResearchRunWiring {
    * request field can substitute another source, and a wiring without one
    * refuses an input-bound execution before spawn.
    */
-  readonly inputBundles?: { snapshot(bundleDigest: string): Promise<ScienceFlowInputSnapshot> };
+  readonly inputBundles?: {
+    snapshot(bundleDigest: string): Promise<ScienceFlowInputSnapshot>;
+    /** Host roots this store owns, so a launcher can prove no writable bind covers them. */
+    hostRoots(): readonly string[];
+  };
   /**
    * Test-only host runtime for fixtures that do not lease a managed
    * environment. Production never sets it: the run then records this fixture
@@ -792,11 +928,14 @@ interface PreparedResearchInputs {
  * exclusive staging directory, re-verified against the canonical manifest, and
  * published with one rename; a half-written tree is never mountable. A leftover
  * copy from an earlier attempt at the same execution id is neither reused nor
- * repaired: it is a fixed refusal.
+ * repaired: it is a fixed refusal. Before any of that, the location itself must
+ * be private: a writable bind that covers the copy or the shared cache would
+ * undo the read-only mount, so it is refused before anything is created.
  */
 async function prepareResearchInputs(
   wiring: ResearchRunWiring,
   request: ResearchRunRequest,
+  writableHostRoots: readonly string[],
 ): Promise<PreparedResearchInputs> {
   const inputs = request.inputs;
   if (inputs === undefined) throw new ResearchRunError("RESEARCH_INPUT_REQUIRED");
@@ -821,6 +960,12 @@ async function prepareResearchInputs(
 
   const parent = resolve(wiring.config.dataDir, INPUT_STATE_DIRECTORY);
   const root = researchInputRoot(wiring.config.dataDir, request.executionId);
+  // Nothing Runner-owned may sit where this launch will bind a writable host
+  // directory: the copy root, its staging parent and the shared cache have to
+  // be disjoint from every writable bind source, including through links and
+  // mount aliases. This runs before anything is created, so a refusal leaves
+  // no partial copy behind.
+  await assertInputLocationsPrivate([parent, root, ...store.hostRoots()], writableHostRoots);
   await mkdir(parent, { recursive: true, mode: 0o700 })
     .catch(() => { throw new ResearchRunError("RESEARCH_INPUT_COPY_FAILED"); });
   // The private root is Runner-owned: a link, a non-directory, or a directory
@@ -1341,7 +1486,10 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
   // launched once these bytes are the ones that were checked.
   let inputs: PreparedResearchInputs;
   try {
-    inputs = await prepareResearchInputs(wiring, request);
+    // The only writable host sources this launch will bind are the workspace
+    // root and the control directory; both are checked against every
+    // Runner-owned input location before the copy is materialized.
+    inputs = await prepareResearchInputs(wiring, request, [request.workspaceRoot, channel.hostPath]);
   } catch (error) {
     const code = error instanceof ResearchRunError ? error.code : "RESEARCH_INPUT_UNAVAILABLE";
     return {
