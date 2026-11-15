@@ -630,6 +630,16 @@ the next operator in the same kernel. A future run with this package compares
 narrower than the plan's wording. The operator did not rewrite the kernel to
 close that gap; that decision belongs to the Agent.
 
+A formal comparison also needs more than this package as it stands. Each
+command started from the artifact the previous one left, so a later arm's higher
+score cannot be attributed to the operator; an arm comparison needs both arms to
+start from the same fixed artifact, with equal per-command budget, equal command
+counts and one logging rule. And the Agent has to decide whether the hypothesis
+is still the planned polish-only comparison or is explicitly narrowed to an
+ablation of the evict draw inside the existing mixed kernel. Until that decision
+and those controls exist, `seed-d`'s gate and runner are reusable infrastructure,
+not a completed controlled experiment.
+
 ## 11. What this pilot does not claim
 
 - No Runner gateway, sandbox or `canStart` change. `canStart` stays `false` and
