@@ -477,32 +477,37 @@ distinct evictee per command, at the same allowance, with validity checked first
 and support only when Arm B's best exceeds Arm A's and the incumbent by a stated
 margin.
 
-### 10.2 The two bounded runs
+### 10.2 The bounded runs
 
 The seed was materialized from the store's CAS by digest, not retyped: the
 incumbent bytes (`ec060f2f…`, 1655 bytes), the plan bytes (`7159960e…`, 4400
 bytes), the engine's own evaluation of those incumbent bytes from the previous
 run, the model-written solver from that run, and the operator submission helper.
 A manifest records every seed file's digest. The corrected run's seed also
-carries the kernel the previous round-22 run wrote, with its source run named.
+carries the kernel the first round-22 run wrote, with its source run named, and
+the third run's seed fixes the arm order and forbids nested multiprocessing.
 
 | Run | Allowance outcome | Captured stages | Selected best |
 | --- | --- | --- | --- |
 | `round22-circle-packing-a` | `completed`, 880.8 s, research finished | S01 2.631640653898, S02 2.6325585398458324, S03 2.6329437164770155, S04 2.633134264465223 | S04 (`178312f7…`), +0.009159 over the seed |
 | `round22-circle-packing-b` | `completed`, 844.7 s, research finished | S01 2.6239750175348147 (the seed reproduced) | S01 = the seed, no new candidate |
+| `round22-circle-packing-c` | `failed` after 60.3 s: the provider returned reasoning without an answer or tool call (`UnusableResponseError`) | none committed (S01 was evaluated but the run failed before the ledger row) | none |
 
 Run A's researcher read the plan at t+5 s and wrote its own solver family; its
 solvers include the eviction operator, but mixed with multistart, global passes
 and other escape moves, and its first captured stage was already a new candidate,
 so the plan's Arm A baseline was never captured. Run B reproduced the seed as
 S01, then wrote its own solver files; its first long search command was cut with
-about 20 s left in the research budget, and no changed artifact was scored.
+about 20 s left in the research budget, and no changed artifact was scored. Run C
+followed the fixed sequence at first — it copied the seed and the engine evaluated
+it as S01 — but the eighth provider turn ended the worker before any arm command
+committed a stage.
 
-Both are recorded with their deviations rather than smoothed: the model used
-nested `multiprocessing` pools inside its own commands (for example 15 workers),
-which exceeds the operator's single-engine-worker allowance in spirit though not
-the engine's evaluation; neither run was stopped by the 900 s allowance; and the
-plan's controlled comparison was not carried out in either run.
+All three are recorded with their deviations rather than smoothed: the model used
+nested `multiprocessing` pools inside its own commands in runs A and B (for
+example 15 workers), which exceeds the operator's single-engine-worker allowance
+in spirit though not the engine's evaluation; none was stopped by the 900 s
+allowance; and the plan's controlled comparison was not carried out in any run.
 
 ### 10.3 Delivery with the plan, the incumbent and every attempt
 
@@ -560,7 +565,7 @@ answer is attributed to them.
 ### 10.5 What round 22 establishes, and what it does not
 
 Established in this isolated operator scope: a real Agent authored plan is a
-fixed Session artifact; the same persisted Session's SD-selected model drove two
+fixed Session artifact; the same persisted Session's SD-selected model drove three
 managed runs from the exact incumbent and plan bytes; the plan reached the
 researcher's context and tool use; four new candidates were engine-evaluated in
 run A; every captured stage is separately delivered with its digest and role; run
@@ -571,9 +576,12 @@ verdict.
 Not established: the plan's controlled comparison. No run executed Arm A versus
 Arm B at equal allowance with arm labels, so the hypothesis is not tested as
 designed, and a higher score unrelated to that comparison is not treated as
-support. This document does not claim statistical significance, a benchmark
-campaign, a public research start, a HTTP/browser/Runner journey, or isolation of
-hostile code.
+support. The third run was set up to do exactly that — seed first, two Arm A
+commands, six Arm B commands, one process, a trial log — but an unusable provider
+response ended the worker after the seed was evaluated and before any arm command
+committed a stage. This document does not claim statistical significance, a
+benchmark campaign, a public research start, a HTTP/browser/Runner journey, or
+isolation of hostile code.
 
 ## 11. What this pilot does not claim
 
@@ -638,7 +646,7 @@ Round 22 evidence lives under the ignored `.tmp/r/round22/` directory: `store/`
 is a consistent isolated copy of the round-21 store (same Project, Session,
 model and prior artifact identities), `evidence/agent-run-*.json` hold the two
 planning/interpretation conversations and the two capped ones, `evidence/delivery-*.json`
-are the delivery records, `seed/` and `seed-b/` are the two seeds with their
+are the delivery records, `seed/`, `seed-b/` and `seed-c/` are the seeds with their
 manifests, `evidence/execution-summary-*.json` and
 `evidence/interpretation-artifact.json` are the published supporting artifacts'
 metadata, `evidence/run-a-attempt-correction.json` records the role correction,
