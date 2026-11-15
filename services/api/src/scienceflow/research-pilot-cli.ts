@@ -352,6 +352,7 @@ async function main(): Promise<number> {
     readerScriptPath: options.readerScriptPath,
     seedDir: options.seedDir,
     ...(options.task ? { task: options.task } : {}),
+    ...(options.taskDescription ? { taskDescription: options.taskDescription } : {}),
     ...(options.researchBudgetSec !== undefined ? { researchBudgetSec: options.researchBudgetSec } : {}),
     ...(options.reportBudgetSec !== undefined ? { reportBudgetSec: options.reportBudgetSec } : {}),
     ...(options.totalAllowanceSec !== undefined ? { totalAllowanceSec: options.totalAllowanceSec } : {}),
