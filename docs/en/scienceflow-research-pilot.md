@@ -481,6 +481,24 @@ distinct evictee per command, at the same allowance, with validity checked first
 and support only when Arm B's best exceeds Arm A's and the incumbent by a stated
 margin.
 
+After the review and the offline precheck, a second planning conversation
+(run `3d9b8663-085e-4944-becf-d7944821cd81`, `completed`, 254.6 s) revised the
+plan. The prompt gave the four runs' outcomes, the precheck's finding that the
+frozen kernel has no polish-only arm, and the executable envelope (one worker, at
+most eight searches, one fixed start, an arm runner). The Agent chose to narrow
+the experiment explicitly to an **operator-routing ablation** inside the mixed
+kernel: the eviction draw routed to `evict → re-jam → regrow` (ARM=B) versus the
+same draw falling through to the kernel's next operator (ARM=A); it stated that
+this does not test the polish-only hypothesis. The revision specifies four
+searches per arm at 45 s with paired seeds 101–104, the same fixed start, one
+submit per arm, a reset between arms, validity first, and support only if
+`B_best − A_best ≥ 0.0005` and `B_i ≥ A_i` on at least three of the four pairs.
+Both of its `read_artifact` calls failed because it passed the version id where a
+numeric version is required; the answer says so, and the plan rests on the
+operator's summary. It is recorded unchanged as version 2 of
+`scienceflow/round22/experiment-plan.md` (`34ccf482…`, 2,439 bytes, sha256
+`a6e3d3e4…`), with the version-1 plan and the prior interpretation as inputs.
+
 ### 10.2 The bounded runs
 
 The seed was materialized from the store's CAS by digest, not retyped: the
@@ -489,7 +507,11 @@ bytes), the engine's own evaluation of those incumbent bytes from the previous
 run, the model-written solver from that run, and the operator submission helper.
 A manifest records every seed file's digest. The corrected run's seed also
 carries the kernel the first round-22 run wrote, with its source run named, and
-the third run's seed fixes the arm order and forbids nested multiprocessing.
+the third run's seed fixes the arm order and forbids nested multiprocessing. The
+revised package `seed-e` carries plan version 2 (`a6e3d3e4…`), the same frozen
+kernel with the one-line gate, a runner with `search` and `submit` modes, the
+same incumbent bytes as `start_solution.json`, and the eight paired commands
+from the revised plan.
 
 | Run | Allowance outcome | Captured stages | Selected best |
 | --- | --- | --- | --- |
@@ -497,6 +519,7 @@ the third run's seed fixes the arm order and forbids nested multiprocessing.
 | `round22-circle-packing-b` | `completed`, 844.7 s, research finished | S01 2.6239750175348147 (the seed reproduced) | S01 = the seed, no new candidate |
 | `round22-circle-packing-c` | `failed` after 60.3 s: the provider returned reasoning without an answer or tool call (`UnusableResponseError`) | none committed (S01 was evaluated but the run failed before the ledger row) | none |
 | `round22-circle-packing-d` | `completed`, 875.0 s, research finished | S01 2.6239750175348147 (the seed reproduced) | S01 = the seed, no new candidate |
+| `round22-circle-packing-e` | `stopped` at the operator's 900 s allowance, 910.3 s; research stopped, report ready | S01 2.6239750175348147 (the seed reproduced) | S01 = the seed, no arm candidate |
 
 Run A's researcher read the plan at t+5 s and wrote its own solver family; its
 solvers include the eviction operator, but mixed with multistart, global passes
@@ -506,13 +529,21 @@ S01, then wrote its own solver files; its first long search command was cut with
 about 20 s left in the research budget, and no changed artifact was scored. Run C
 followed the fixed sequence at first — it copied the seed and the engine evaluated
 it as S01 — but the eighth provider turn ended the worker before any arm command
-committed a stage.
+committed a stage. Run D reproduced the seed, then rewrote its own solver and
+never ran an arm command. Run E, after the revised plan, did the reconnaissance
+and copied the seed (S01), but then copied `solver3.py` into the workspace root
+and started it in the background at 600 s with 15 workers, wrote a new
+`solver4.py`, and started that in the background too. It never called
+`run_arm.py`, wrote no trial log, and submitted no arm result; the engine stopped
+it at the operator allowance with only S01 captured. The workspace artifact
+changed after that stage but was never evaluated, so it is not counted.
 
-All three are recorded with their deviations rather than smoothed: the model used
-nested `multiprocessing` pools inside its own commands in runs A and B (for
-example 15 workers), which exceeds the operator's single-engine-worker allowance
-in spirit though not the engine's evaluation; none was stopped by the 900 s
-allowance; and the plan's controlled comparison was not carried out in any run.
+All four later runs are recorded with their deviations rather than smoothed: the
+model used nested `multiprocessing` pools inside its own commands (for example 15
+workers) and background processes, which exceeds the operator's single
+engine-worker allowance in spirit though not the engine's evaluation; runs A–D
+were not stopped by the 900 s allowance, while run E was; and neither the planned
+comparison nor the revised ablation was carried out.
 
 ### 10.3 Delivery with the plan, the incumbent and every attempt
 
@@ -541,16 +572,21 @@ evaluated stages. Run A delivered its solution
 (version `9b53b2e8…`), a note (version `25bddde3…`), and attempts `d49bc970…`
 (S01 `first_captured`), `b35803f0…` (S02), `2f6f1fa3…` (S03). Run B delivered the
 seed bytes as its selected solution (version `e181e53c…`), a note (`b34869ef…`)
-and S01 as the selected carried seed. One correction is in the record: delivery
-v1 labelled run A's S01 as the carried seed from the old parent-only rule; that
-attempt artifact was marked deleted and the stage republished with the corrected
-role, and the correction file keeps the reason.
+and S01 as the selected carried seed. Run E delivered the seed bytes as the
+selected solution (`dc0b30ed…` / version `5c79b5ab…`), a note (`15c88be2…` /
+version `21d88195…`) linking plan version 2, and S01 as the selected carried
+seed; there was no arm stage to publish. One correction is in the record:
+delivery v1 labelled run A's S01 as the carried seed from the old parent-only
+rule; that attempt artifact was marked deleted and the stage republished with
+the corrected role, and the correction file keeps the reason.
 
 An operator-extracted execution summary (from the engine's per-stage tool logs,
 the worker's main log and the workspace files) is published per run as an
 ordinary artifact, so the interpretation can see what actually ran without
 exposing host paths. Two incomplete summary versions were corrected; the final
-versions are `89e818af…` (run A) and `bbd2394d…` (run B).
+versions are `89e818af…` (run A), `bbd2394d…` (run B) and `9387b8da…` (run E),
+whose summary quotes the backgrounded `solver3.py 600 15 5000` and the new
+`solver4.py`.
 
 ### 10.4 The interpretation and its verdict
 
@@ -577,25 +613,42 @@ version 2 text names the run that produced it. Two conversations that reached th
 (`dc090802…`, `613404f6…`) are recorded as `interrupted` with the reason; no
 answer is attributed to them.
 
+After run E, one more authorized conversation (run
+`e99478d9-4949-45b1-bb7f-c719aacd2f3e`, 152.3 s, three successful artifact reads)
+compared plan version 2, run E's note and run E's execution summary. Its verdict
+is again **unresolved**: `run_arm.py` was never called, there were zero searches,
+zero submits and no trial log; the only plan step performed was copying the seed;
+the selected best is the unchanged seed; and the backgrounded solver runs were
+never scored. It proposes one next action — have the harness pre-execute the
+reset, the eight searches and the two submits as one bounded script before the
+first model turn — and explicitly says that this requires the researcher to
+execute the plan, not merely to receive it. The answer is version 3 of
+`scienceflow/round22/experiment-interpretation.md` (`f3eaebfd…`, 2,284 bytes),
+with plan version 2, the run E note and the run E summary as inputs.
+
 ### 10.5 What round 22 establishes, and what it does not
 
 Established in this isolated operator scope: a real Agent authored plan is a
-fixed Session artifact; the same persisted Session's SD-selected model drove three
-managed runs from the exact incumbent and plan bytes; the plan reached the
-researcher's context and tool use; four new candidates were engine-evaluated in
-run A; every captured stage is separately delivered with its digest and role; run
-B's selected best is the seed and its null result is published rather than hidden;
-and a real follow-up Agent read the evidence and gave an explicitly unresolved
-verdict.
+fixed Session artifact, and after the review it authored a revised, narrower plan
+as version 2; the same persisted Session's SD-selected model drove five managed
+runs from the exact incumbent and plan bytes; the plan reached the researcher's
+context and tool use; four new candidates were engine-evaluated in run A; every
+captured stage is separately delivered with its digest and role; run B's and run
+E's selected best is the seed and their null results are published rather than
+hidden; and real follow-up Agents read the evidence and gave explicitly
+unresolved verdicts, the last one against the revised ablation.
 
-Not established: the plan's controlled comparison. No run executed Arm A versus
-Arm B at equal allowance with arm labels, so the hypothesis is not tested as
-designed, and a higher score unrelated to that comparison is not treated as
-support. The third run was set up to do exactly that — seed first, two Arm A
-commands, six Arm B commands, one process, a trial log — but an unusable provider
-response ended the worker after the seed was evaluated and before any arm command
-committed a stage; the authorized fourth run reproduced the seed and then rewrote
-its own solver instead of running the arms. This document does not claim statistical significance, a
+Not established: the plan's controlled comparison and its revised ablation. No
+run executed Arm A versus Arm B at equal allowance with arm labels, so neither the
+original hypothesis nor the narrowed routing ablation is tested, and a higher
+score unrelated to that comparison is not treated as support. The third run was
+set up to do exactly that — seed first, two Arm A commands, six Arm B commands,
+one process, a trial log — but an unusable provider response ended the worker
+after the seed was evaluated and before any arm command committed a stage; the
+authorized fourth run reproduced the seed and then rewrote its own solver instead
+of running the arms. The fifth run received the revised plan and the paired
+runner, copied the seed, and then backgrounded its own `solver3.py` and a new
+`solver4.py` without calling the runner. This document does not claim statistical significance, a
 benchmark campaign, a public research start, a HTTP/browser/Runner journey, or
 isolation of hostile code.
 
@@ -639,6 +692,17 @@ is still the planned polish-only comparison or is explicitly narrowed to an
 ablation of the evict draw inside the existing mixed kernel. Until that decision
 and those controls exist, `seed-d`'s gate and runner are reusable infrastructure,
 not a completed controlled experiment.
+
+After the Agent narrowed the plan to the routing ablation (10.1), a second
+offline precheck (`seed-e`) exercised the paired sequence: four searches per arm
+at a 5 s budget from the same fixed start, one submit per arm and a reset. All
+15 checks passed: eight searches exited 0 with valid candidates, each appended
+exactly one trial row, each used at most one descendant process, the eight
+candidates were computed independently, each submit chose its arm's best, and
+the reset restored the first stage's digest. This is still mechanics only: the
+short-budget scores are not evidence, and the paired comparison has never been
+executed in an engine run. Run E received this package and did not call the
+runner at all (10.2).
 
 ## 11. What this pilot does not claim
 
@@ -701,19 +765,21 @@ that drove the conversation.
 
 Round 22 evidence lives under the ignored `.tmp/r/round22/` directory: `store/`
 is a consistent isolated copy of the round-21 store (same Project, Session,
-model and prior artifact identities), `evidence/agent-run-*.json` hold the two
-planning/interpretation conversations and the two capped ones,
-`evidence/planning-context-provenance.json` records the planning run's own tool
-calls and the predecessor turn's artifact reads, `evidence/delivery-*.json`
-are the delivery records, `seed/`, `seed-b/` and `seed-c/` are the seeds with their
-manifests, `evidence/execution-summary-*.json` and
-`evidence/interpretation-artifact.json` are the published supporting artifacts'
-metadata, `evidence/run-a-attempt-correction.json` records the role correction,
-`evidence/verification.json` re-derives the chain's 37 invariants from the
-store, CAS and records; `evidence/agent-run-5.json` is the run D interpretation
-conversation and `evidence/interpretation-artifact-v2.json` its published
-metadata. The precheck adds `seed-d/` with `evidence/seed-d-manifest.json`,
-`evidence/precheck-results.json` and the ignored `precheck/` workspace. The
-engine's own task state is under
-`pilot/runs/<run>/circle-packing/`, and the private generated model inputs stay
-outside the repository in a 0700 directory.
+model and prior artifact identities), `evidence/agent-run-*.json` hold the
+planning and interpretation conversations, including the revised-plan run
+(`agent-run-7.json`) and the capped attempt (`agent-run-6.json`, marked
+`interrupted`), `evidence/planning-context-provenance.json` records the planning
+run's own tool calls and the predecessor turn's artifact reads,
+`evidence/delivery-*.json` are the delivery records, `seed/`, `seed-b/`,
+`seed-c/`, `seed-d/` and `seed-e/` are the seeds with their manifests,
+`evidence/execution-summary-*.json` and `evidence/interpretation-artifact*.json`
+are the published supporting artifacts' metadata,
+`evidence/run-a-attempt-correction.json` records the role correction,
+`evidence/plan-v2-artifact.json` and `evidence/interpretation-artifact-v3.json`
+identify the revised plan and the run E interpretation, and
+`evidence/verification.json` re-derives the chain's 47 invariants from the store,
+CAS and records. The prechecks add `seed-d`/`seed-e` manifests,
+`evidence/precheck-results.json`, `evidence/precheck-e-results.json` and the
+ignored `precheck/` and `precheck-e/` workspaces. The engine's own task state is
+under `pilot/runs/<run>/circle-packing/`, and the private generated model inputs
+stay outside the repository in a 0700 directory.
