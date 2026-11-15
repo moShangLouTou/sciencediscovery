@@ -762,7 +762,181 @@ same frozen kernel and runner. Run H is the first run that followed the sequence
 end to end; the option is execution input, not a research decision, and the plan
 artifact remains the Agent's.
 
-## 11. What this pilot does not claim
+## 11. Round 23: starting and finishing research from a normal Session
+
+Rounds 19–22 exercised the engine and delivered its result into a Session, but an
+operator still ran the engine. Round 23 closes that last join: in an explicitly
+enabled **experimental local research mode**, the Session's own Agent starts,
+observes and stops one bounded ScienceFlow managed run with ordinary tools, and
+the terminal result becomes ordinary Session artifacts automatically. No operator
+command sits between the user's request and the answer.
+
+This is a product connection, not a new scientific result. It does not change the
+formal Runner execution plan: `canStart` stays `false`, the five public-start
+blockers stay in place, and nothing here is the unimplemented sandbox/no-bypass
+gateway.
+
+### 11.1 Enabling the mode
+
+One environment variable names an administrator JSON file:
+`SCIENCE_AGENT_SCIENCEFLOW_LOCAL_RESEARCH_CONFIG_PATH`. Unset, blank, or
+`"enabled": false` leaves the mode off and reads no profile: no research tool is
+exposed and no engine process can be started from a conversation. The file is
+loaded once at server construction, so a change needs a restart.
+
+```json
+{
+  "schemaVersion": 1,
+  "enabled": true,
+  "research": {
+    "profileId": "round23-local",
+    "engineCheckout": "/abs/pinned/scienceflow",
+    "pythonExecutable": "/abs/interpreter/python",
+    "readerScriptPath": "/abs/services/scienceflow-reader/snapshot.py",
+    "task": "circle-packing",
+    "seedDir": "/abs/task-owned/seed",
+    "workRoot": "/abs/task-owned/research",
+    "privateRoot": "/abs/private-0700",
+    "taskDescriptionPath": "/abs/task-owned/task.txt",
+    "refusePackageInstall": true
+  },
+  "defaults": {
+    "researchBudgetSec": 300,
+    "reportBudgetSec": 60,
+    "totalAllowanceSec": 420,
+    "maxSteps": 24,
+    "stageCaptureMax": 3,
+    "bashTimeoutSec": 60,
+    "codeMaxTokens": 8192,
+    "feedbackMaxTokens": 4096,
+    "httpTimeoutSec": 60,
+    "observeMaxWaitMs": 120000
+  }
+}
+```
+
+Every path is absolute and comes only from the administrator. The private root
+must lie outside the work root and the seed directory; the work root and the seed
+directory must not overlap. The pinned task text is read from the configured file
+at load (at most 32 KiB), so the conversation cannot supply commands, an
+interpreter, a model, an endpoint or a credential. One profile names one engine
+task package; there is no task discovery or arbitrary package upload.
+
+Enabling the mode is deployment configuration, not an authorization decision: a
+start still asks the Session's governed permission under action `code` for
+resource `scienceflow:local-research`. For an isolated demonstration, install one
+narrow Session-scope grant for exactly that resource; do not switch the Session to
+`always_allow`, and do not bypass the permission request.
+
+### 11.2 The conversation surface
+
+| Tool | Parameters | Behaviour |
+| --- | --- | --- |
+| `start_research` | `intent`, optional `plan_version_id`, `incumbent_version_id` | Resolves identity, write gate, the Session's effective model and the linked versions; persists one operation and returns its id at once. The engine run continues in the background. |
+| `get_research` | optional `operation_id`, `wait_seconds`, `action` | Reports the engine's real lifecycle, evaluated stages, delivery state and artifact version references. The wait is bounded and pauses the Agent's idle clock. `action: retry_delivery` republishes an ended run without rerunning it. |
+| `stop_research` | optional `operation_id` | Requests the engine's own stop for this operation and reports requested versus confirmed termination. |
+
+The model supplies business identities and research intent only. The view it
+receives carries no host path, interpreter, engine checkout, endpoint or
+credential; the operation record keeps those for the service.
+
+### 11.3 One accepted start is one operation
+
+A row in `science_flow_local_research_operations` (the same `catalog.sqlite` as
+the other ScienceFlow control-plane records) holds the operation id, the
+conversation run that owns it, the frozen engine identity, the latest observed
+state and the delivery outcome. The idempotency key is a hash of the Project, the
+Session, the owning conversation run, the intent and the linked versions:
+
+- replaying the same accepted start — a tool retry, a provider replay or a
+  reconnect — attaches to the same operation and launches nothing;
+- a second start in the same conversation run while the first is still live also
+  attaches, so one stop action owns one experiment;
+- a later user message is a different conversation run, so the same intent is a
+  new experiment with a new operation.
+
+### 11.4 Stop, repeated stop and conversation cancellation
+
+A stop goes through the engine's own `stop_run(run_id, timeout)` on exactly the
+recorded run id. The operation records `requestedAt` immediately and `confirmedAt`
+only when the engine's record reports a terminal state, so a requested stop is
+never presented as confirmed termination. Repeating it is safe. Cancelling the
+conversation (`cancelSessionRun`, including the current-run route) asks the
+research service to stop that conversation run's owned, non-terminal operation;
+it does not broad-kill another run, another Session or an unrelated process.
+
+### 11.5 Automatic delivery and a rebuilt service
+
+When the engine reaches a terminal outcome the background worker performs the
+existing registration, reader and delivery steps for the originating Session:
+the selected stage becomes `scienceflow/<run>/best-solution.json`, every captured
+stage becomes its own attempt artifact, the plan and incumbent versions are linked,
+and a factual result note is published. The note names this deployment's
+experimental local mode as the starter rather than claiming an external run.
+
+The researcher's own `trial_log.tsv` and `submit_log.tsv` are copied unchanged
+from the run workspace as `scienceflow/<run>/researcher/*.tsv`, so the Session can
+see which commands actually ran instead of inferring them from the stage chain.
+A missing record is reported `unresolved`; it is never fabricated and never fails
+the delivery.
+
+Delivery state is separate from research state. A failed publication is visible
+(`delivery.state = "failed"` plus a stable reason) and `get_research` with
+`action: retry_delivery` republishes without rerunning the experiment; an already
+published result keeps its versions, and unchanged bytes reuse their version.
+
+The operation record is enough for a rebuilt service to observe the same run: the
+engine record, stage ledger and receipt are read again, never relaunched. A run
+whose launcher outcome is unknown stays `unknown` until an engine record
+reconciles it; it is never automatically resumed or retried.
+
+### 11.6 What the round-23 journeys did
+
+The journeys used the persisted round-22 Session (model `Qwen3.8-Flash` through the
+configured gateway), the revised plan version `34ccf482…`, the fixed incumbent
+version `5c79b5ab…` (the seed bytes, digest `ec060f2f…`), and the same frozen
+kernel/runner seed. One narrow Session grant for `scienceflow:local-research` was
+installed first; the approval mode was not changed.
+
+**Start, run and automatic delivery.** A normal user message asked the Agent to
+run the configured experiment. The Agent called `start_research` with the linked
+plan and incumbent versions; the service created one operation and engine run
+`sd-research-03124a9e-2df`. The Agent observed it with bounded `get_research`
+waits. The engine captured three stages, all evaluated `ok`, valid and
+gate-accepted: S01 the carried seed `2.6239750175348147`, S02 `2.624001926632221`
+(the Arm A submit) and S03 `2.6240289620648882` (the Arm B submit). The
+researcher's delivered `trial_log.tsv` has all eight arm-labelled searches valid
+with exit 0 at seeds 101–104 (about 7 s each, this run's stated 10 s bound), and
+`submit_log.tsv` records `A_3` and `B_3`. The run ended `stopped` at the 420 s
+allowance with its report ready; in the same process the worker registered the run
+and published the solution, the note, both attempts and the two researcher logs as
+ordinary Session artifacts.
+
+**The Agent answered from the delivered artifacts.** After the run ended the
+Agent read the result note, both researcher logs, plan v2 and the selected
+solution with `read_artifact`, then reported: `B_best − A_best = 2.7035e-5`,
+below the plan's `5e-4` threshold, while `B_i ≥ A_i` on 4/4 pairs — so the
+conjunctive rule is **not supported**. It also named the real deviations: trials
+ran ~7 s rather than the plan's 45 s, the reset was not captured as a stage
+because the 3-stage cap was consumed by the seed and the two submits, and the
+kernel digest pre-check is not evidenced in a delivered artifact. Those are
+limitations of this demonstration, not hidden successes.
+
+**Replay, stop and cancellation.** A repeated accepted start and a relabelled
+start in the same conversation run attached to one operation (one engine run,
+one new row). A real stop through the engine's own path returned
+`requested: true` and, about 9 s later, `confirmed: true` with the engine record
+reading `stopped`; the stopped run, which captured no candidate, was delivered as
+`no-candidate` rather than as a fabricated result. Cancelling a conversation asks
+only that run's owned operation to stop (checked with the real cancel path).
+
+**A restarted service observes and delivers, never relaunches.** An earlier
+journey's harness deadline ended its Node process before the background worker
+finished. A rebuilt service read the same operation, reconciled it from the
+engine record, marked it terminal and delivered its captured stages; the launch
+path was never called again.
+
+## 12. What this pilot does not claim
 
 - No Runner gateway, sandbox or `canStart` change. `canStart` stays `false` and
   the five blockers stay in place.
@@ -780,8 +954,19 @@ artifact remains the Agent's.
   result.
 - The seeded incumbent A was produced by the model in run 3; run 5's model
   re-materialized it, and B and C are the model's own work in run 5.
+- Round 23's experimental local mode does not clear the formal Runner blockers
+  and is not a sandbox. It runs one administrator-staged task package with one
+  CPU worker; the engine's workspace path guard is the tool boundary, and
+  generated code is not isolated from the host.
+- The round-23 demonstration used a three-stage capture cap, so the inter-arm
+  reset was not itself a captured stage; its ledger alone therefore does not
+  prove arm independence. The delivered trial and submit logs do record the
+  eight labelled searches and both submits. This is a product demonstration, not
+  a new scientific result or a benchmark.
+- No browser/UI journey is claimed for the mode. The demonstration used the
+  ordinary Session run creation and scheduling path without an HTTP listener.
 
-## 12. Where the evidence lives
+## 13. Where the evidence lives
 
 Ignored local artifacts under `.tmp/r/round19/` (never committed):
 
@@ -821,8 +1006,7 @@ code, `evidence/agent-run-*.json` hold the Agent's tool calls, permission
 decisions and answer, and `agent-harness.mts` is the local service-level harness
 that drove the conversation.
 
-Round 22 evidence lives under the ignored `.tmp/r/round22/` directory: `store/`
-is a consistent isolated copy of the round-21 store (same Project, Session,
+Round 22 evidence lives under the ignored `.tmp/r/round22/` directory: `store/`is a consistent isolated copy of the round-21 store (same Project, Session,
 model and prior artifact identities), `evidence/agent-run-*.json` hold the
 planning and interpretation conversations, including the revised-plan run
 (`agent-run-7.json`) and the capped attempt (`agent-run-6.json`, marked
@@ -845,3 +1029,18 @@ manifests, `evidence/precheck-results.json`, `evidence/precheck-e-results.json`
 and the ignored `precheck/` and `precheck-e/` workspaces. The engine's own task
 state is under `pilot/runs/<run>/circle-packing/`, and the private generated
 model inputs stay outside the repository in a 0700 directory.
+
+Round 23 evidence lives under the ignored `.tmp/r/round23/` directory: `store/`
+is a consistent isolated copy of the round-22 store (same Project, Session,
+model and prior artifact identities); `local-research.json` and `task.txt` are the
+administrator profile and the pinned task text; `seed/` is the task-owned seed;
+`evidence/agent-run-{a,b,c}.json` hold the three conversations' prompts, tool
+calls and answers (`a` is the start whose worker was cut by the harness deadline,
+`b` the follow-up readback, `c` the uninterrupted start-to-answer journey);
+`evidence/permission-grant.json` is the one narrow grant;
+`evidence/observe-deliver.json` is the rebuilt service's observation and first
+delivery; `evidence/republish-first.json` records the corrected note and the
+researcher-record delivery; `evidence/duplicate-and-stop.json` records the
+accepted-start replay and the real confirmed stop. The engine's own task state,
+receipts and delivery records are under `research/operations/<operation>/`, and
+the generated model inputs stay outside the repository in a 0700 directory.
