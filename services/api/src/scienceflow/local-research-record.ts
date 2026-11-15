@@ -130,6 +130,22 @@ export interface ScienceFlowLocalResearchStop {
   readonly lastError?: string;
 }
 
+/** The two fixed input roles this experimental profile can bind. */
+export type ScienceFlowLocalResearchInputRole = "plan" | "incumbent";
+
+/**
+ * The bytes this operation's launch actually used for one fixed input role.
+ * `versionId` is the Session version the start named after its content was
+ * proven equal to the profile's configured input file; `null` means the start
+ * ran the configured input without a linked version.
+ */
+export interface ScienceFlowLocalResearchInput {
+  readonly role: ScienceFlowLocalResearchInputRole;
+  readonly sha256: string;
+  readonly size: number;
+  readonly versionId: string | null;
+}
+
 /** What the engine's own record last said about this run. */
 export interface ScienceFlowLocalResearchEngineFacts {
   readonly status?: string;
@@ -152,6 +168,12 @@ export interface ScienceFlowLocalResearchOperation {
   readonly intent: string;
   readonly planVersionId?: string;
   readonly incumbentVersionId?: string;
+  /**
+   * The fixed input bytes this launch used, with the verified version identity
+   * when the start named one. Absent on records written before the binding was
+   * introduced; observation still reads them unchanged.
+   */
+  readonly inputs?: readonly ScienceFlowLocalResearchInput[];
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly state: ScienceFlowLocalResearchState;

@@ -18,7 +18,7 @@ const { test } = createTest(import.meta.url, {
 });
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { TestContext } from "node:test";
@@ -45,6 +45,7 @@ import type { ScienceFlowLocalResearchSettings } from "./local-research-config.j
 import type { ResearchPilotLauncher, ResearchPilotLaunchOutcome } from "./research-pilot.js";
 
 const TASK = "circle-packing";
+const PLAN_TEXT = "# plan\n";
 const SEED_TEXT = JSON.stringify({ circles: [[0.5, 0.5, 0.1]] });
 const NEW_TEXT = JSON.stringify({ circles: [[0.5, 0.5, 0.11], [0.1, 0.1, 0.01]] });
 const STAGE_METRICS = [2.61661905326, 2.6239750175348147];
@@ -85,7 +86,11 @@ async function fixture(context: TestContext, options: { readonly model?: "openai
   await mkdir(seedDir, { recursive: true });
   await mkdir(workRoot, { recursive: true });
   await mkdir(privateRoot, { recursive: true });
-  const plan = await publishVersion(store, project.id, session.id, "scienceflow/round23/experiment-plan.md", "# plan\n");
+  // The profile's fixed experiment: these are the exact bytes the engine will
+  // receive, and the versions published below are their Session identity.
+  await writeFile(join(seedDir, "experiment_plan.md"), PLAN_TEXT, "utf8");
+  await writeFile(join(seedDir, "incumbent.json"), SEED_TEXT, "utf8");
+  const plan = await publishVersion(store, project.id, session.id, "scienceflow/round23/experiment-plan.md", PLAN_TEXT);
   const incumbent = await publishVersion(store, project.id, session.id, "scienceflow/round23/incumbent.json", SEED_TEXT);
   return {
     incumbentVersionId: incumbent.versionId,
@@ -113,6 +118,10 @@ async function fixture(context: TestContext, options: { readonly model?: "openai
       readerScriptPath: join(root, "snapshot.py"),
       refusePackageInstall: true,
       seedDir,
+      inputs: {
+        incumbent: join(seedDir, "incumbent.json"),
+        plan: join(seedDir, "experiment_plan.md"),
+      },
       task: TASK,
       taskDescription: "Run the two bounded commands and report the trial log.",
       workRoot,
@@ -295,6 +304,22 @@ test("one accepted start becomes one run, an evaluated stage and delivered artif
   assert.equal(outcome.operation.state, "accepted");
   // The start freezes the credential-free model selection it resolved.
   assert.equal(outcome.operation.model?.providerModel, "fixture-model");
+  // The named versions were accepted because their bytes are exactly the
+  // profile's configured inputs; the record keeps both digests and identities.
+  assert.deepEqual(outcome.operation.inputs, [
+    {
+      role: "plan",
+      sha256: sha256(PLAN_TEXT),
+      size: Buffer.byteLength(PLAN_TEXT),
+      versionId: target.planVersionId,
+    },
+    {
+      role: "incumbent",
+      sha256: sha256(SEED_TEXT),
+      size: Buffer.byteLength(SEED_TEXT),
+      versionId: target.incumbentVersionId,
+    },
+  ]);
 
   const view = await waitTerminal(service, {
     operationId: outcome.operation.operationId,
@@ -315,6 +340,16 @@ test("one accepted start becomes one run, an evaluated stage and delivered artif
   assert.deepEqual(view.delivery.staged?.map((attempt) => attempt.role), ["carried_seed"]);
   assert.equal(view.planVersionId, target.planVersionId);
   assert.equal(view.incumbentVersionId, target.incumbentVersionId);
+  // The launch manifest points the engine at the very seed directory whose
+  // files were proven equal to the named versions above.
+  const manifest = await readFile(
+    join(target.workRoot, "operations", outcome.operation.operationId, "pilot-manifest.yaml"),
+    "utf8",
+  );
+  assert.ok(
+    manifest.split("\n").some((line) => line.trim() === `input_data_dir: ${JSON.stringify(target.settings.seedDir)}`),
+    "the manifest must hand the engine the configured fixed input directory",
+  );
   assert.equal(view.experimentalLocalExecution, true);
   assert.equal(view.formalRunnerSandbox, false);
 
@@ -404,6 +439,117 @@ test("refuses an unsupported model and an unknown Session before anything runs",
     (error: unknown) => error instanceof LocalResearchRefusal && error.reason === "session-not-found",
   );
   assert.equal(calls.count, 0);
+});
+
+test("a linked version that is not the configured input is refused before launch", async (context) => {
+  const target = await fixture(context);
+  const calls = { count: 0 };
+  const service = serviceFor(target, { launch: completedLaunch(context, calls) });
+  // Both are live versions of this same Session; only their bytes differ from
+  // the profile's fixed experiment, so neither may be linked to a run.
+  const otherPlan = await publishVersion(
+    target.store,
+    target.projectId,
+    target.sessionId,
+    "scienceflow/round23/experiment-plan-2.md",
+    "# a different plan\n",
+  );
+  const otherIncumbent = await publishVersion(
+    target.store,
+    target.projectId,
+    target.sessionId,
+    "scienceflow/round23/incumbent-2.json",
+    JSON.stringify({ circles: [[0.2, 0.2, 0.2]] }),
+  );
+  const request = {
+    intent: "Run the configured experiment.",
+    ownerRunId: "conversation-run-1",
+    projectId: target.projectId,
+    sessionId: target.sessionId,
+  };
+  await assert.rejects(
+    service.start({ ...request, planVersionId: otherPlan.versionId, incumbentVersionId: target.incumbentVersionId }),
+    (error: unknown) => error instanceof LocalResearchRefusal && error.reason === "link-version-mismatch",
+  );
+  await assert.rejects(
+    service.start({ ...request, planVersionId: target.planVersionId, incumbentVersionId: otherIncumbent.versionId }),
+    (error: unknown) => error instanceof LocalResearchRefusal && error.reason === "link-version-mismatch",
+  );
+  assert.equal(calls.count, 0, "a mismatched input must never reach the engine");
+  assert.equal(service.latest(target.projectId, target.sessionId), undefined);
+});
+
+test("a version for a role the profile does not bind is refused instead of linked", async (context) => {
+  const target = await fixture(context);
+  const calls = { count: 0 };
+  const { inputs: ignored, ...unbound } = target.settings;
+  void ignored;
+  const service = createLocalResearchService(
+    { settings: unbound, store: target.store },
+    { launch: completedLaunch(context, calls) },
+  );
+  await assert.rejects(
+    service.start({
+      incumbentVersionId: target.incumbentVersionId,
+      intent: "Run the configured experiment.",
+      ownerRunId: "conversation-run-1",
+      projectId: target.projectId,
+      sessionId: target.sessionId,
+    }),
+    (error: unknown) => error instanceof LocalResearchRefusal && error.reason === "link-not-supported",
+  );
+  assert.equal(calls.count, 0);
+  assert.equal(service.latest(target.projectId, target.sessionId), undefined);
+});
+
+test("a start under an already cancelled conversation creates nothing", async (context) => {
+  const target = await fixture(context);
+  const calls = { count: 0 };
+  const service = serviceFor(target, {
+    launch: completedLaunch(context, calls),
+    ownerRunStatus: async () => "cancelled",
+  });
+  await assert.rejects(
+    service.start({
+      intent: "Run the configured experiment.",
+      ownerRunId: "conversation-run-1",
+      projectId: target.projectId,
+      sessionId: target.sessionId,
+    }),
+    (error: unknown) => error instanceof LocalResearchRefusal && error.reason === "conversation-cancelled",
+  );
+  assert.equal(calls.count, 0);
+  assert.equal(service.latest(target.projectId, target.sessionId), undefined);
+});
+
+test("cancellation between acceptance and the worker records a stop instead of launching", async (context) => {
+  const target = await fixture(context);
+  const calls = { count: 0 };
+  let statusChecks = 0;
+  const service = serviceFor(target, {
+    launch: completedLaunch(context, calls),
+    // The start sees a live conversation; by the time the background worker
+    // re-checks, the user has cancelled it.
+    ownerRunStatus: async () => {
+      statusChecks += 1;
+      return statusChecks === 1 ? "running" : "cancelled";
+    },
+  });
+  await service.start({
+    intent: "Run the configured experiment.",
+    ownerRunId: "conversation-run-1",
+    projectId: target.projectId,
+    sessionId: target.sessionId,
+  });
+  const deadline = Date.now() + 5_000;
+  let record = service.latest(target.projectId, target.sessionId);
+  while (record?.state !== "stopped" && Date.now() < deadline) {
+    await sleep(20);
+    record = service.latest(target.projectId, target.sessionId);
+  }
+  assert.equal(record?.state, "stopped");
+  assert.equal(record?.stop.requestedBy, "conversation-cancel");
+  assert.equal(calls.count, 0, "a cancelled conversation must not launch a late run");
 });
 
 test("a genuinely new user experiment receives a new operation identity", async (context) => {

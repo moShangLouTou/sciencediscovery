@@ -31,7 +31,7 @@
  * This is execution configuration, not an authorization decision: a Session's
  * own permission check still runs before a research run is started.
  */
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 
 /** Points at the administrator's JSON file; unset means the mode is off. */
@@ -43,6 +43,8 @@ export const SCIENCE_FLOW_LOCAL_RESEARCH_CONFIG_SCHEMA_VERSION = 1;
 export const SCIENCE_FLOW_LOCAL_RESEARCH_CONFIG_MAX_BYTES = 1024 * 1024;
 /** The pinned task text is execution input, bounded like a manifest field. */
 export const SCIENCE_FLOW_LOCAL_RESEARCH_TASK_TEXT_MAX_BYTES = 32_768;
+/** A plan or incumbent reference file is small; bound what the loader will trust. */
+export const SCIENCE_FLOW_LOCAL_RESEARCH_INPUT_MAX_BYTES = 4 * 1024 * 1024;
 /** A tool wait is a scheduling bound, not a research budget. */
 export const SCIENCE_FLOW_LOCAL_RESEARCH_OBSERVE_MAX_WAIT_MS = 300_000;
 
@@ -71,6 +73,13 @@ export interface ScienceFlowLocalResearchSettings {
   readonly task: string;
   /** Fixed seed directory the administrator staged for the task. */
   readonly seedDir: string;
+  /**
+   * The seed file that carries each fixed input role, when the profile declares
+   * them. A start that names a Session version for a role must match that file
+   * byte for byte; otherwise the start is refused before anything runs. The
+   * paths are resolved and contained under `seedDir` at load.
+   */
+  readonly inputs?: ScienceFlowLocalResearchInputs;
   /** Root for per-operation work dirs, receipts and delivery records. */
   readonly workRoot: string;
   /** Root for per-operation private engine inputs (0700); outside the work root. */
@@ -81,6 +90,12 @@ export interface ScienceFlowLocalResearchSettings {
   /** Put pip/pip3/uv refusal shims on the run's PATH. */
   readonly refusePackageInstall: boolean;
   readonly defaults: ScienceFlowLocalResearchDefaults;
+}
+
+/** Seed files that carry the profile's fixed plan and incumbent inputs. */
+export interface ScienceFlowLocalResearchInputs {
+  readonly plan?: string;
+  readonly incumbent?: string;
 }
 
 const DEFAULT_DEFAULTS: ScienceFlowLocalResearchDefaults = {
@@ -179,6 +194,7 @@ function parseResearch(
       "readerScriptPath",
       "task",
       "seedDir",
+      "inputs",
       "workRoot",
       "privateRoot",
       "taskDescriptionPath",
@@ -192,6 +208,7 @@ function parseResearch(
   const readerScriptPath = requireAbsolutePath(value.readerScriptPath, "research.readerScriptPath");
   const task = requireTaskId(value.task, "research.task");
   const seedDir = requireAbsolutePath(value.seedDir, "research.seedDir");
+  const inputs = parseInputs(value.inputs, seedDir);
   const workRoot = requireAbsolutePath(value.workRoot, "research.workRoot");
   const privateRoot = requireAbsolutePath(value.privateRoot, "research.privateRoot");
   // Generated credentials live under privateRoot and the engine writes under
@@ -219,11 +236,61 @@ function parseResearch(
     readerScriptPath,
     task,
     seedDir,
+    ...(inputs === undefined ? {} : { inputs }),
     workRoot,
     privateRoot,
     ...(taskDescription === undefined ? {} : { taskDescription }),
     refusePackageInstall,
     defaults,
+  });
+}
+
+/**
+ * The profile runs one fixed experiment. These bindings name which seed file
+ * carries the plan and which carries the incumbent, so a start can refuse a
+ * Session version whose bytes are not that experiment's input instead of
+ * linking it in the result metadata only.
+ */
+function parseInputs(value: unknown, seedDir: string): ScienceFlowLocalResearchInputs | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw configError("research.inputs must be an object");
+  rejectUnknownKeys(value, ["plan", "incumbent"], "research.inputs");
+  const read = (role: "plan" | "incumbent"): string | undefined => {
+    const name = value[role];
+    if (name === undefined) return undefined;
+    if (typeof name !== "string" || name.trim().length === 0 || name.includes("\0") || isAbsolute(name)) {
+      throw configError(`research.inputs.${role} must be a relative file name under the seed dir`);
+    }
+    const path = resolve(seedDir, name);
+    let realSeed: string;
+    let realInput: string;
+    let stats: ReturnType<typeof statSync>;
+    try {
+      realSeed = realpathSync(seedDir);
+      realInput = realpathSync(path);
+      stats = statSync(realInput);
+    } catch {
+      throw configError(`research.inputs.${role} must name a readable file under the seed dir`);
+    }
+    if (!isInside(realInput, realSeed) || realInput === realSeed) {
+      throw configError(`research.inputs.${role} must stay inside the seed dir`);
+    }
+    if (!stats.isFile()) {
+      throw configError(`research.inputs.${role} must name a regular file`);
+    }
+    if (stats.size > SCIENCE_FLOW_LOCAL_RESEARCH_INPUT_MAX_BYTES) {
+      throw configError(
+        `research.inputs.${role} must not exceed ${SCIENCE_FLOW_LOCAL_RESEARCH_INPUT_MAX_BYTES} bytes`,
+      );
+    }
+    return realInput;
+  };
+  const plan = read("plan");
+  const incumbent = read("incumbent");
+  if (plan === undefined && incumbent === undefined) return undefined;
+  return Object.freeze({
+    ...(plan === undefined ? {} : { plan }),
+    ...(incumbent === undefined ? {} : { incumbent }),
   });
 }
 

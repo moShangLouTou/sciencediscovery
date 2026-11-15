@@ -29,7 +29,10 @@
  *   blockers are untouched, and nothing here claims a sandbox;
  * - the conversation supplies research intent and fixed Artifact version ids
  *   only; host paths, interpreter, endpoint, credential and the pinned task text
- *   come from administrator configuration and the Session;
+ *   come from administrator configuration and the Session. The profile declares
+ *   which seed file carries each fixed input, and a named version is accepted
+ *   only when its content is byte-identical to that file — never linked to a run
+ *   that executed different bytes;
  * - the operation record keeps host paths so a rebuilt service can observe the
  *   same run, but no Agent-visible view carries them;
  * - a run whose state cannot be read is reported `unknown`, never relaunched.
@@ -39,6 +42,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import { CasStore } from "@sciencediscovery/cas";
 import type {
   ReadScienceFlowRunSnapshotOptions,
   ScienceFlowSnapshotReadResult,
@@ -50,7 +54,10 @@ import {
   type ScienceFlowResultDeliveryRecord,
   type ScienceFlowResultDeliveryRequest,
 } from "./result-delivery.js";
-import type { ScienceFlowLocalResearchSettings } from "./local-research-config.js";
+import {
+  SCIENCE_FLOW_LOCAL_RESEARCH_INPUT_MAX_BYTES,
+  type ScienceFlowLocalResearchSettings,
+} from "./local-research-config.js";
 import {
   isTerminalResearchState,
   SCIENCE_FLOW_LOCAL_RESEARCH_OPERATION_VERSION,
@@ -58,6 +65,8 @@ import {
   type ScienceFlowLocalResearchDelivery,
   type ScienceFlowLocalResearchEngineFacts,
   type ScienceFlowLocalResearchGrant,
+  type ScienceFlowLocalResearchInput,
+  type ScienceFlowLocalResearchInputRole,
   type ScienceFlowLocalResearchOperation,
   type ScienceFlowLocalResearchStage,
   type ScienceFlowLocalResearchState,
@@ -98,7 +107,12 @@ export type LocalResearchRefusalReason =
   | "invalid-option"
   | "operation-not-found"
   | "operation-identity-mismatch"
-  | "link-version-not-found";
+  | "link-version-not-found"
+  | "link-not-supported"
+  | "link-version-mismatch"
+  | "link-version-unreadable"
+  | "configured-input-unavailable"
+  | "conversation-cancelled";
 
 /** A refusal with a stable reason; messages never carry a credential or path. */
 export class LocalResearchRefusal extends Error {
@@ -114,6 +128,11 @@ export class LocalResearchRefusal extends Error {
 export interface LocalResearchServiceStore extends ResearchPilotReadbackStore {
   readonly scienceFlowResearchOperations: ScienceFlowLocalResearchStore;
   readonly dataDir: string;
+  /** The owning conversation run's status, used to refuse a late launch. */
+  readonly getSessionRun?: (
+    sessionId: string,
+    runId: string,
+  ) => Promise<{ readonly status: string } | undefined>;
   readonly getProjectArtifactVersion: (projectId: string, versionId: string) => {
     readonly artifactId: string;
     readonly content: { readonly hash: string; readonly size: number };
@@ -155,6 +174,8 @@ export interface ScienceFlowLocalResearchView {
   readonly updatedAt: string;
   readonly planVersionId: string | null;
   readonly incumbentVersionId: string | null;
+  /** The fixed input bytes this run used, including the verified version id. */
+  readonly inputs: readonly ScienceFlowLocalResearchInput[];
   readonly model: { readonly profileName: string; readonly providerModel: string; readonly selectionSource: string } | null;
   readonly grant: ScienceFlowLocalResearchGrant;
   readonly engine: ScienceFlowLocalResearchEngineFacts;
@@ -196,6 +217,10 @@ export interface LocalResearchServiceDependencies {
   readonly readSnapshot?: (
     options: ReadScienceFlowRunSnapshotOptions,
   ) => Promise<ScienceFlowSnapshotReadResult>;
+  /** Reads a Session artifact version's CAS bytes; tests substitute one. */
+  readonly readArtifactBytes?: (hash: string) => Promise<Buffer>;
+  /** The owning conversation run's status; tests substitute one. */
+  readonly ownerRunStatus?: (sessionId: string, runId: string) => Promise<string | undefined>;
   readonly now?: () => string;
   readonly newOperationId?: () => string;
   readonly sleep?: (ms: number) => Promise<void>;
@@ -237,6 +262,12 @@ export function createLocalResearchService(input: {
     request,
     deps,
   ));
+  const readArtifactBytes = dependencies.readArtifactBytes
+    ?? ((hash: string) => new CasStore(store.dataDir).read(hash));
+  const ownerRunStatus = dependencies.ownerRunStatus ?? (async (sessionId: string, runId: string) => {
+    if (!store.getSessionRun) return undefined;
+    return (await store.getSessionRun(sessionId, runId))?.status;
+  });
   /** Operations whose launch/observe/deliver worker is alive in this process. */
   const activeWorkers = new Set<string>();
   /** Operations with a delivery attempt in flight in this process. */
@@ -557,6 +588,19 @@ export function createLocalResearchService(input: {
         mutate(operationId, (record) => ({ ...record, state: "stopped" }));
         return;
       }
+      // Cancellation can land between the tool's post-permission check and this
+      // worker: when the owning run already ended by cancellation there is no
+      // one left to read a result, so record the stop instead of launching.
+      if (await ownerStopped(current.identity.sessionId, current.ownerRunId)) {
+        mutate(operationId, (record) => ({
+          ...record,
+          state: "stopped",
+          stop: record.stop.requestedAt
+            ? record.stop
+            : { ...record.stop, requestedAt: now(), requestedBy: "conversation-cancel" },
+        }));
+        return;
+      }
       mutate(operationId, (record) => ({ ...record, state: "running" }));
       const receipt = await runResearchPilot(store, pilotRequest(current), {
         ...(dependencies.launch ? { launch: dependencies.launch } : {}),
@@ -615,6 +659,7 @@ export function createLocalResearchService(input: {
     updatedAt: record.updatedAt,
     planVersionId: record.planVersionId ?? null,
     incumbentVersionId: record.incumbentVersionId ?? null,
+    inputs: record.inputs ?? [],
     model: record.launch.model,
     grant: record.launch.grant,
     engine: record.engine,
@@ -639,7 +684,12 @@ export function createLocalResearchService(input: {
     }))
     .digest("hex");
 
-  const assertLinkVersion = (sessionId: string, projectId: string, versionId: string, label: string): void => {
+  const assertLinkVersion = (
+    sessionId: string,
+    projectId: string,
+    versionId: string,
+    label: string,
+  ): NonNullable<ReturnType<LocalResearchServiceStore["getProjectArtifactVersion"]>> => {
     const version = store.getProjectArtifactVersion(projectId, versionId);
     const artifact = version ? store.getProjectArtifact(projectId, version.artifactId) : undefined;
     if (!version || !artifact || artifact.deletedAt || artifact.createdInSessionId !== sessionId) {
@@ -648,6 +698,107 @@ export function createLocalResearchService(input: {
         `The ${label} version is not a live artifact version of this Session`,
       );
     }
+    return version;
+  };
+
+  /**
+   * Read one configured fixed input file and return its digest. The file is the
+   * bytes the pilot's manifest will hand to the engine, so this is what a
+   * selected Session version must match.
+   */
+  const readConfiguredInput = async (
+    role: ScienceFlowLocalResearchInputRole,
+    path: string,
+  ): Promise<{ readonly sha256: string; readonly size: number }> => {
+    let bytes: Buffer;
+    try {
+      bytes = await readFile(path);
+    } catch {
+      throw new LocalResearchRefusal(
+        "configured-input-unavailable",
+        `This research profile's configured ${role} input could not be read`,
+      );
+    }
+    if (bytes.length > SCIENCE_FLOW_LOCAL_RESEARCH_INPUT_MAX_BYTES) {
+      throw new LocalResearchRefusal(
+        "configured-input-unavailable",
+        `This research profile's configured ${role} input is too large`,
+      );
+    }
+    return { sha256: createHash("sha256").update(bytes).digest("hex"), size: bytes.length };
+  };
+
+  /** Read and verify one linked version's CAS bytes. */
+  const readLinkedInput = async (
+    role: ScienceFlowLocalResearchInputRole,
+    version: NonNullable<ReturnType<LocalResearchServiceStore["getProjectArtifactVersion"]>>,
+  ): Promise<{ readonly sha256: string; readonly size: number }> => {
+    let bytes: Buffer;
+    try {
+      bytes = await readArtifactBytes(version.content.hash);
+    } catch {
+      throw new LocalResearchRefusal(
+        "link-version-unreadable",
+        `The ${role} version's content could not be read`,
+      );
+    }
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    if (digest !== version.content.hash || bytes.length !== version.content.size) {
+      throw new LocalResearchRefusal(
+        "link-version-unreadable",
+        `The ${role} version's content does not match its recorded digest`,
+      );
+    }
+    return { sha256: digest, size: bytes.length };
+  };
+
+  /**
+   * Bind the accepted request to the bytes the engine will actually receive.
+   * A named version is accepted only when the profile declares that role and
+   * the version's content is byte-identical to the configured seed file; a
+   * start never runs the old seed while linking a different version to it.
+   */
+  const resolveInputs = async (
+    request: LocalResearchStartInput,
+  ): Promise<readonly ScienceFlowLocalResearchInput[]> => {
+    const bindings = settings.inputs ?? {};
+    const named: Partial<Record<ScienceFlowLocalResearchInputRole, string>> = {
+      ...(request.planVersionId ? { plan: request.planVersionId } : {}),
+      ...(request.incumbentVersionId ? { incumbent: request.incumbentVersionId } : {}),
+    };
+    const inputs: ScienceFlowLocalResearchInput[] = [];
+    for (const role of ["plan", "incumbent"] as const) {
+      const configured = bindings[role];
+      const versionId = named[role];
+      if (versionId) {
+        if (!configured) {
+          throw new LocalResearchRefusal(
+            "link-not-supported",
+            `This research profile runs a fixed experiment and does not accept a ${role} version`,
+          );
+        }
+        const version = assertLinkVersion(request.sessionId, request.projectId, versionId, role);
+        const actual = await readLinkedInput(role, version);
+        const expected = await readConfiguredInput(role, configured);
+        if (actual.sha256 !== expected.sha256 || actual.size !== expected.size) {
+          throw new LocalResearchRefusal(
+            "link-version-mismatch",
+            `The ${role} version is not this research profile's configured ${role} input`,
+          );
+        }
+        inputs.push({ role, sha256: actual.sha256, size: actual.size, versionId });
+      } else if (configured) {
+        const expected = await readConfiguredInput(role, configured);
+        inputs.push({ role, sha256: expected.sha256, size: expected.size, versionId: null });
+      }
+    }
+    return inputs;
+  };
+
+  /** True when the owning conversation run was cancelled or interrupted. */
+  const ownerStopped = async (sessionId: string, runId: string): Promise<boolean> => {
+    const status = await ownerRunStatus(sessionId, runId);
+    return status === "cancelled" || status === "interrupted";
   };
 
   return {
@@ -701,6 +852,17 @@ export function createLocalResearchService(input: {
       if (active) {
         return { attached: true, attachedReason: "active-operation", operation: view(active) };
       }
+      // A start that arrives after its conversation run was cancelled must not
+      // create an operation no cancel path owns any more.
+      if (await ownerStopped(request.sessionId, request.ownerRunId)) {
+        throw new LocalResearchRefusal(
+          "conversation-cancelled",
+          "The conversation run that would own this experiment was cancelled",
+        );
+      }
+      // Freeze the fixed input bytes this run will actually use, and prove a
+      // named version is exactly that input before any record or launch exists.
+      const inputs = await resolveInputs(request);
 
       const operationId = newOperationId();
       const createdAt = now();
@@ -728,6 +890,7 @@ export function createLocalResearchService(input: {
         intent,
         ...(request.planVersionId ? { planVersionId: request.planVersionId } : {}),
         ...(request.incumbentVersionId ? { incumbentVersionId: request.incumbentVersionId } : {}),
+        ...(inputs.length ? { inputs } : {}),
         createdAt,
         updatedAt: createdAt,
         state: "accepted",

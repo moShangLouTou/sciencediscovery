@@ -56,6 +56,7 @@ function baseView(overrides: Partial<Record<string, unknown>> = {}): ScienceFlow
       totalAllowanceSec: 320,
     },
     incumbentVersionId: null,
+    inputs: [],
     instruction: "Observe the run with get_research.",
     intent: "Run the bounded experiment.",
     model: { profileName: "Fixture", providerModel: "fixture-model", selectionSource: "session" },
@@ -128,6 +129,8 @@ test("exposes the three research tools and states the experimental boundary", ()
   assert.match(instructions, /experimental local execution, not the formal Runner sandbox/);
   assert.match(instructions, /wait_seconds/);
   assert.match(instructions, /retry_delivery/);
+  // The tool must state that a named version has to match the configured input.
+  assert.match(instructions, /byte-identical/);
 });
 
 test("start asks for the governed privilege and returns only the public operation view", async () => {
@@ -157,6 +160,44 @@ test("a service refusal is reported as a stable reason instead of a stack trace"
   }, undefined));
   assert.equal(result.error, "unsupported-model");
   assert.match(String(result.message), /openai-chat-completions/);
+});
+
+test("cancelling during the permission wait starts no research after it resolves", async () => {
+  let permit!: () => void;
+  let entered!: () => void;
+  const enteredPromise = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  let privileges = 0;
+  let starts = 0;
+  const { tools } = toolsFor(fakeService({
+    start: async () => {
+      starts += 1;
+      return { attached: false, operation: baseView() };
+    },
+  }), {
+    requirePrivilege: () => {
+      privileges += 1;
+      entered();
+      // The permission decision is held until after the conversation aborts.
+      return new Promise<void>((resolve) => {
+        permit = resolve;
+      });
+    },
+  });
+  const controller = new AbortController();
+  const pending = byName(tools, START_RESEARCH_TOOL).execute("call-6", {
+    intent: "Run the configured experiment.",
+  }, controller.signal);
+  await enteredPromise;
+  controller.abort();
+  permit();
+  await assert.rejects(
+    pending,
+    (error: unknown) => error instanceof Error && error.name === "AbortError",
+  );
+  assert.equal(privileges, 1);
+  assert.equal(starts, 0, "a cancelled start must not create a research operation");
 });
 
 test("a bounded observation wait pauses and releases the Agent idle clock", async () => {

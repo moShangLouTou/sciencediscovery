@@ -53,12 +53,12 @@ const startParameters = Type.Object({
     minLength: 1,
   }),
   plan_version_id: Type.Optional(Type.String({
-    description: "The Session's Agent-authored plan artifact version this run tests. Business id only.",
+    description: "Optional: the Session's plan artifact version whose content is exactly this profile's configured plan input. A different version is refused before launch. Business id only.",
     maxLength: 200,
     minLength: 1,
   })),
   incumbent_version_id: Type.Optional(Type.String({
-    description: "The fixed incumbent artifact version the run is seeded with. Business id only.",
+    description: "Optional: the Session's incumbent artifact version whose content is exactly this profile's configured incumbent input. A different version is refused before launch. Business id only.",
     maxLength: 200,
     minLength: 1,
   })),
@@ -115,7 +115,7 @@ export function localResearchInstructions(service: LocalResearchService): string
   return [
     `<local_research_mode>`,
     `Experimental local research is enabled for this Session (profile ${service.profileId}). It runs one bounded ScienceFlow experiment on this host with the Session's own model and the administrator's fixed engine/task inputs. This is experimental local execution, not the formal Runner sandbox: formal execution-plan readiness and its blockers are unchanged and this mode makes no sandbox claim.`,
-    `When the user asks to run or execute a bounded experiment, call start_research with a short intent and, when the experiment tests a fixed plan or incumbent, this Session's plan_version_id / incumbent_version_id. Never supply host paths, an interpreter, a model, an endpoint, a credential, commands or a task description: those are administrator and Session configuration.`,
+    `When the user asks to run the configured experiment, call start_research with a short intent. This profile runs one administrator-configured bounded experiment: its pinned task text is the instruction the researcher executes, and the intent is recorded only as this run's label and as the purpose you report. If you name plan_version_id or incumbent_version_id, they must be this Session's versions whose content is byte-identical to the profile's configured plan/incumbent inputs; a different version is refused before anything runs. Omit them to run the configured fixed inputs. Never supply host paths, an interpreter, a model, an endpoint, a credential, commands or a task description: those are administrator and Session configuration.`,
     `start_research returns an operation id immediately. Call get_research with wait_seconds (at most ${Math.floor(service.observeMaxWaitMs / 1_000)}) to observe the real engine lifecycle and the evaluated stages. Do not call start_research again for the same experiment; a replayed start attaches to the same operation.`,
     `When the run ends, its result artifacts are delivered to this Session automatically. Read them with list_artifacts and read_artifact and answer from what was actually evaluated. If delivery failed, call get_research action retry_delivery; that republishes without rerunning research. Use stop_research for an explicit user stop and distinguish a requested stop from confirmed engine termination.`,
     `Do not claim success, a score or a scientific conclusion that the delivered evidence does not support.`,
@@ -143,8 +143,9 @@ export function createLocalResearchTools(input: LocalResearchToolInput): AgentTo
     name: START_RESEARCH_TOOL,
     label: "Start local research",
     description: [
-      "Start one bounded experimental ScienceFlow research run for this Session from a short research intent.",
-      "Supply business identities only: intent and, when the experiment tests fixed versions, this Session's plan_version_id and incumbent_version_id.",
+      "Start this deployment's one configured bounded experimental ScienceFlow research run for this Session.",
+      "The administrator's pinned task text is the instruction the researcher executes; intent is recorded as this run's label and the purpose you report.",
+      "Supply business identities only: intent and, optionally, this Session's plan_version_id and incumbent_version_id, which must exactly match the profile's configured fixed inputs. A different version is refused before launch.",
       "This is experimental local execution on this host, not the formal Runner sandbox. It returns an operation id at once; observe it with get_research. Do not start the same experiment twice.",
     ].join(" "),
     parameters: startParameters,
@@ -159,6 +160,10 @@ export function createLocalResearchTools(input: LocalResearchToolInput): AgentTo
           toolCallId,
           ...(signal ? { signal } : {}),
         });
+        // The permission wait can outlive the conversation. Re-check before
+        // creating the operation: at this point the cancel path may already
+        // have found nothing to stop, and a late start would be unowned.
+        signal?.throwIfAborted();
         const outcome = await service.start({
           projectId,
           sessionId,

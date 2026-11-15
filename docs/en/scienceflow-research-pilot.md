@@ -795,6 +795,10 @@ loaded once at server construction, so a change needs a restart.
     "readerScriptPath": "/abs/services/scienceflow-reader/snapshot.py",
     "task": "circle-packing",
     "seedDir": "/abs/task-owned/seed",
+    "inputs": {
+      "plan": "experiment_plan.md",
+      "incumbent": "candidate_a.json"
+    },
     "workRoot": "/abs/task-owned/research",
     "privateRoot": "/abs/private-0700",
     "taskDescriptionPath": "/abs/task-owned/task.txt",
@@ -822,6 +826,16 @@ at load (at most 32 KiB), so the conversation cannot supply commands, an
 interpreter, a model, an endpoint or a credential. One profile names one engine
 task package; there is no task discovery or arbitrary package upload.
 
+The optional `inputs` object names the seed file that carries the plan and the
+one that carries the incumbent; both are relative names resolved and contained
+under `seedDir` at load. It states which bytes this profile's one fixed
+experiment uses. A start that names a Session plan or incumbent version is
+accepted only when that version's content is byte-identical to the named file;
+a different version is refused with `link-version-mismatch` before an operation
+or a launch exists. Naming a version for a role the profile does not bind is
+refused with `link-not-supported`. Omitting both version ids runs the configured
+fixed inputs and records their digests as the input this run actually used.
+
 Enabling the mode is deployment configuration, not an authorization decision: a
 start still asks the Session's governed permission under action `code` for
 resource `scienceflow:local-research`. For an isolated demonstration, install one
@@ -832,21 +846,27 @@ narrow Session-scope grant for exactly that resource; do not switch the Session 
 
 | Tool | Parameters | Behaviour |
 | --- | --- | --- |
-| `start_research` | `intent`, optional `plan_version_id`, `incumbent_version_id` | Resolves identity, write gate, the Session's effective model and the linked versions; persists one operation and returns its id at once. The engine run continues in the background. |
+| `start_research` | `intent`, optional `plan_version_id`, `incumbent_version_id` | Resolves identity, write gate, the Session's effective model and proves any named version equals the profile's configured input bytes; persists one operation and returns its id at once. The engine run continues in the background. |
 | `get_research` | optional `operation_id`, `wait_seconds`, `action` | Reports the engine's real lifecycle, evaluated stages, delivery state and artifact version references. The wait is bounded and pauses the Agent's idle clock. `action: retry_delivery` republishes an ended run without rerunning it. |
 | `stop_research` | optional `operation_id` | Requests the engine's own stop for this operation and reports requested versus confirmed termination. |
 
 The model supplies business identities and research intent only. The view it
 receives carries no host path, interpreter, engine checkout, endpoint or
-credential; the operation record keeps those for the service.
+credential; the operation record keeps those for the service. This profile runs
+one administrator-configured experiment: the pinned task text is the instruction
+the researcher executes, and the intent is a recorded label for this run (the
+purpose the Agent reports), not a task description that replaces the configured
+one.
 
 ### 11.3 One accepted start is one operation
 
 A row in `science_flow_local_research_operations` (the same `catalog.sqlite` as
 the other ScienceFlow control-plane records) holds the operation id, the
-conversation run that owns it, the frozen engine identity, the latest observed
-state and the delivery outcome. The idempotency key is a hash of the Project, the
-Session, the owning conversation run, the intent and the linked versions:
+conversation run that owns it, the frozen engine identity, the verified digest
+and size of each fixed input the launch used (with the Session version id when
+one was named), the latest observed state and the delivery outcome. The
+idempotency key is a hash of the Project, the Session, the owning conversation
+run, the intent and the linked versions:
 
 - replaying the same accepted start — a tool retry, a provider replay or a
   reconnect — attaches to the same operation and launches nothing;
@@ -864,6 +884,15 @@ never presented as confirmed termination. Repeating it is safe. Cancelling the
 conversation (`cancelSessionRun`, including the current-run route) asks the
 research service to stop that conversation run's owned, non-terminal operation;
 it does not broad-kill another run, another Session or an unrelated process.
+
+Two cancellation windows matter because an operation is created only after the
+permission check. The start tool re-checks its abort signal immediately after
+the governed permission resolves, so an abort during that wait creates no
+operation. The background worker also re-reads the owning conversation run's
+status before launching: if that run is already `cancelled` or `interrupted`, it
+records a stop request instead of starting an engine run that no conversation
+could read. A start whose owning run is already cancelled is refused with
+`conversation-cancelled` and writes nothing.
 
 ### 11.5 Automatic delivery and a rebuilt service
 
@@ -936,8 +965,47 @@ finished. A rebuilt service read the same operation, reconciled it from the
 engine record, marked it terminal and delivered its captured stages; the launch
 path was never called again.
 
-## 12. What this pilot does not claim
+### 11.7 Review follow-up: input binding and the cancellation window
 
+Two review findings (2026-11-16) were fixed without changing the successful
+conversation wiring, automatic delivery or the formal Runner boundary.
+
+**A named version must be the experiment's input.** `start_research` previously
+checked that a plan or incumbent version belonged to the Session, then ran the
+administrator's fixed seed regardless and linked the named version in the
+result. The profile now declares which seed file carries each role, and a named
+version is accepted only when its content is byte-identical to that file. The
+isolated check — real `SessionStore`, real CAS, the real configuration loader
+and a launch substitute that reads the manifest — created two live versions of
+the same Session whose bytes differ from the configured input. The mismatched
+plan and the mismatched incumbent each returned `link-version-mismatch`, left
+the operation count unchanged at 0 and recorded no launch; a version for an
+unbound role returned `link-not-supported`. The matching versions were
+accepted: the operation recorded the plan digest `85f061eb…` (49 bytes) and the
+incumbent digest `91112a2a…` (27 bytes) with their version ids, and the launch
+manifest's `input_data_dir` was the configured seed directory whose files were
+proven equal to those versions. Evidence:
+`.tmp/r/round23/evidence/review-fixes.json`.
+
+**Cancellation during the permission wait.** The start tool used to check its
+abort signal only on entry. A conversation cancelled while the governed
+permission was pending had no operation for the cancel path to find, and the
+tool could still create one when the permission resolved. The tool now re-checks
+the abort signal after the permission returns, and the worker refuses to launch
+when the owning conversation run is already `cancelled` or `interrupted`. A
+targeted test holds the permission promise, aborts the conversation, resolves it
+and proves the service's `start` was never called (one permission request, zero
+starts). A service-level check in the same evidence file shows a start under a
+cancelled run returning `conversation-cancelled` with no record, and a
+cancellation that lands between acceptance and the worker leaving the operation
+`stopped` with `requestedBy: conversation-cancel` and zero launches.
+
+Targeted checks for this follow-up: **67/67** across six files (config 5,
+service 12, tools 8, cancel 2, delivery 20, pilot 20), source-mapped
+`tsc --noEmit` exit 0 and `git diff --check` clean. No full suite, browser,
+product-stack or formal Runner run was repeated for these two fixes.
+
+## 12. What this pilot does not claim
 - No Runner gateway, sandbox or `canStart` change. `canStart` stays `false` and
   the five blockers stay in place.
 - Generated code ran in the task workspace through the engine's normal tools.
@@ -958,6 +1026,10 @@ path was never called again.
   and is not a sandbox. It runs one administrator-staged task package with one
   CPU worker; the engine's workspace path guard is the tool boundary, and
   generated code is not isolated from the host.
+- The experimental mode runs one administrator-configured experiment with fixed
+  inputs; it is not a general task system. A Session plan or incumbent version
+  whose content is not exactly the configured input is refused before launch,
+  not linked to a different experiment.
 - The round-23 demonstration used a three-stage capture cap, so the inter-arm
   reset was not itself a captured stage; its ledger alone therefore does not
   prove arm independence. The delivered trial and submit logs do record the
@@ -1041,6 +1113,8 @@ calls and answers (`a` is the start whose worker was cut by the harness deadline
 `evidence/observe-deliver.json` is the rebuilt service's observation and first
 delivery; `evidence/republish-first.json` records the corrected note and the
 researcher-record delivery; `evidence/duplicate-and-stop.json` records the
-accepted-start replay and the real confirmed stop. The engine's own task state,
+accepted-start replay and the real confirmed stop. The review follow-up adds
+`evidence/review-fixes.json` (isolated real-store input-binding and cancellation
+checks) and `evidence/review-targeted-tests.tap`. The engine's own task state,
 receipts and delivery records are under `research/operations/<operation>/`, and
 the generated model inputs stay outside the repository in a 0700 directory.

@@ -49,6 +49,8 @@ async function fixture(context: TestContext): Promise<Fixture> {
   await mkdir(seedDir, { recursive: true });
   await mkdir(workRoot, { recursive: true });
   await mkdir(privateRoot, { recursive: true });
+  await writeFile(join(seedDir, "experiment_plan.md"), "# plan\n", "utf8");
+  await writeFile(join(seedDir, "candidate_a.json"), "{\"circles\": []}\n", "utf8");
   await writeFile(taskTextPath, "Run the three bounded commands in order.\n", "utf8");
   return { configPath: join(root, "local-research.json"), privateRoot, root, seedDir, taskTextPath, workRoot };
 }
@@ -63,6 +65,7 @@ function configValue(target: Fixture, overrides: Record<string, unknown> = {}): 
       pythonExecutable: "/usr/bin/python3",
       readerScriptPath: join(target.root, "snapshot.py"),
       seedDir: target.seedDir,
+      inputs: { incumbent: "candidate_a.json", plan: "experiment_plan.md" },
       task: "circle-packing",
       taskDescriptionPath: target.taskTextPath,
       workRoot: target.workRoot,
@@ -107,6 +110,12 @@ test("a valid profile binds absolute roots and the fixed task text", async (cont
   assert.equal(settings.workRoot, target.workRoot);
   assert.equal(settings.taskDescription, "Run the three bounded commands in order.");
   assert.equal(settings.refusePackageInstall, true);
+  // The fixed input bindings resolve to real files contained by the seed dir;
+  // they are what a linked Session version must later match byte for byte.
+  assert.deepEqual(settings.inputs, {
+    incumbent: join(target.seedDir, "candidate_a.json"),
+    plan: join(target.seedDir, "experiment_plan.md"),
+  });
   assert.equal(settings.defaults.researchBudgetSec, 120);
   assert.equal(settings.defaults.observeMaxWaitMs, 30_000);
   // Unspecified defaults keep the standing pilot allowance.
@@ -165,4 +174,33 @@ test("refuses unusable configuration instead of partially trusting it", async (c
   );
   await writeFile(target.taskTextPath, "x".repeat(SCIENCE_FLOW_LOCAL_RESEARCH_TASK_TEXT_MAX_BYTES + 1), "utf8");
   await assert.rejects(load(target, configValue(target)), /must not exceed/);
+});
+
+test("fixed input bindings must be real files contained by the seed dir", async (context) => {
+  const target = await fixture(context);
+  const research = () => configValue(target).research as Record<string, unknown>;
+  await assert.rejects(
+    load(target, configValue(target, {
+      research: { ...research(), inputs: { plan: "/etc/passwd" } },
+    })),
+    /must be a relative file name/,
+  );
+  await assert.rejects(
+    load(target, configValue(target, {
+      research: { ...research(), inputs: { plan: "../outside.md" } },
+    })),
+    /must name a readable file|must stay inside/,
+  );
+  await assert.rejects(
+    load(target, configValue(target, {
+      research: { ...research(), inputs: { incumbent: "missing.json" } },
+    })),
+    /must name a readable file/,
+  );
+  await assert.rejects(
+    load(target, configValue(target, {
+      research: { ...research(), inputs: { plan: "experiment_plan.md", seed: "candidate_a.json" } },
+    })),
+    /unsupported key/,
+  );
 });
