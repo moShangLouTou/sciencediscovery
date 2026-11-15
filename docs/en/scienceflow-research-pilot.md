@@ -1,9 +1,11 @@
 # ScienceFlow research pilot: one evaluated circle-packing loop
 
-Status: operator-run research pilot (round 19). This note records what was
-actually executed, what the engine and the model did, and what the result does
-and does not support. It is evidence of bounded internal runs, not a product
-capability.
+Status: operator-run research pilot (round 19). Five bounded managed runs were
+executed on the engine's own `circle-packing` task. Runs 1–3 established the
+task, evaluator and process evidence; runs 4–5 closed the loop: a
+model-produced candidate was captured and evaluated by the engine, the engine's
+score was delivered back to the model, and the model then produced a second
+candidate that the engine captured, evaluated and compared.
 
 ## 1. What this pilot is
 
@@ -32,6 +34,8 @@ modified.
 | Task description | `description_lite.md`, sha256 `abc5514a57719fbf49b1df64f5ac49534e43f0fc9a8ade159a851f33bc3c4966` |
 | Package tree | `tree_sha256 17721fbad2fc429ea20ccf8623d964faeb8f88234b80ca88aa699ac8182bc33d` |
 | Evaluator timeout | 300 s (declared in `task.yaml`) |
+| Engine | pinned checkout, commit `e1347021eaa497d2dc138d9e66ce36e09260568a` |
+| Model | alias `round19-qwen-flash`, provider model `Qwen3.8-Flash` |
 
 The evaluator contract is established independently of any model output, both by
 direct execution and through the engine's real `entrypoint_runner`:
@@ -50,161 +54,145 @@ each run was started through its managed-run control API:
 cd .tmp/r/round19/pilot
 XDG_STATE_HOME=$PWD/state \
 PYTHONPATH=<pinned-sf-checkout> \
+ROUND19_NOINSTALL_SHIMS=1 \
 <python-3.12.12-venv>/bin/python launch_pilot.py <manifest>.yaml <run-id>
 ```
 
 `launch_pilot.py` only wraps the allowance around the engine's own entry: it
 calls `scienceflow.runtime.parallel.control.start_run(manifest)`, polls
 `get_run`, samples the engine processes it spawned, and would call `stop_run` if
-the run were still alive at 600 s. Research and reporting themselves run inside
-the engine's detached supervisor; the launcher makes no model call.
+the run were still alive at its wall-clock limit. Research and reporting
+themselves run inside the engine's detached supervisor; the launcher makes no
+model call.
 
-The manifest fixes one worker, CPU only, the research budget, a hard report
-budget and an empty task-owned input directory, and points `config` at a wrapper
-that includes the pinned engine `default.yaml` followed by the private pilot
-settings (model alias, token limits, HTTP timeout). The wrapper exists so the
-engine's own profile defaults (context window, tool limits, sandbox, `lnr`
-defaults) stay in effect while the approved model configuration overrides only
-the model roles and limits.
-
-Redacted manifest of the run that produced the reported candidate:
+Runs 4–5 used a new run identity per attempt and an input directory that carries
+the incumbent candidate as a traced seed:
 
 ```yaml
 defaults:
   config: <pilot>/engine-config-b.yaml
   workspace_base: <pilot>/runs
-  input_data_dir: <pilot>/inputs-empty
+  input_data_dir: <pilot>/seed-round19d
   gpu_list: cpu
   scienceflow_interaction_log_full: true
   scienceflow_bash_timeout_sec: 60
 tasks:
   - exp_id: circle-packing
-    run_id: round19-circle-packing-c
+    run_id: round19-circle-packing-e
 lnr:
   num_workers: 1
   merge_enabled: false
-  wall_clock_budget_sec: 540
-  max_steps: 12
+  wall_clock_budget_sec: 840
+  max_steps: 24
   stage_capture_max_count: 2
 report_budget_sec: 60
 ```
 
-## 4. Three attempts, and what each one taught
+The seed directory contains the incumbent artifact, the engine evaluator's result
+for that exact file, and the model-written solver that produced it. It is
+labelled as carried-over work with its source run, so nothing in the new run is
+presented as if the old run had resumed or as if the seed were a new model
+result.
+
+## 4. The five runs
 
 All corrections were configuration-only; no engine or SD source was changed.
 
 | Run | Change | Outcome |
 | --- | --- | --- |
-| 1 | initial manifest | 244 s, no candidate. With `input_data_dir` unset the engine defaulted to `.` and `prepare_workspace_dataset_flat` symlinked every entry of the operator's pilot directory into `workspace/dataset/`; the LLM merge reserve also cut the single worker's budget from 540 s to 240 s. |
-| 2 | isolated empty input dir; `merge_enabled: false` | 542 s, no candidate. The worker now had the full 540 s, but the model spent it on five package-install attempts (`pip`/`uv`, one backgrounded with `nohup`), then wrote a numpy-based solver that could never import. |
-| 3 | plus `evaluator.command.python_executable`, install-refusing PATH shims, 60 s bash timeout | 543 s, one valid candidate at `radii_sum = 2.6166` (`benchmark_ratio = 0.993`). |
+| 1 | initial manifest | 244 s, no candidate. With `input_data_dir` unset the engine defaulted to `.` and linked every entry of the operator's pilot directory into `workspace/dataset/`; the LLM merge reserve also cut the single worker's budget from 540 s to 240 s. |
+| 2 | isolated empty input dir; `merge_enabled: false` | 542 s, no candidate. The worker had the full 540 s, but the model spent it on five package-install attempts (`pip`/`uv`, one backgrounded with `nohup`), then wrote a numpy-based solver that could never import. |
+| 3 | plus `evaluator.command.python_executable`, install-refusing PATH shims, 60 s bash timeout | 543 s, one valid candidate at `radii_sum = 2.6166`, but its producing command was cut off by the deadline, so the engine archived it with `tool_error: true` and captured no stage. |
+| 4 | seeded incumbent; 840 s research / 24 steps (user's continuation allowance) | 846 s. S01 captured the seeded incumbent and the engine evaluated it; the model received the engine's S01 row in stage S02 and rebuilt a solver, but the research budget ended before it wrote a changed artifact. |
+| 5 | same seed with the prior solver resuming from the incumbent artifact | 846 s. Three candidates evaluated: S01 (seeded incumbent) and S02 (model's own solver) captured as stages; a third candidate (S03) was evaluated and gate-accepted but not admitted because the run's two-stage cap was reached. |
 
-Run 3's two additions exist because of what run 2 showed. With
-`evaluator.command.python_executable` unset, `task_python_executable()` resolves
-to `None`, so the worker's "Task runtime contract" prompt drops both the
-interpreter line and the engine's own "do not install task dependencies into the
-controller `.venv` or a new ad-hoc workspace environment" guidance; the model
-then had no supported interpreter to use or reason about. The shims make `uv`,
-`pip` and `pip3` exit non-zero with a one-line notice, which enforces the pilot's
-own rule that nothing may be installed, instead of leaving an installation that
-cannot complete to absorb the budget.
+Run 5 is the loop this pilot was for.
 
-## 5. What the engine actually spawned
+## 5. How a returned command becomes model feedback
 
-Sampled from `/proc` while the runs were live (not reconstructed afterwards):
+The mechanism is the engine's own, and it is why the earlier runs missed:
 
-- supervisor: `<venv>/bin/python -m scienceflow.runtime.parallel.control.worker <run-id> <token>`
-- research worker: `<venv>/bin/python -P -m scienceflow.runtime.parallel.execution.task_worker <task text> --workspace <task root> --type lnr --config <pilot>/engine-config-b.yaml`
-- report entry: `<venv>/bin/python -P -m scienceflow.runtime.parallel.control.reporting <run-id> <token> <supervisor-pid> 60.0`
+1. After each bash tool call the post-commit adapter archives the candidate and
+   then considers stage capture (`scienceflow/agent/core/ports/session_callbacks.py:68,109`).
+2. Capture requires the tool result to be non-error, and the per-command timeout
+   is `min(configured, remaining)` (`coordinator/shared.py:239`). A command that
+   runs into the research deadline therefore always returns an error, and its
+   artifact never becomes a stage — exactly what happened in run 3.
+3. When capture does fire, the engine evaluates the artifact
+   (`_record_evaluator_stage_events` → `TaskPackageBackend`) and commits the
+   stage (`evaluation/commit.py:199`). The commit turn then shows the model the
+   evaluated facts, including `metric: <value>`
+   (`lifecycle/stage/prompt.py:112,140`), and the committed ledger row
+   (`### S01 | metric: ... | metric_note: authoritative_evaluator_ok`) stays in
+   the model's context for the following stage.
 
-Every process resolved to the same interpreter
-(`.../uv/python/cpython-3.12.12-linux-x86_64-gnu/bin/python3.12`, reached through
-the venv symlink) with `PYTHONPATH` pinned to the engine checkout and
-`XDG_STATE_HOME` inside the pilot directory. The `-P` flag — the round-18 EC6
-change that keeps the writable workspace off `sys.path` — is observable on the
-real worker and report entries of real runs, not only in `argv` assertions.
+So the feedback channel is real and engine-owned; the only requirement is that a
+bounded command returns after writing the artifact.
 
-Run state stayed inside the pilot: run records under
-`<pilot>/state/scienceflow/managed_runs/`, task state under
-`<pilot>/runs/<run-id>/circle-packing/`. Nothing was written to the daily SDK
-state, to either worktree, or to the isolated interpreter.
+## 6. Run 5: the loop
 
-## 6. The result
+| Candidate | Stage | `radii_sum` | Artifact sha256 (16) | Engine status | Produced by |
+| --- | --- | --- | --- | --- | --- |
+| A (incumbent, carried seed) | S01 | 2.61661905326 | `1401d3987588f19e` | captured, `task_package` ok, validity high | model copied the traced seed into `artifacts/best_solution.json` at t+1 s |
+| B | S02 | 2.621352304043 | `f5c5579c4e5e06da` | captured, `task_package` ok, validity high | model's own `solver/pack.py`, written after S01's engine row |
+| C | S03 (not captured) | 2.635799459773 | `ab9b077bb45bdf1b` | evaluator `ok`, gate `accept eligible`, no stage | model's own C solver `solver/cp_v1.c` |
 
-Run 3 produced a real, valid candidate:
+- B vs A: `+0.004733` (`+0.18%`), `0.9930 → 0.9948` of the benchmark 2.635.
+- C vs B: `+0.014447` (`+0.55%`); C reaches `1.0003x` the declared benchmark.
+- C is not a stage: `lnr.stage_capture_max_count` was 2 for this run. The engine
+  still ran its evaluator and gate for the artifact (`evaluator_metric_event`,
+  `gate: accept eligible`, `validation_ok`, `candidate_ready`,
+  `selection_eligible`, `metric_validity: high`) and archived it; a later
+  operator re-evaluation through the same `TaskPackageBackend` reproduced
+  `2.635799459773` (`benchmark_ratio = 1.0003034`, 26 circles, valid). It is
+  reported here as an engine-evaluated, gate-accepted candidate that was **not**
+  admitted as a stage, not as a third stage.
 
-- model-authored code: `workers/w00/workspace/packing_core.py` and `solve.py`,
-  pure Python (`math`, `json`, `random`) — no third-party dependency;
-- artifact: `workers/w00/workspace/artifacts/best_solution.json`, 1510 bytes,
-  sha256 `1401d3987588f19e61f72164440bbfe506aa3a6eb1076e9acd223718a414b0a7`;
-- authoritative evaluation through the engine's own `TaskPackageBackend`:
-  `radii_sum = 2.61661905326`, `benchmark_ratio = 0.993`, `validation_ok`,
-  `candidate_ready`, `selection_eligible`, `metric_validity = high`,
-  `evaluator_status = ok`, 0.10 s.
+Stage lifecycle in the engine's own journal:
 
-That is 99.3% of the declared benchmark 2.635, from a solver the model wrote and
-ran inside its own workspace.
+| Stage | captured (detect) | committed | note |
+| --- | --- | --- | --- |
+| S01 | 11:35:57 | 11:38:10 | seeded incumbent |
+| S02 | 11:41:58 | 11:42:50 | model's `pack.py` |
+| S03 | 11:46:14 | — | cap reached; assess ran, no commit |
 
-The engine did not record it as a research stage, and the reason is specific. The
-model's last command was `timeout 90 python3 solve.py search 45`, launched with
-about three seconds of research budget left; the artifact had already been
-flushed at 10:39:00.87, and the command was killed at 10:39:03 with the tool
-result `Error: Command timed out after 3s`. Stage capture requires a non-error
-tool result, so no stage was captured. The engine nevertheless archived the
-candidate and recorded why:
+The model's S02 request already carried the engine's S01 row
+(`### S01 | metric: 2.61661905326 | ... authoritative_evaluator_ok`), and the
+same row is present in every later request of the run. The run ended
+`completed` with `stage_count = 2`.
 
-```json
-{"trigger": "bash", "artifact_path": "artifacts/best_solution.json",
- "snapshot_path": "../logs/artifact_snapshots/iter_0001_20261115T023903Z_best_solution_sha_1401d3987588.json",
- "size_bytes": 1510, "tool_error": true}
-```
-
-So the loop reached "model writes code → code runs → valid artifact exists →
-authoritative score available", and missed the engine-captured stage by one tool
-result. The evaluation above was invoked by the operator through the engine's
-real evaluator backend; it is not a stage the engine recorded itself.
-
-Only one candidate was produced. There was no second candidate and therefore no
-evaluator-feedback iteration: the A → feedback → B half of the target loop is not
-demonstrated by this pilot.
+Both captured candidates are preserved: the engine's `artifact_snapshots/`
+keeps `iter_0001..._1401d3987588` and `iter_0002..._f5c5579c4e5e`, and the
+operator-side immutable records are `candidate-a/`, `candidate-b/`,
+`candidate-c/` (artifact, evaluator result, provenance, model code, 0444).
 
 ## 7. Reading the run back through ScienceDiscovery
 
 The run records were read at service level, without the product stack or a
-browser:
+browser: `services/scienceflow-reader/snapshot.py` (real reader, spawned as a
+child process), `services/api/src/scienceflow/run-snapshot.ts`
+(`createScienceFlowRunSnapshotQuery`), `services/api/src/scienceflow/dto.ts`
+(`projectScienceFlowRunSnapshot`), and
+`services/api/src/scienceflow/registration.ts` +
+`registration-repository.ts` (a registration row in a real
+`science_flow_run_registrations` table on an isolated `node:sqlite` file).
 
-- `services/scienceflow-reader/snapshot.py` — the real reader, spawned as a
-  child process by the real wrapper.
-- `services/api/src/scienceflow/run-snapshot.ts` — `createScienceFlowRunSnapshotQuery`
-  with the administrator-style binding (`runId` → run record + allowed task
-  roots), the real identity checks, and the real reader invocation.
-- `services/api/src/scienceflow/dto.ts` — `projectScienceFlowRunSnapshot`, the
-  public allow-listed DTO.
-- `services/api/src/scienceflow/registration.ts` and
-  `registration-repository.ts` — a registration row persisted to a real
-  `science_flow_run_registrations` table in an isolated `node:sqlite` file.
+| Run | Readback |
+| --- | --- |
+| 3 | `status failed`, `candidate: null`, `no_candidate_binding` — a valid artifact on disk that was never captured as a stage is not expressible |
+| 4 | `status completed`, `reportedMetric radii_sum 2.61661905326` (source `lhr_stage_performance`), `candidate` sha `1401d398…`, `digestVerified: true`, `stageId S01` |
+| 5 | `status completed`, `reportedMetric radii_sum 2.621352304043`, `candidate` sha `f5c5579c…`, `digestVerified: true`, `stageId S02` |
 
-Run identity and the recorded outcome read back correctly: every run reports its
-own `runId`, `status` and `phase`, and registration persists and lists as
-specified. Two limits are visible in that readback:
-
-1. The snapshot binds a candidate only through `merge/best_stage_manifest.json`
-   or `task_logs/lhr_stage_performance.csv`. Neither exists for run 3, because
-   the engine captured no stage — so the reader reports
-   `no_candidate_binding` and the DTO carries `candidate: null` even though a
-   valid, digest-verified artifact is on disk. The snapshot cannot express "an
-   artifact exists but was never captured as a stage".
-2. The DTO has no per-candidate or feedback field, so an A/B comparison is not
-   expressible today whatever the run records.
-
-The two-candidate comparison would therefore need a small additive projection,
-not a redesign: an optional per-task candidate summary sourced from the engine's
-artifact archive, and an optional feedback reference. Neither was implemented —
-this pilot changed no SD source.
+Two limits remain visible in the readback: the DTO binds the best *captured*
+stage, so run 5's S03 candidate (evaluated, gate-accepted, not a stage) is not
+expressible; and the DTO has no per-candidate list or feedback reference, so the
+A→B comparison is readable from the run record and the stage CSV but not from
+the DTO.
 
 Only the identity lookup is an in-memory adapter: importing the full
 `SessionStore` graph in this worktree needs package installs that are out of
 scope here. The API server, HTTP routes and browser journeys were not started.
+No SD source was changed.
 
 ## 8. What this pilot does not claim
 
@@ -219,20 +207,31 @@ scope here. The API server, HTTP routes and browser journeys were not started.
 - No user-visible HTTP or browser journey is claimed.
 - Package installation was disabled for these runs by operator control; the
   shims are part of the pilot's environment, not of the engine.
+- Candidate C is an engine-evaluated, gate-accepted, archived candidate, not a
+  captured stage. The stage cap that excluded it is a run setting, not an engine
+  result.
+- The seeded incumbent A was produced by the model in run 3; run 5's model
+  re-materialized it, and B and C are the model's own work in run 5.
 
 ## 9. Where the evidence lives
 
 Ignored local artifacts under `.tmp/r/round19/` (never committed):
 
 - `pilot/state/scienceflow/managed_runs/<run-id>/control.json` — the run record.
-- `pilot/runs/<run-id>/circle-packing/` — task state: `task_logs/`,
-  `workers/w00/logs/` (stage events, candidate archive ledger,
-  `agent_provider_calls.jsonl`, interaction log), `workers/w00/workspace/`
-  (model-authored code and `artifacts/`), `workers/w00/snapshots/`, `merge/`,
-  `report.md`.
+- `pilot/runs/<run-id>/circle-packing/` — task state: `task_logs/`
+  (`lhr_stage_performance.csv`, `lhr_state.json`), `workers/w00/logs/`
+  (`lhr_stage_lifecycle_events.jsonl`, `checkpoints/artifact_archive.jsonl`,
+  `artifact_snapshots/`, `agent_provider_calls.jsonl`,
+  `agent_runtime_audit/agent_runtime_operations/`, interaction logs),
+  `workers/w00/workspace/` (model-authored code and `artifacts/`),
+  `workers/w00/snapshots/W00-L01-S*/`, `merge/`, `report.md`.
 - `pilot/launcher-evidence*.json` — allowance, process samples, termination.
-- `pilot/evidence-<run-id>.json` — stage rows, model-call timeline, artifacts.
-- `pilot/evaluator-controls/controls.json` — evaluator control results.
+- `pilot/evidence-<run-id>.json` — stage rows, lifecycle, call timeline, artifacts.
+- `pilot/candidate-a/`, `pilot/candidate-b/`, `pilot/candidate-c/` — immutable
+  candidate records (artifact, evaluator result, provenance, model code).
+- `pilot/seed-round19d/` — the seed carried into runs 4–5.
 - `pilot/engine-evaluation-<run-id>.json` — the engine backend's evaluation of
-  the model-produced artifact.
+  the workspace artifact.
 - `pilot/sd-readback/<run-id>/readback.json` — registration + reader + DTO.
+- `compare_stages.py`, `verify_stage_feedback.py`, `extract_evidence.py` —
+  read-only analysis scripts used for the tables above.
