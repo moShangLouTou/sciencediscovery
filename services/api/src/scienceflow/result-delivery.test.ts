@@ -538,9 +538,11 @@ test("links the plan version and drops the templated next-experiment suggestion"
   assert.deepEqual(noteVersion?.inputArtifactVersionIds, [record.artifacts.solution!.versionId, plan.versionId]);
 
   const noteText = (await new CasStore(target.store.dataDir).read(note.content.hash)).toString("utf8");
-  assert.match(noteText, /## Experiment plan tested/);
+  assert.match(noteText, /## Linked experiment plan/);
   assert.ok(noteText.includes(plan.versionId), "the note must cite the plan version id");
   assert.ok(noteText.includes(plan.artifactId), "the note must cite the plan artifact id");
+  assert.match(noteText, /Linking establishes identity only/, "linking must not claim the plan was executed");
+  assert.ok(!noteText.includes("researcher received the plan"), "linking must not claim the researcher read the plan");
   assert.match(noteText, /## Interpreting this run/);
   assert.ok(!noteText.includes("Proposed next experiment (not run)"), "the template suggestion must not stand in for the plan");
   assert.ok(!noteText.includes("twice the largest stage-to-stage step"), "the template margin is not a plan requirement");

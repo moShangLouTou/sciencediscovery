@@ -1053,14 +1053,14 @@ function buildResultNote(input: {
 
   if (plan) {
     lines.push(
-      "## Experiment plan tested",
+      "## Linked experiment plan",
       "",
       `- Plan artifact: \`${plan.logicalName}\` version ${plan.version} (artifact \`${plan.artifactId}\`, version \`${plan.versionId}\`, content sha256 \`${plan.content.hash}\`${plan.title ? `, title "${cell(plan.title)}"` : ""}).`,
       ...(incumbent
         ? [`- Fixed incumbent artifact: \`${incumbent.logicalName}\` version ${incumbent.version} (artifact \`${incumbent.artifactId}\`, version \`${incumbent.versionId}\`, content sha256 \`${incumbent.content.hash}\`).`]
         : []),
-      "- This plan is the Session Agent's own research decision for this run, recorded before the run started; the operator did not author it and this note does not restate it.",
-      "- The run's researcher received the plan content as part of its input data; the engine's own interaction logs record what it read and which commands it ran.",
+      "- This is a fixed Session artifact version; the operator did not author it and this note neither restates nor rewrites it.",
+      "- Linking establishes identity only: it does not establish that the researcher read or followed the plan. What actually ran is evidenced by the engine's interaction logs and the evaluated stages, not by this link.",
       "",
     );
   } else if (incumbent) {
