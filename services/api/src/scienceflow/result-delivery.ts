@@ -93,6 +93,23 @@ export interface ScienceFlowResultDeliveryRequest {
   readonly pythonExecutable: string;
   readonly readerScriptPath: string;
   readonly task?: string;
+  /**
+   * The Agent-authored plan version this run tested, if one exists. It is
+   * linked to the delivered note and must already be a live artifact of this
+   * Session; delivery never authors or rewrites a plan.
+   */
+  readonly planVersionId?: string;
+  /**
+   * The fixed incumbent version the run was seeded with. Linking it lets the
+   * stage roles be exact: only a stage whose digest matches this version is
+   * labelled the carried seed.
+   */
+  readonly incumbentVersionId?: string;
+  /**
+   * Publish every captured stage artifact, not only the selected best, so a
+   * worse new attempt stays visible as an evaluated candidate.
+   */
+  readonly includeAttempts?: boolean;
   /** Where the delivery record is written; defaults to `<work-dir>/delivery.json`. */
   readonly recordPath?: string;
   /**
@@ -124,6 +141,8 @@ export type ScienceFlowResultDeliveryFailureReason =
   | "candidate-sha-mismatch"
   | "candidate-unreadable"
   | "stage-ledger-conflict"
+  | "plan-version-not-found"
+  | "plan-unreadable"
   | "publication-failed";
 
 export type ScienceFlowResultDeliveryStep =
@@ -133,7 +152,9 @@ export type ScienceFlowResultDeliveryStep =
   | "readback"
   | "resolve"
   | "verify"
+  | "plan"
   | "publish-solution"
+  | "publish-attempts"
   | "publish-note";
 
 /** The selected captured stage, as the reader resolved and verified it. */
@@ -161,6 +182,35 @@ export interface ScienceFlowDeliveredArtifact {
   readonly versionId: string;
 }
 
+/** A fixed Session artifact version this run is linked to; never authored here. */
+export interface ScienceFlowLinkedVersion {
+  readonly artifactId: string;
+  readonly logicalName: string;
+  readonly title: string | null;
+  readonly content: CasObjectRef;
+  readonly version: number;
+  readonly versionId: string;
+}
+
+/**
+ * One captured stage's artifact, published separately from the selected best.
+ * A stage that reproduces the fixed incumbent is the carried seed; another
+ * first stage is already a new candidate; a later stage is a new attempt. All
+ * of them are engine-captured stages, not operator reconstructions.
+ */
+export interface ScienceFlowDeliveredAttempt {
+  readonly stageId: string;
+  readonly role: "carried_seed" | "first_captured" | "evaluated_attempt";
+  readonly metricName: string;
+  readonly metricValue: number;
+  readonly artifactSha256: string | null;
+  readonly status: "published" | "unresolved" | "selected";
+  /** Present when `published`; the selected stage is represented by the solution. */
+  readonly artifact?: ScienceFlowDeliveredArtifact;
+  /** A stable reason when the stage artifact could not be published. */
+  readonly reason?: string;
+}
+
 export interface ScienceFlowResultDeliveryRecord {
   readonly schemaVersion: typeof SCIENCE_FLOW_RESULT_DELIVERY_VERSION;
   readonly invocation: "scienceflow-result-delivery";
@@ -180,6 +230,9 @@ export interface ScienceFlowResultDeliveryRecord {
   /** The public allow-listed snapshot; no host paths or reader prose. */
   readonly snapshot: ScienceFlowRunSnapshotDto | null;
   readonly selected: ScienceFlowDeliveredSelection | null;
+  readonly plan: ScienceFlowLinkedVersion | null;
+  readonly incumbent: ScienceFlowLinkedVersion | null;
+  readonly attempts: readonly ScienceFlowDeliveredAttempt[];
   readonly stages: readonly ResearchPilotStageRow[] | null;
   readonly artifacts: {
     readonly solution?: ScienceFlowDeliveredArtifact;
@@ -237,6 +290,9 @@ export async function deliverScienceFlowResult(
   let runState: ScienceFlowResultDeliveryRecord["runState"] = null;
   let snapshot: ScienceFlowRunSnapshotDto | null = null;
   let selected: ScienceFlowDeliveredSelection | null = null;
+  let plan: ScienceFlowLinkedVersion | null = null;
+  let incumbent: ScienceFlowLinkedVersion | null = null;
+  let attempts: readonly ScienceFlowDeliveredAttempt[] = [];
   let stages: readonly ResearchPilotStageRow[] | null = null;
 
   const failed = (
@@ -245,10 +301,13 @@ export async function deliverScienceFlowResult(
     message: string,
   ): ScienceFlowResultDeliveryRecord => ({
     artifacts,
+    attempts,
     finishedAt: now(),
     identity,
     invocation: "scienceflow-result-delivery",
     outcome: { failedStep, message, reason, status: "failed" },
+    incumbent,
+    plan,
     registration,
     run: { runId: request.runId, task: target?.task ?? request.task ?? SCIENCE_FLOW_RESULT_DELIVERY_DEFAULT_TASK },
     runState,
@@ -317,6 +376,14 @@ export async function deliverScienceFlowResult(
     }
     const receipt = await readReceiptFacts(target, identity);
 
+    step = "plan";
+    plan = request.planVersionId
+      ? await resolveLinkedVersion(store, identity, request.planVersionId, "plan")
+      : null;
+    incumbent = request.incumbentVersionId
+      ? await resolveLinkedVersion(store, identity, request.incumbentVersionId, "incumbent")
+      : null;
+
     step = "publish-solution";
     const solution = await publishDeliveredArtifact(store, {
       bytes,
@@ -331,9 +398,24 @@ export async function deliverScienceFlowResult(
     });
     artifacts.solution = solution;
 
+    step = "publish-attempts";
+    attempts = request.includeAttempts
+      ? await publishCapturedAttempts(store, {
+          identity,
+          incumbent,
+          plan,
+          selected,
+          stages: stages ?? [],
+          target,
+        })
+      : [];
+
     step = "publish-note";
     const noteText = buildResultNote({
+      attempts,
       identity,
+      incumbent,
+      plan,
       receipt,
       registration,
       runState,
@@ -347,7 +429,12 @@ export async function deliverScienceFlowResult(
       bytes: Buffer.from(noteText, "utf8"),
       description: `Delivered result note for ScienceFlow run ${target.runId} (selected stage ${selected.stageId})`,
       digest: undefined,
-      inputArtifactVersionIds: [solution.versionId],
+      inputArtifactVersionIds: [
+        solution.versionId,
+        ...attempts.flatMap((attempt) => (attempt.artifact ? [attempt.artifact.versionId] : [])),
+        ...(plan ? [plan.versionId] : []),
+        ...(incumbent ? [incumbent.versionId] : []),
+      ],
       kind: "markdown",
       mediaType: "text/markdown",
       logicalName: `scienceflow/${target.runId}/${DELIVERY_OUTPUTS.note}`,
@@ -359,10 +446,13 @@ export async function deliverScienceFlowResult(
 
     return {
       artifacts,
+      attempts,
       finishedAt: now(),
       identity,
       invocation: "scienceflow-result-delivery",
       outcome: { status: "delivered" },
+      incumbent,
+      plan,
       registration,
       run: { runId: target.runId, task: target.task },
       runState,
@@ -383,7 +473,7 @@ export async function deliverScienceFlowResult(
           : "The Session is read-only; nothing was published",
       );
     }
-    if (step === "publish-solution" || step === "publish-note") {
+    if (step === "publish-solution" || step === "publish-attempts" || step === "publish-note") {
       return failed(step, "publication-failed", errorMessage(error));
     }
     if (step === "resolve" || step === "verify") {
@@ -698,6 +788,166 @@ function deliveryOriginMeta(
   };
 }
 
+/**
+ * Resolve a fixed version the operator names (the plan or the incumbent) to
+ * the Session's own artifact record. Delivery only links it: it never writes,
+ * rewrites or interprets the linked content, and it refuses a version from
+ * another Session or an unreadable one.
+ */
+async function resolveLinkedVersion(
+  store: SessionStore,
+  identity: { readonly projectId: string; readonly sessionId: string },
+  versionId: string,
+  label: "plan" | "incumbent",
+): Promise<ScienceFlowLinkedVersion> {
+  if (!isUsableId(versionId)) {
+    throw new DeliveryRefusal("invalid-option", `The ${label} version id is not a usable business id`);
+  }
+  const version = store.getProjectArtifactVersion(identity.projectId, versionId);
+  const artifact = version ? store.getProjectArtifact(identity.projectId, version.artifactId) : undefined;
+  if (!version || !artifact || artifact.deletedAt || artifact.createdInSessionId !== identity.sessionId) {
+    throw new DeliveryRefusal(
+      "plan-version-not-found",
+      `The ${label} version is not a live artifact version of this Session`,
+    );
+  }
+  let bytes: Buffer;
+  try {
+    bytes = await new CasStore(store.dataDir).read(version.content.hash);
+  } catch {
+    throw new DeliveryRefusal("plan-unreadable", `The ${label} version's content could not be read`);
+  }
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  if (bytes.length !== version.content.size || digest !== version.content.hash) {
+    throw new DeliveryRefusal("plan-unreadable", `The ${label} version's content does not match its recorded digest`);
+  }
+  return {
+    artifactId: artifact.id,
+    content: version.content,
+    logicalName: artifact.name,
+    title: artifact.title ?? null,
+    version: version.version,
+    versionId: version.id,
+  };
+}
+
+/**
+ * Publish every captured stage as its own artifact. The selected stage is
+ * represented by the solution artifact; every other stage is a carried seed, a
+ * first captured candidate, or an evaluated attempt. Only a stage whose digest
+ * matches the linked incumbent is called the seed. A stage whose bytes cannot
+ * be verified is reported as unresolved instead of being silently dropped or
+ * replaced.
+ */
+async function publishCapturedAttempts(
+  store: SessionStore,
+  input: {
+    readonly identity: { readonly projectId: string; readonly sessionId: string };
+    readonly incumbent: ScienceFlowLinkedVersion | null;
+    readonly plan: ScienceFlowLinkedVersion | null;
+    readonly selected: ScienceFlowDeliveredSelection;
+    readonly stages: readonly ResearchPilotStageRow[];
+    readonly target: DeliveryTarget;
+  },
+): Promise<readonly ScienceFlowDeliveredAttempt[]> {
+  const { identity, incumbent, plan, selected, stages, target } = input;
+  const attempts: ScienceFlowDeliveredAttempt[] = [];
+  const seen = new Set<string>();
+  for (const stage of stages) {
+    if (seen.has(stage.stageId)) continue;
+    seen.add(stage.stageId);
+    const role: ScienceFlowDeliveredAttempt["role"] = incumbent && stage.artifactSha256 === incumbent.content.hash
+      ? "carried_seed"
+      : stage.parentStageId
+        ? "evaluated_attempt"
+        : "first_captured";
+    const base = {
+      artifactSha256: stage.artifactSha256,
+      metricName: stage.metricName,
+      metricValue: stage.metricValue,
+      role,
+      stageId: stage.stageId,
+    } as const;
+    if (stage.stageId === selected.stageId) {
+      attempts.push({ ...base, status: "selected" });
+      continue;
+    }
+    const unresolved = (reason: string): void => {
+      attempts.push({ ...base, status: "unresolved", reason });
+    };
+    if (!stage.artifactSha256 || !stage.artifactPath || !stage.snapshotPath) {
+      unresolved("stage-artifact-not-recorded");
+      continue;
+    }
+    const read = await readStageArtifact(target, stage);
+    if (read.status === "unresolved") {
+      unresolved(read.reason);
+      continue;
+    }
+    const artifact = await publishDeliveredArtifact(store, {
+      bytes: read.bytes,
+      description: `Captured ${roleLabel(role)} stage ${stage.stageId} of ScienceFlow run ${target.runId}`,
+      digest: stage.artifactSha256,
+      ...(plan ? { inputArtifactVersionIds: [plan.versionId] } : {}),
+      kind: "json",
+      logicalName: `scienceflow/${target.runId}/attempts/${stage.stageId.toLowerCase()}/solution.json`,
+      mediaType: "application/json",
+      originMeta: {
+        ...deliveryOriginMeta(target.runId, stage.stageId, stage.artifactSha256),
+        attemptRole: role,
+        ...(plan ? { planVersionId: plan.versionId } : {}),
+        ...(incumbent ? { incumbentVersionId: incumbent.versionId } : {}),
+      },
+      sessionId: identity.sessionId,
+      title: `ScienceFlow ${target.runId} stage ${stage.stageId} ${roleLabel(role)} (${stage.metricName} ${stage.metricValue})`,
+    });
+    attempts.push({ ...base, artifact, status: "published" });
+  }
+  return attempts;
+}
+
+function roleLabel(role: ScienceFlowDeliveredAttempt["role"]): string {
+  return role === "carried_seed"
+    ? "carried seed"
+    : role === "first_captured"
+      ? "first captured candidate"
+      : "evaluated attempt";
+}
+
+/**
+ * Read one captured stage's artifact from the engine's own stage snapshot.
+ * Both the snapshot and the file must resolve inside the run's task root, and
+ * the bytes must match the digest the ledger recorded.
+ */
+async function readStageArtifact(
+  target: DeliveryTarget,
+  stage: ResearchPilotStageRow,
+): Promise<{ readonly status: "ok"; readonly bytes: Buffer } | { readonly status: "unresolved"; readonly reason: string }> {
+  try {
+    const realRoot = await realpath(target.taskRoot);
+    const realSnapshot = await realpath(resolve(stage.snapshotPath!));
+    const realFile = await realpath(resolve(resolve(stage.snapshotPath!), stage.artifactPath!));
+    if (!isWithin(realRoot, realSnapshot) || !isWithin(realRoot, realFile) || !isWithin(realSnapshot, realFile)) {
+      return { reason: "artifact-path-out-of-bounds", status: "unresolved" };
+    }
+    const metadata = await stat(realFile);
+    if (!metadata.isFile()) return { reason: "artifact-file-missing", status: "unresolved" };
+    if (metadata.size > MAX_DELIVERY_BYTES) return { reason: "artifact-too-large", status: "unresolved" };
+    const bytes = await readFile(realFile);
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    if (digest !== stage.artifactSha256) {
+      return { reason: "artifact-digest-mismatch", status: "unresolved" };
+    }
+    return { bytes, status: "ok" };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      return { reason: "artifact-file-missing", status: "unresolved" };
+    }
+    return { reason: "artifact-unreadable", status: "unresolved" };
+  }
+}
+
 interface ReceiptFacts {
   readonly model: {
     readonly profileName: string;
@@ -760,7 +1010,10 @@ async function readReceiptFacts(
  * Agent reading of it is separate from this text.
  */
 function buildResultNote(input: {
+  readonly attempts: readonly ScienceFlowDeliveredAttempt[];
   readonly identity: { readonly projectId: string; readonly sessionId: string };
+  readonly incumbent: ScienceFlowLinkedVersion | null;
+  readonly plan: ScienceFlowLinkedVersion | null;
   readonly receipt: ReceiptFacts;
   readonly registration: NonNullable<ScienceFlowResultDeliveryRecord["registration"]>;
   readonly runState: NonNullable<ScienceFlowResultDeliveryRecord["runState"]>;
@@ -770,7 +1023,7 @@ function buildResultNote(input: {
   readonly stages: readonly ResearchPilotStageRow[];
   readonly target: DeliveryTarget;
 }): string {
-  const { identity, receipt, registration, runState, selected, solution, stages, target } = input;
+  const { attempts, identity, incumbent, plan, receipt, registration, runState, selected, solution, stages, target } = input;
   const lines: string[] = [];
   const direction = selected.lowerIsBetter === true
     ? "lower is better"
@@ -798,6 +1051,27 @@ function buildResultNote(input: {
     "",
   );
 
+  if (plan) {
+    lines.push(
+      "## Experiment plan tested",
+      "",
+      `- Plan artifact: \`${plan.logicalName}\` version ${plan.version} (artifact \`${plan.artifactId}\`, version \`${plan.versionId}\`, content sha256 \`${plan.content.hash}\`${plan.title ? `, title "${cell(plan.title)}"` : ""}).`,
+      ...(incumbent
+        ? [`- Fixed incumbent artifact: \`${incumbent.logicalName}\` version ${incumbent.version} (artifact \`${incumbent.artifactId}\`, version \`${incumbent.versionId}\`, content sha256 \`${incumbent.content.hash}\`).`]
+        : []),
+      "- This plan is the Session Agent's own research decision for this run, recorded before the run started; the operator did not author it and this note does not restate it.",
+      "- The run's researcher received the plan content as part of its input data; the engine's own interaction logs record what it read and which commands it ran.",
+      "",
+    );
+  } else if (incumbent) {
+    lines.push(
+      "## Fixed incumbent",
+      "",
+      `- Incumbent artifact: \`${incumbent.logicalName}\` version ${incumbent.version} (artifact \`${incumbent.artifactId}\`, version \`${incumbent.versionId}\`, content sha256 \`${incumbent.content.hash}\`).`,
+      "",
+    );
+  }
+
   if (stages.length) {
     lines.push(
       "## Evaluated stages",
@@ -806,10 +1080,15 @@ function buildResultNote(input: {
       "| --- | --- | --- | --- | --- | --- | --- | --- |",
     );
     for (const stage of stages) {
+      const origin = stage.artifactSha256 && incumbent && stage.artifactSha256 === incumbent.content.hash
+        ? "carried-in seed"
+        : stage.parentStageId
+          ? "new candidate"
+          : "first captured stage";
       lines.push([
         `| ${cell(stage.stageId)}`,
         cell(stage.parentStageId),
-        stage.parentStageId ? "new candidate" : "carried-in seed (first stage)",
+        origin,
         formatNumber(stage.metricValue),
         `\`${cell(stage.artifactSha256)}\``,
         cell(stage.evaluatorStatus),
@@ -819,10 +1098,12 @@ function buildResultNote(input: {
     }
     lines.push(
       "",
-      "The pilot starts every run from a carried-in seed artifact, so the stage with no parent",
-      "reproduces carried work rather than a new model candidate. Each later stage is a new",
-      "candidate produced after the engine returned the previous stage's evaluated metric to the",
-      "model; parent links and timestamps above are the engine's own stage ledger.",
+      incumbent
+        ? "A stage is marked as the carried-in seed only when its digest matches the linked incumbent"
+        : "The first captured stage has no parent in the engine's ledger",
+      "version; otherwise the stage with no parent is already a candidate produced inside this run.",
+      "Each later stage is a new candidate produced after the engine returned the previous stage's",
+      "evaluated metric to the model; parent links and timestamps above are the engine's own ledger.",
       "",
     );
   } else {
@@ -843,6 +1124,37 @@ function buildResultNote(input: {
     `- Content sha256: \`${solution.content.hash}\` (${solution.content.size} bytes).`,
     `- This is the digest the engine recorded for the stage and the digest the ScienceDiscovery reader recomputed from the selected snapshot file (digest verified: ${selected.digestVerified === true ? "yes" : "not confirmed"}); the delivered bytes are unchanged.`,
     "",
+  );
+
+  if (attempts.length) {
+    lines.push(
+      "## Evaluated attempts",
+      "",
+      "Every captured stage is published separately, so a worse or equal new candidate stays",
+      "visible even when the engine's selected best is the seed or an earlier attempt.",
+      "",
+    );
+    for (const attempt of attempts) {
+      const role = roleLabel(attempt.role);
+      if (attempt.status === "published" && attempt.artifact) {
+        const artifact = attempt.artifact;
+        lines.push(
+          `- \`${codeText(attempt.stageId)}\` (${role}) \`${codeText(attempt.metricName)}\` = ${formatNumber(attempt.metricValue)}: \`${artifact.logicalName}\` version ${artifact.version} (artifact \`${artifact.artifactId}\`, version \`${artifact.versionId}\`), content sha256 \`${artifact.content.hash}\`.`,
+        );
+      } else if (attempt.status === "selected") {
+        lines.push(
+          `- \`${codeText(attempt.stageId)}\` (${role}) \`${codeText(attempt.metricName)}\` = ${formatNumber(attempt.metricValue)}: the selected best, delivered as the solution artifact above.`,
+        );
+      } else {
+        lines.push(
+          `- \`${codeText(attempt.stageId)}\` (${role}) \`${codeText(attempt.metricName)}\` = ${formatNumber(attempt.metricValue)}: artifact not published (\`${cell(attempt.reason ?? "unresolved")}\`).`,
+        );
+      }
+    }
+    lines.push("");
+  }
+
+  lines.push(
     "## Comparison",
     "",
   );
@@ -862,14 +1174,27 @@ function buildResultNote(input: {
     `- The run ended \`${runState.status}\`${runState.phase === "finished" ? " with its phase finished" : ""}; this is not an independently validated research record.`,
     "- No benchmark, optimum or scientific-record claim is made by this note.",
     "",
-    "## Proposed next experiment (not run)",
-    "",
-    `- Start one new bounded pilot run on the same task and evaluator, seeded with this delivered solution, with one CPU worker and the same research allowance.`,
-    `- Evaluation criterion: accept a new captured candidate only when the engine's evaluator reports \`ok\`, the gate accepts it, the solution is valid, and \`${codeText(selected.metricName)}\` improves on \`${formatNumber(selected.metricValue)}\` by at least \`${formatThreshold(proposedMargin(stages))}\` (target \`${formatThreshold(selected.metricValue + proposedMargin(stages))}\`) — twice the largest stage-to-stage step observed in this run.`,
-    "- If the allowance ends without such a candidate, report that no improvement was observed rather than a new best.",
-    "- This experiment has not been run; every number above comes from the single delivered run.",
-    "",
   );
+  if (plan) {
+    lines.push(
+      "## Interpreting this run",
+      "",
+      "- This note records what ran and how the engine scored it; the experiment under test is the linked plan version above.",
+      "- Whether the plan's method was actually executed, and whether its hypothesis is supported, is a separate Session Agent interpretation, not a verdict in this note.",
+      "- A selected best that is the carried seed or an unchanged earlier candidate is not, by itself, evidence for or against the planned change; the evaluated attempts above and the follow-up interpretation carry that question.",
+      "",
+    );
+  } else {
+    lines.push(
+      "## Proposed next experiment (not run)",
+      "",
+      `- Start one new bounded pilot run on the same task and evaluator, seeded with this delivered solution, with one CPU worker and the same research allowance.`,
+      `- Evaluation criterion: accept a new captured candidate only when the engine's evaluator reports \`ok\`, the gate accepts it, the solution is valid, and \`${codeText(selected.metricName)}\` improves on \`${formatNumber(selected.metricValue)}\` by at least \`${formatThreshold(proposedMargin(stages))}\` (target \`${formatThreshold(selected.metricValue + proposedMargin(stages))}\`) — twice the largest stage-to-stage step observed in this run.`,
+      "- If the allowance ends without such a candidate, report that no improvement was observed rather than a new best.",
+      "- This experiment has not been run; every number above comes from the single delivered run.",
+      "",
+    );
+  }
   return `${lines.join("\n")}`;
 }
 

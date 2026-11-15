@@ -124,11 +124,17 @@ async function fixture(context: TestContext): Promise<Fixture> {
   };
 }
 
-function stageCsv(rows: readonly { stageId: string; parent: string; metric: number; artifactSha: string | null }[]): string {
+function stageCsv(rows: readonly {
+  stageId: string;
+  parent: string;
+  metric: number;
+  artifactSha: string | null;
+  snapshotPath?: string;
+}[]): string {
   const header = [
     "stage_id", "parent_stage_id", "candidate_id", "metric_name", "metric_value", "lower_is_better",
     "validation_ok", "selection_eligible", "gate_accepted", "evaluator_status", "artifact_sha", "artifact_path",
-    "created_at_utc",
+    "snapshot_path", "created_at_utc",
   ].join(",");
   const lines = rows.map((row) => [
     row.stageId,
@@ -143,6 +149,7 @@ function stageCsv(rows: readonly { stageId: string; parent: string; metric: numb
     "ok",
     row.artifactSha ?? "",
     "artifacts/best_solution.json",
+    row.snapshotPath ?? "",
     "2026-11-15T05:00:00Z",
   ].join(","));
   return [header, ...lines, ""].join("\n");
@@ -264,7 +271,7 @@ test("delivers the selected stage as unchanged Session artifacts", async (contex
   assert.match(noteText, /higher is better/);
   assert.match(noteText, /2\.6239750175348147/);
   assert.match(noteText, /S01/);
-  assert.match(noteText, /carried-in seed/);
+  assert.match(noteText, /first captured stage/);
   assert.match(noteText, /stopped/);
   assert.match(noteText, /has not been run/);
   // No host paths, endpoints, credentials or reader prose in published text.
@@ -464,4 +471,228 @@ test("operator options cannot smuggle a host path as a run id", () => {
     }),
     /run id/,
   );
+});
+
+const PLAN_TEXT = [
+  "# Experiment plan (fixture)",
+  "",
+  "Test one deterministic restart from the incumbent packing state.",
+  "Accept only a valid candidate that improves radii_sum.",
+].join("\n");
+
+async function publishPlan(
+  target: Fixture,
+  sessionId: string = target.sessionId,
+): Promise<{ artifactId: string; versionId: string }> {
+  const cas = new CasStore(target.store.dataDir);
+  const content = await cas.put(Buffer.from(PLAN_TEXT));
+  const { artifact, version } = await target.store.createArtifactVersion({
+    content,
+    kind: "markdown",
+    logicalName: "scienceflow/round22/experiment-plan.md",
+    mediaType: "text/markdown",
+    origin: "server_generated",
+    originMeta: { assistantAuthored: "true", purpose: "experiment-plan" },
+    sessionId,
+    title: "Agent-authored experiment plan",
+  });
+  return { artifactId: artifact.id, versionId: version.id };
+}
+
+async function publishIncumbent(
+  target: Fixture,
+  text: string,
+): Promise<{ artifactId: string; versionId: string }> {
+  const cas = new CasStore(target.store.dataDir);
+  const content = await cas.put(Buffer.from(text));
+  const { artifact, version } = await target.store.createArtifactVersion({
+    content,
+    kind: "json",
+    logicalName: "scienceflow/round21/best-solution.json",
+    mediaType: "application/json",
+    origin: "server_generated",
+    sessionId: target.sessionId,
+    title: "Delivered incumbent",
+  });
+  return { artifactId: artifact.id, versionId: version.id };
+}
+
+test("links the plan version and drops the templated next-experiment suggestion", async (context) => {
+  const target = await fixture(context);
+  const plan = await publishPlan(target);
+  const record = await deliver(
+    target,
+    snapshotFor({ path: target.candidatePath, sha256: target.candidateSha }),
+    { planVersionId: plan.versionId },
+  );
+
+  assert.equal(record.outcome.status, "delivered");
+  assert.equal(record.plan?.versionId, plan.versionId);
+  assert.equal(record.plan?.artifactId, plan.artifactId);
+  assert.equal(record.plan?.logicalName, "scienceflow/round22/experiment-plan.md");
+  assert.equal(record.plan?.title, "Agent-authored experiment plan");
+
+  const note = record.artifacts.note!;
+  const noteVersion = target.store.listProjectArtifactVersions(target.projectId, note.artifactId)
+    .find((candidate) => candidate.id === note.versionId);
+  assert.deepEqual(noteVersion?.inputArtifactVersionIds, [record.artifacts.solution!.versionId, plan.versionId]);
+
+  const noteText = (await new CasStore(target.store.dataDir).read(note.content.hash)).toString("utf8");
+  assert.match(noteText, /## Experiment plan tested/);
+  assert.ok(noteText.includes(plan.versionId), "the note must cite the plan version id");
+  assert.ok(noteText.includes(plan.artifactId), "the note must cite the plan artifact id");
+  assert.match(noteText, /## Interpreting this run/);
+  assert.ok(!noteText.includes("Proposed next experiment (not run)"), "the template suggestion must not stand in for the plan");
+  assert.ok(!noteText.includes("twice the largest stage-to-stage step"), "the template margin is not a plan requirement");
+});
+
+test("a plan version from another Session is refused before publication", async (context) => {
+  const target = await fixture(context);
+  const other = await target.store.createSession(target.projectId, "Other session");
+  const plan = await publishPlan(target, other.id);
+  const record = await deliver(
+    target,
+    snapshotFor({ path: target.candidatePath, sha256: target.candidateSha }),
+    { planVersionId: plan.versionId },
+  );
+  assert.equal(record.outcome.status, "failed");
+  assert.equal(record.outcome.status === "failed" ? record.outcome.failedStep : null, "plan");
+  assert.equal(record.outcome.status === "failed" ? record.outcome.reason : null, "plan-version-not-found");
+  assert.deepEqual(record.artifacts, {});
+});
+
+test("a missing plan version is refused and nothing is published", async (context) => {
+  const target = await fixture(context);
+  const record = await deliver(
+    target,
+    snapshotFor({ path: target.candidatePath, sha256: target.candidateSha }),
+    { planVersionId: randomUUID() },
+  );
+  assert.equal(record.outcome.status, "failed");
+  assert.equal(record.outcome.status === "failed" ? record.outcome.reason : null, "plan-version-not-found");
+  assert.deepEqual(record.artifacts, {});
+  assert.deepEqual(artifactsNamed(target.store, target.projectId, `scienceflow/${RUN_ID}/best-solution.json`), []);
+});
+
+test("every captured stage is published as its own attempt, beside the selected best", async (context) => {
+  const target = await fixture(context);
+  const seedText = JSON.stringify({ circles: [[0.5, 0.5, 0.1]] });
+  const seedDir = join(target.taskRoot, "workers", "w00", "snapshots", "W00-L01-S01");
+  await mkdir(join(seedDir, "artifacts"), { recursive: true });
+  await writeFile(join(seedDir, "artifacts", "best_solution.json"), seedText, "utf8");
+  await writeFile(
+    join(target.taskRoot, "task_logs", "lhr_stage_performance.csv"),
+    stageCsv([
+      { artifactSha: sha256(seedText), metric: 2.61661905326, parent: "", snapshotPath: seedDir, stageId: "S01" },
+      { artifactSha: target.candidateSha, metric: 2.6239750175348147, parent: "S01", snapshotPath: dirname(dirname(target.candidatePath)), stageId: "S02" },
+    ]),
+    "utf8",
+  );
+  const plan = await publishPlan(target);
+  const incumbent = await publishIncumbent(target, seedText);
+  const snapshot = snapshotFor({ path: target.candidatePath, sha256: target.candidateSha });
+
+  const record = await deliver(target, snapshot, {
+    includeAttempts: true,
+    incumbentVersionId: incumbent.versionId,
+    planVersionId: plan.versionId,
+  });
+  assert.equal(record.outcome.status, "delivered");
+  assert.equal(record.incumbent?.versionId, incumbent.versionId);
+  const seed = record.attempts.find((attempt) => attempt.stageId === "S01");
+  const selected = record.attempts.find((attempt) => attempt.stageId === "S02");
+  assert.equal(seed?.role, "carried_seed");
+  assert.equal(seed?.status, "published");
+  assert.equal(seed?.artifact?.content.hash, sha256(seedText));
+  assert.equal(selected?.role, "evaluated_attempt");
+  assert.equal(selected?.status, "selected");
+
+  const seedArtifact = target.store.getProjectArtifact(target.projectId, seed!.artifact!.artifactId);
+  assert.equal(seedArtifact?.originMeta?.attemptRole, "carried_seed");
+  assert.equal(seedArtifact?.originMeta?.incumbentVersionId, incumbent.versionId);
+  assert.equal(seedArtifact?.originMeta?.planVersionId, plan.versionId);
+  const storedSeed = await new CasStore(target.store.dataDir).read(seed!.artifact!.content.hash);
+  assert.equal(storedSeed.toString("utf8"), seedText, "the seed bytes must be published unchanged");
+
+  const note = record.artifacts.note!;
+  const noteText = (await new CasStore(target.store.dataDir).read(note.content.hash)).toString("utf8");
+  assert.match(noteText, /## Evaluated attempts/);
+  assert.ok(noteText.includes(seed!.artifact!.versionId), "the note must cite the attempt version");
+  const noteVersion = target.store.listProjectArtifactVersions(target.projectId, note.artifactId)
+    .find((candidate) => candidate.id === note.versionId);
+  assert.deepEqual(noteVersion?.inputArtifactVersionIds, [
+    record.artifacts.solution!.versionId,
+    seed!.artifact!.versionId,
+    plan.versionId,
+    incumbent.versionId,
+  ]);
+
+  const repeated = await deliver(target, snapshot, {
+    includeAttempts: true,
+    incumbentVersionId: incumbent.versionId,
+    planVersionId: plan.versionId,
+  });
+  assert.equal(repeated.outcome.status, "delivered");
+  assert.equal(repeated.attempts.find((attempt) => attempt.stageId === "S01")?.artifact?.status, "reused");
+  assert.equal(
+    target.store.listProjectArtifactVersions(repeated.identity.projectId, seed!.artifact!.artifactId).length,
+    1,
+    "a repeated delivery must not duplicate an attempt version",
+  );
+});
+
+test("an unreadable attempt is recorded as unresolved without hiding the selected result", async (context) => {
+  const target = await fixture(context);
+  const missingDir = join(target.taskRoot, "workers", "w00", "snapshots", "W00-L01-S01");
+  await writeFile(
+    join(target.taskRoot, "task_logs", "lhr_stage_performance.csv"),
+    stageCsv([
+      { artifactSha: sha256("never written"), metric: 2.61661905326, parent: "", snapshotPath: missingDir, stageId: "S01" },
+      { artifactSha: target.candidateSha, metric: 2.6239750175348147, parent: "S01", snapshotPath: dirname(dirname(target.candidatePath)), stageId: "S02" },
+    ]),
+    "utf8",
+  );
+  const record = await deliver(
+    target,
+    snapshotFor({ path: target.candidatePath, sha256: target.candidateSha }),
+    { includeAttempts: true },
+  );
+  assert.equal(record.outcome.status, "delivered");
+  const seed = record.attempts.find((attempt) => attempt.stageId === "S01");
+  assert.equal(seed?.status, "unresolved");
+  assert.equal(seed?.reason, "artifact-file-missing");
+  const noteText = (await new CasStore(target.store.dataDir).read(record.artifacts.note!.content.hash)).toString("utf8");
+  assert.match(noteText, /artifact not published/);
+  assert.match(noteText, /artifact-file-missing/);
+});
+
+test("a first stage whose digest is not the incumbent is a new candidate, not the seed", async (context) => {
+  const target = await fixture(context);
+  const firstText = JSON.stringify({ circles: [[0.4, 0.4, 0.3]] });
+  const firstDir = join(target.taskRoot, "workers", "w00", "snapshots", "W00-L01-S01");
+  await mkdir(join(firstDir, "artifacts"), { recursive: true });
+  await writeFile(join(firstDir, "artifacts", "best_solution.json"), firstText, "utf8");
+  await writeFile(
+    join(target.taskRoot, "task_logs", "lhr_stage_performance.csv"),
+    stageCsv([
+      { artifactSha: sha256(firstText), metric: 2.631640653898, parent: "", snapshotPath: firstDir, stageId: "S01" },
+      { artifactSha: target.candidateSha, metric: 2.633134264465223, parent: "S01", snapshotPath: dirname(dirname(target.candidatePath)), stageId: "S02" },
+    ]),
+    "utf8",
+  );
+  const incumbent = await publishIncumbent(target, JSON.stringify({ circles: [[0.5, 0.5, 0.1]] }));
+  const record = await deliver(
+    target,
+    snapshotFor({ path: target.candidatePath, sha256: target.candidateSha }),
+    { includeAttempts: true, incumbentVersionId: incumbent.versionId },
+  );
+  assert.equal(record.outcome.status, "delivered");
+  const first = record.attempts.find((attempt) => attempt.stageId === "S01");
+  assert.equal(first?.role, "first_captured");
+  assert.equal(first?.status, "published");
+  const firstArtifact = target.store.getProjectArtifact(target.projectId, first!.artifact!.artifactId);
+  assert.equal(firstArtifact?.originMeta?.attemptRole, "first_captured");
+  const noteText = (await new CasStore(target.store.dataDir).read(record.artifacts.note!.content.hash)).toString("utf8");
+  assert.match(noteText, /\| S01 \| — \| first captured stage \|/);
+  assert.ok(!noteText.includes("| carried-in seed |"), "no stage matches the incumbent, so none is labelled the seed");
 });

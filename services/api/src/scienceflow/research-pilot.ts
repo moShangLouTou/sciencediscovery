@@ -357,6 +357,8 @@ export interface ResearchPilotStageRow {
   readonly metricValue: number;
   readonly artifactSha256: string | null;
   readonly artifactPath: string | null;
+  /** The stage's own snapshot directory, as the engine recorded it. */
+  readonly snapshotPath: string | null;
   readonly validationOk: boolean;
   readonly selectionEligible: boolean;
   readonly gateAccepted: boolean;
@@ -1346,6 +1348,7 @@ export async function readStageRows(csvPath: string): Promise<readonly ResearchP
     metricValue: column("metric_value"),
     artifactSha: column("artifact_sha"),
     artifactPath: column("artifact_path"),
+    snapshotPath: column("snapshot_path"),
     validationOk: column("validation_ok"),
     selectionEligible: column("selection_eligible"),
     gateAccepted: column("gate_accepted"),
@@ -1366,6 +1369,7 @@ export async function readStageRows(csvPath: string): Promise<readonly ResearchP
       metricValue: metric,
       artifactSha256: value(index.artifactSha) || null,
       artifactPath: value(index.artifactPath) || null,
+      snapshotPath: value(index.snapshotPath) || null,
       validationOk: value(index.validationOk) === "1",
       selectionEligible: value(index.selectionEligible) === "1",
       gateAccepted: value(index.gateAccepted) === "1",

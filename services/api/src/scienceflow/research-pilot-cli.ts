@@ -83,6 +83,13 @@ deliver only:
   --record <path>            delivery record output; default <work-dir>/delivery.json
   --launch-receipt <path>    pilot receipt read for model/lifecycle facts;
                              default <work-dir>/receipt.json
+  --plan-version <id>        the Session's Agent-authored plan artifact version
+                             this run tested; linked to the note, never authored
+  --incumbent-version <id>   the fixed incumbent artifact version the run was
+                             seeded with; a stage is called the seed only when
+                             its digest matches this version
+  --attempts                 publish every captured stage separately, so a worse
+                             new candidate stays visible beside the selected best
 
 deliver publishes the existing run's selected stage as normal Session artifacts.
 It starts no run, re-evaluates nothing and accepts no score or digest.
@@ -110,7 +117,7 @@ function parseArgs(argv: readonly string[]): {
     const item = argv[index]!;
     if (!item.startsWith("--")) fail(`Unexpected argument: ${item}\n\n${USAGE}`);
     const name = item.slice(2);
-    if (name === "refuse-package-install" || name === "help") {
+    if (name === "refuse-package-install" || name === "attempts" || name === "help") {
       flags.add(name);
       continue;
     }
@@ -235,6 +242,32 @@ function summarizeDelivery(
           bytes: record.selected.bytes,
         }
       : null,
+    plan: record.plan
+      ? {
+          artifactId: record.plan.artifactId,
+          versionId: record.plan.versionId,
+          version: record.plan.version,
+          title: record.plan.title,
+          contentSha256: record.plan.content.hash,
+        }
+      : null,
+    incumbent: record.incumbent
+      ? {
+          artifactId: record.incumbent.artifactId,
+          versionId: record.incumbent.versionId,
+          version: record.incumbent.version,
+          contentSha256: record.incumbent.content.hash,
+        }
+      : null,
+    attempts: record.attempts.map((attempt) => ({
+      stageId: attempt.stageId,
+      role: attempt.role,
+      metricName: attempt.metricName,
+      metricValue: attempt.metricValue,
+      status: attempt.status,
+      ...(attempt.reason ? { reason: attempt.reason } : {}),
+      ...(attempt.artifact ? { artifactId: attempt.artifact.artifactId, versionId: attempt.artifact.versionId } : {}),
+    })),
     artifacts: record.artifacts,
   };
 }
@@ -244,11 +277,17 @@ async function main(): Promise<number> {
   // A retargeted flag that this command does not read must fail loudly, not
   // silently write (or read) the default path.
   if (command === "deliver") {
-    if (values.has("receipt")) {
-      fail("--receipt applies to launch and attach; deliver writes --record and reads --launch-receipt");
+    for (const name of ["private-root", "engine", "seed", "receipt"]) {
+      if (values.has(name)) {
+        fail(`--${name} applies to launch and attach; deliver publishes an existing run`);
+      }
     }
-  } else if (values.has("record") || values.has("launch-receipt")) {
-    fail("--record and --launch-receipt apply to deliver only");
+  } else if (values.has("record") || values.has("launch-receipt")
+    || values.has("plan-version") || values.has("incumbent-version")) {
+    fail("--record, --launch-receipt, --plan-version and --incumbent-version apply to deliver only");
+  }
+  if (command !== "deliver" && flags.has("attempts")) {
+    fail("--attempts applies to deliver only");
   }
   const dataDir = resolve(values.get("data-dir")!);
   const store = new SessionStore(dataDir);
@@ -265,6 +304,9 @@ async function main(): Promise<number> {
       pythonExecutable: resolve(values.get("python")!),
       readerScriptPath: resolve(values.get("reader-script")!),
       ...(values.get("task") ? { task: values.get("task")! } : {}),
+      ...(values.get("plan-version") ? { planVersionId: values.get("plan-version")! } : {}),
+      ...(values.get("incumbent-version") ? { incumbentVersionId: values.get("incumbent-version")! } : {}),
+      ...(flags.has("attempts") ? { includeAttempts: true } : {}),
       ...(values.get("record") ? { recordPath: resolve(values.get("record")!) } : {}),
       ...(values.get("launch-receipt")
         ? { launchReceiptPath: resolve(values.get("launch-receipt")!) }
