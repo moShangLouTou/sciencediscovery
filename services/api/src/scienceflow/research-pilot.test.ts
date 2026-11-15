@@ -490,6 +490,7 @@ test("a completed run registers and reads back through the real store", async ()
       engineCheckout: "/opt/engine",
       pythonExecutable: "/opt/python/bin/python",
       readerScriptPath: "/opt/reader/snapshot.py",
+      taskDescription: "Execute exactly these commands.\nDo not write solver code.",
       refusePackageInstall: true,
     };
     const { paths } = researchPilotPlan(options);
@@ -505,6 +506,9 @@ test("a completed run registers and reads back through the real store", async ()
         assert.match(manifest, /wall_clock_budget_sec: 840/u);
         assert.match(manifest, /stage_capture_max_count: 3/u);
         assert.match(manifest, /merge_enabled: false/u);
+        assert.match(manifest, /    task: \|/u);
+        assert.match(manifest, /      Execute exactly these commands\./u);
+        assert.match(manifest, /      Do not write solver code\./u);
         return { outcome: "finished", status: "completed", phase: "finished", elapsedSec: 12.5 };
       },
       readSnapshot: async () => ({ status: "ok", snapshot: fakeSnapshot("round20-test-run") }),

@@ -34,6 +34,7 @@
  * only from the resolved SD Session. `deliver` accepts neither a score nor an
  * artifact digest: the reader resolves the selected stage and its bytes.
  */
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import { SessionStore } from "../store.js";
@@ -67,6 +68,8 @@ launch and attach also require:
 
 pilot limits (defaults are the round-20 standing allowance):
   --task <name>              engine task id (default circle-packing)
+  --task-description <path>  run-specific task text (at most 32 KiB) pinned as the
+                             researcher's first user message; launch/attach only
   --research-budget-sec <n>  default 840
   --report-budget-sec <n>    default 60
   --total-allowance-sec <n>  default 900
@@ -140,6 +143,22 @@ function parseArgs(argv: readonly string[]): {
   return { command, flags, values };
 }
 
+function readTaskDescription(path: string): string {
+  const resolved = resolve(path);
+  let text: string;
+  try {
+    text = readFileSync(resolved, "utf8");
+  } catch {
+    fail(`--task-description could not be read: ${resolved}`);
+  }
+  const trimmed = text.trim();
+  if (!trimmed) fail(`--task-description is empty: ${resolved}`);
+  if (trimmed.includes("\u0000") || Buffer.byteLength(trimmed, "utf8") > 32_768) {
+    fail(`--task-description must be at most 32 KiB and contain no NUL bytes: ${resolved}`);
+  }
+  return trimmed;
+}
+
 function pilotRequest(
   values: ReadonlyMap<string, string>,
   flags: ReadonlySet<string>,
@@ -160,6 +179,9 @@ function pilotRequest(
     readerScriptPath: resolve(values.get("reader-script")!),
     seedDir: resolve(values.get("seed")!),
     ...(values.get("task") ? { task: values.get("task")! } : {}),
+    ...(values.get("task-description")
+      ? { taskDescription: readTaskDescription(values.get("task-description")!) }
+      : {}),
     ...(number("research-budget-sec") !== undefined
       ? { researchBudgetSec: number("research-budget-sec")! }
       : {}),
@@ -277,7 +299,7 @@ async function main(): Promise<number> {
   // A retargeted flag that this command does not read must fail loudly, not
   // silently write (or read) the default path.
   if (command === "deliver") {
-    for (const name of ["private-root", "engine", "seed", "receipt"]) {
+    for (const name of ["private-root", "engine", "seed", "receipt", "task-description"]) {
       if (values.has(name)) {
         fail(`--${name} applies to launch and attach; deliver publishes an existing run`);
       }

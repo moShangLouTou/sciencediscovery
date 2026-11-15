@@ -279,6 +279,14 @@ export interface ResearchPilotOptions {
   readonly readerScriptPath: string;
   readonly seedDir: string;
   readonly task?: string;
+  /**
+   * Run-specific task text. When present it becomes the engine manifest's inline
+   * `task`, which the engine pins as the researcher's first user message instead
+   * of the task package's default description. It is execution input, not a
+   * research decision: the operator passes it unchanged and the receipt records
+   * the bytes it used.
+   */
+  readonly taskDescription?: string;
   readonly researchBudgetSec?: number;
   readonly reportBudgetSec?: number;
   readonly maxSteps?: number;
@@ -294,6 +302,8 @@ export interface ResearchPilotOptions {
 
 export interface ResearchPilotGrant {
   readonly task: string;
+  /** Present only when the operator supplied run-specific task text. */
+  readonly taskDescription?: string;
   readonly researchBudgetSec: number;
   readonly reportBudgetSec: number;
   readonly maxSteps: number;
@@ -501,8 +511,16 @@ export function researchPilotPlan(options: ResearchPilotOptions): {
       "The private root must be outside the work dir and the seed dir",
     );
   }
+  const taskDescription = options.taskDescription?.trim();
+  if (taskDescription !== undefined && (!taskDescription || taskDescription.includes("\u0000"))) {
+    throw new ResearchPilotRefusal("invalid-option", "The task description must be non-empty text without NUL bytes");
+  }
+  if (taskDescription !== undefined && Buffer.byteLength(taskDescription, "utf8") > 32_768) {
+    throw new ResearchPilotRefusal("invalid-option", "The task description must be at most 32 KiB");
+  }
   const grant: ResearchPilotGrant = {
     task,
+    ...(taskDescription ? { taskDescription } : {}),
     researchBudgetSec: boundedInt(options.researchBudgetSec, RESEARCH_PILOT_DEFAULTS.researchBudgetSec, 30, 840),
     reportBudgetSec: boundedInt(options.reportBudgetSec, RESEARCH_PILOT_DEFAULTS.reportBudgetSec, 10, 600),
     maxSteps: boundedInt(options.maxSteps, RESEARCH_PILOT_DEFAULTS.maxSteps, 1, 200),
@@ -642,6 +660,12 @@ export function researchPilotManifest(input: {
     "tasks:",
     `  - exp_id: ${grant.task}`,
     `    run_id: ${yamlString(runId)}`,
+    ...(grant.taskDescription
+      ? [
+          "    task: |",
+          ...grant.taskDescription.replace(/\r\n?/gu, "\n").split("\n").map((line) => `      ${line}`),
+        ]
+      : []),
     "lnr:",
     "  num_workers: 1",
     "  merge_enabled: false",
@@ -1265,6 +1289,7 @@ function refusalReceipt(input: {
 function planFallbackGrant(options: ResearchPilotOptions): ResearchPilotGrant {
   return {
     task: options.task ?? RESEARCH_PILOT_DEFAULTS.task,
+    ...(options.taskDescription?.trim() ? { taskDescription: options.taskDescription.trim() } : {}),
     researchBudgetSec: options.researchBudgetSec ?? RESEARCH_PILOT_DEFAULTS.researchBudgetSec,
     reportBudgetSec: options.reportBudgetSec ?? RESEARCH_PILOT_DEFAULTS.reportBudgetSec,
     maxSteps: options.maxSteps ?? RESEARCH_PILOT_DEFAULTS.maxSteps,
