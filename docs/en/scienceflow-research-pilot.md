@@ -1,11 +1,18 @@
 # ScienceFlow research pilot: one evaluated circle-packing loop
 
-Status: operator-run research pilot (round 19). Five bounded managed runs were
-executed on the engine's own `circle-packing` task. Runs 1–3 established the
-task, evaluator and process evidence; runs 4–5 closed the loop: a
-model-produced candidate was captured and evaluated by the engine, the engine's
+Status: operator-run research pilot (rounds 19–20). Round 19 executed five
+bounded managed runs on the engine's own `circle-packing` task. Runs 1–3
+established the task, evaluator and process evidence; runs 4–5 closed the loop:
+a model-produced candidate was captured and evaluated by the engine, the engine's
 score was delivered back to the model, and the model then produced a second
 candidate that the engine captured, evaluated and compared.
+
+Round 20 replaces round 19's manual joins — a separately maintained engine model
+registry, an ad hoc launcher and an in-memory Project/Session identity adapter —
+with one reusable internal operator command that resolves the Session's effective
+ScienceDiscovery model and reads the run back for that same persisted Session.
+Section 8 describes the command and the round-20 runs; sections 1–7 remain the
+round-19 record and their results are not rewritten.
 
 ## 1. What this pilot is
 
@@ -35,7 +42,8 @@ modified.
 | Package tree | `tree_sha256 17721fbad2fc429ea20ccf8623d964faeb8f88234b80ca88aa699ac8182bc33d` |
 | Evaluator timeout | 300 s (declared in `task.yaml`) |
 | Engine | pinned checkout, commit `e1347021eaa497d2dc138d9e66ce36e09260568a` |
-| Model | alias `round19-qwen-flash`, provider model `Qwen3.8-Flash` |
+| Model (round 19) | alias `round19-qwen-flash`, provider model `Qwen3.8-Flash` |
+| Model (round 20) | the Session's effective SD profile, provider model `Qwen3.8-Flash`, resolved at launch |
 
 The evaluator contract is established independently of any model output, both by
 direct execution and through the engine's real `entrypoint_runner`:
@@ -194,7 +202,150 @@ Only the identity lookup is an in-memory adapter: importing the full
 scope here. The API server, HTTP routes and browser journeys were not started.
 No SD source was changed.
 
-## 8. What this pilot does not claim
+## 8. Round 20: one reusable operator invocation over the Session's model
+
+Round 19 closed the loop, but with three manual joins: a separately maintained
+engine model registry, an ad hoc launcher, and an in-memory Project/Session
+identity adapter. Round 20 removes those joins for this pilot and nothing else.
+The checked-in command is `services/api/src/scienceflow/research-pilot-cli.ts`
+over `research-pilot.ts`; it is an internal operator entry, not an HTTP route.
+
+### 8.1 What one invocation does
+
+```sh
+node --import tsx services/api/src/scienceflow/research-pilot-cli.ts launch \
+  --data-dir <isolated store> --project <id> --session <id> \
+  --run-id <engine run id> --work-dir <pilot dir> \
+  --private-root <0700 dir outside the work dir> \
+  --engine <pinned checkout> --python <interpreter> \
+  --reader-script services/scienceflow-reader/snapshot.py \
+  --seed <traced seed dir> [--refuse-package-install] [--receipt <path>]
+```
+
+The same command with `attach` takes the same options, skips the launch, and
+re-registers/re-reads the run its receipt already records. Nothing in the options
+selects a provider, credential or model name; those come only from the Session.
+
+1. Opens a real `SessionStore` at the isolated data directory the operator names
+   and resolves the Project and Session there — no in-memory identity adapter.
+2. Resolves the Session's *effective* model through the normal settings layers
+   (`resolveRuntimeSettings(sessionId).effective.modelId` and
+   `.sources.modelId`), reads the profile with `getModel`, and reads the
+   credential with `getModelApiToken`, which already applies the profile's own
+   token or its provider's shared token. Legacy secret tables and the engine's
+   own registry are not consulted.
+3. Resolves the profile's proxy policy for that endpoint with the same helper
+   SD's model calls use (`resolveProxy` + `resolveProxyForUrl`), so an
+   `environment` policy is a real route decision rather than an assumption.
+4. Freezes that selection for the run. Validation finishes before any process
+   starts, and a profile the pilot cannot carry is refused with a stable reason:
+   another API protocol, a variant other than `openai`/`qwen`, an explicit
+   thinking mode on the `qwen` variant, an unusable credential, endpoint or
+   proxy, a Project and Session that do not own each other, or options that would
+   put the private root inside the work dir or the seed.
+5. Generates the engine's model input from that frozen selection into a private
+   run-scoped directory (0700; files 0600): `models.json` (one alias, the
+   provider model name, its endpoint and credential), `pilot-settings.json`
+   (both agent roles bound to that alias) and `engine-config.yaml` (the pinned
+   engine's `default.yaml`, plus the settings and the task interpreter). This is
+   generated execution input, not a second user-maintained catalog. The private
+   root must be outside the work dir and the seed, and the file holding the
+   credential never enters the workspace, the dataset or the receipt.
+6. Derives one launch manifest from the explicit pilot options: the run id, the
+   bounded research and report budgets, one worker with merge disabled, the
+   stage-capture allowance, the isolated input directory (the seed) and the
+   run-scoped engine config.
+7. Starts the run through the engine's own control entry
+   (`scienceflow.runtime.parallel.control.start_run`) from a fixed program text
+   inside the module, polls the engine's own record, and stops the run through
+   the engine's own `stop_run` if the operator allowance is reached. The
+   launcher makes no model call; research and reporting run inside the engine.
+8. Registers the resulting run for the original persisted Session through
+   `createScienceFlowRegistrationService` (real identity and write gates, the
+   store's own registration table), then reads it back through
+   `createScienceFlowRunSnapshotQuery` (the real reader subprocess) and
+   `projectScienceFlowRunSnapshot` (the public DTO allow-list).
+9. Writes a credential-free receipt: Project and Session, the frozen model
+   selection and the layer it came from, the engine run and its outcome, the
+   registration row, the public snapshot, the engine's own stage rows (score,
+   artifact digest, parent stage) and the provider usage the engine recorded.
+   Those call and token figures are the engine's logs, not a monetary or hard
+   provider-token cap.
+
+An engine run id names one run. Both the engine and this command refuse a second
+`launch` for an existing run id. `attach` re-registers and re-reads an existing
+run from its receipt without another paid launch, and keeps the launch-time
+model selection even if the Session's model changed afterwards.
+
+### 8.2 What the round-20 runs showed
+
+Three authorized attempts were made, one per run id. The third closed the
+research loop end to end through the checked-in command:
+
+| Run | Seed | Outcome | Engine stages | Provider usage |
+| --- | --- | --- | --- | --- |
+| `round20-circle-packing-a` | round-19 incumbent and solver | engine `completed`, 854.5 s; the chain registered and read back S01 | S01 (seeded) `2.61661905326`; no new candidate was written | 23 calls, 351,940 in / 37,536 out |
+| `round20-circle-packing-b` | same seed plus sequencing guidance | engine `failed` after 142.3 s: the provider returned reasoning without an answer or tool call, and the engine does not retry that (`UnusableResponseError`) | none | 6 calls, 68,112 in / 6,700 out |
+| `round20-circle-packing-c` | same seed plus the engine's per-turn tool-call requirement | engine `stopped` at the operator's 900 s allowance with its report ready; 910.2 s | S01 seeded `2.61661905326`; S02 `2.623651703004654` (parent S01); S03 `2.6239750175348147` (parent S02); all valid and gate-accepted | 36 calls, 959,102 in / 42,601 out |
+
+Attempt c is the loop:
+
+- The model materialized the incumbent in one short command (S01), then wrote its
+  own solver (`solver/pack_lib.py`, `local.py`, `search.py`, `evolve.py`,
+  `driver.py`) and ran bounded experiments that wrote the artifact. The seeded
+  `prior_solver` and `submit.py` were available and read; the model chose its own
+  solver.
+- 30 model requests carried an engine stage block: 21 carried S01, 7 carried
+  S01 and S02, and 2 carried S01, S02 and S03. The first S01-, S02- and
+  S03-carrying requests follow their committed stage rows by 11 ms, 19 ms and
+  20 ms.
+- The public DTO for the same persisted Session reads `status stopped`,
+  `phase finished`, `reportedMetric radii_sum 2.6239750175348147`, candidate
+  sha `ec060f2f…`, `digestVerified: true`, `stageId S03`; the registration row
+  was created.
+- Against the seed: S03 − S01 = +0.007355964 (+0.28%), `0.9952 → 0.9958` of the
+  declared benchmark 2.635. Improvement is reported here, not required by the
+  loop.
+- Artifact digests: S01 `1401d398…`, S02 `07f4b73a…`, S03 `ec060f2f…` (full
+  values in the receipts).
+
+The engine ended attempt c `stopped` because the operator's 900 s process
+allowance fired while research was still running: its research phase had run
+908 s, past the configured 840 s research budget. This document does not claim
+why the engine's own budget did not end it first. The report had already been
+produced (`reportStatus ready`) and every captured stage was committed. The supervisor was
+not alive after the launcher returned and no task process was left running.
+
+The earlier attempts are kept as they ran: attempt a shows the chain working with
+only the seeded stage (the research half missing), and attempt b is the engine's
+handling of an unusable provider response. Neither is presented as a closed loop.
+
+The invocation used `--private-root` outside the repository,
+`--refuse-package-install`, one CPU worker, and the proxy environment unset so
+the authorized gateway was reached directly (the resolved route was `direct`;
+with a proxy configured, the same code carries it through the engine's
+`use_proxy` path).
+
+### 8.3 What remains experimental
+
+- The entry is local and internal: no HTTP route, no Runner gateway, no sandbox
+  path. `canStart` stays `false` and the five blockers stay in place.
+- The engine's workspace path guard is the tool boundary. Generated code runs in
+  the task workspace through the engine's normal tools; this is not
+  hostile-code isolation.
+- The generated registry carries one model with one endpoint and
+  `reasoning_replay: preserve`. Multi-endpoint routing, per-role models, budget
+  tables and a general protocol adapter are not implemented; unsupported
+  profiles are refused, never silently reduced.
+- No monetary budget, provider-token ledger or general resume/recovery platform
+  is claimed. The allowances are scheduling limits enforced by the operator and
+  by the engine's own budget. A run can end `stopped` at the operator allowance,
+  as attempt c did, rather than by finishing its own budget.
+- The engine does not retry a provider response that carries reasoning but no
+  answer or tool call; it fails the worker, as attempt b showed. Recovering from
+  that means a new attempt, not a silent retry inside this command.
+
+## 9. What this pilot does not claim
 
 - No Runner gateway, sandbox or `canStart` change. `canStart` stays `false` and
   the five blockers stay in place.
@@ -213,7 +364,7 @@ No SD source was changed.
 - The seeded incumbent A was produced by the model in run 3; run 5's model
   re-materialized it, and B and C are the model's own work in run 5.
 
-## 9. Where the evidence lives
+## 10. Where the evidence lives
 
 Ignored local artifacts under `.tmp/r/round19/` (never committed):
 
@@ -235,3 +386,13 @@ Ignored local artifacts under `.tmp/r/round19/` (never committed):
 - `pilot/sd-readback/<run-id>/readback.json` — registration + reader + DTO.
 - `compare_stages.py`, `verify_stage_feedback.py`, `extract_evidence.py` —
   read-only analysis scripts used for the tables above.
+
+Round 20 evidence also lives under the ignored `.tmp/r/round20/` directory of the
+development worktree: `pilot/receipt-<run>.json` are the operator receipts,
+`pilot/evidence-<run>.json` holds the stage rows, the model requests that
+carried an engine stage block, and the recorded provider usage,
+`pilot/runs/<run>/circle-packing/` is the engine's own task state, and
+`seed-round20b/` is the second attempt's seed with its sequencing guidance. The
+generated private inputs — the engine model registry, the pilot settings, the
+engine config and the credential — live outside the repository in a 0700
+directory and are never copied into evidence.
