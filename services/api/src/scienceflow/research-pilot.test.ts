@@ -17,6 +17,7 @@ const { test } = createTest(import.meta.url, {
   tags: ["category:ut", "os:linux", "arch:amd64", "arch:arm64"],
 });
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, rm, stat, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -51,8 +52,10 @@ import {
   type ResearchPilotSessionStore,
 } from "./research-pilot.js";
 
-const MODEL_TOKEN = "sk-pilot-test-token-0000";
-const OTHER_TOKEN = "sk-other-token-1111";
+// Synthetic credentials are generated per test run; no literal stands in for a
+// real or realistic secret.
+const MODEL_TOKEN = `sk-pilot-${randomUUID()}`;
+const OTHER_TOKEN = `sk-other-${randomUUID()}`;
 
 interface FakeModelInput {
   readonly id: string;
@@ -663,6 +666,196 @@ test("a second launch for an engine-owned run id is refused before any work", as
     assert.equal(receipt.outcome.status, "run-already-exists");
     assert.equal(receipt.outcome.engineRunId, "round20-test-run");
     assert.match(receipt.outcome.message ?? "", /attach/u);
+    // The refusal is returned only: no receipt exists to fabricate a model from.
+    await assert.rejects(readFile(paths.receiptPath, "utf8"));
+  });
+});
+
+test("a duplicate launch keeps the run's frozen receipt for attach", async () => {
+  await withTempDir("pilot-duplicate-receipt-", async (base) => {
+    const { store, projectId, sessionId, modelId } = await provisionStore(base);
+    const options = {
+      projectId,
+      sessionId,
+      runId: "round20-test-run",
+      workDir: join(base, "work"),
+      privateRoot: join(base, "private"),
+      seedDir: join(base, "seed"),
+      engineCheckout: "/opt/engine",
+      pythonExecutable: "/opt/python/bin/python",
+      readerScriptPath: "/opt/reader/snapshot.py",
+    };
+    const { paths } = researchPilotPlan(options);
+    await runResearchPilot(store, options, {
+      launch: async () => ({ outcome: "finished", status: "completed" }),
+      readSnapshot: async () => ({ status: "ok", snapshot: fakeSnapshot("round20-test-run") }),
+    });
+    const frozen = await readFile(paths.receiptPath, "utf8");
+    const recordDir = join(paths.stateHome, "scienceflow", "managed_runs", "round20-test-run");
+    await mkdir(recordDir, { recursive: true });
+    await writeFile(join(recordDir, "control.json"), JSON.stringify({ run_id: "round20-test-run" }), "utf8");
+
+    let launches = 0;
+    const refused = await runResearchPilot(store, options, {
+      launch: async () => {
+        launches += 1;
+        return { outcome: "finished" };
+      },
+    });
+    assert.equal(launches, 0);
+    assert.equal(refused.outcome.status, "run-already-exists");
+    assert.equal(
+      await readFile(paths.receiptPath, "utf8"),
+      frozen,
+      "the duplicate refusal must not rewrite the original receipt",
+    );
+
+    const attached = await attachResearchPilotRun(store, options, {
+      launch: async () => {
+        launches += 1;
+        return { outcome: "finished" };
+      },
+      readSnapshot: async () => ({ status: "ok", snapshot: fakeSnapshot("round20-test-run") }),
+    });
+    assert.equal(launches, 0);
+    assert.equal(attached.outcome.status, "completed");
+    assert.equal(attached.model?.profileId, modelId);
+    assert.equal(attached.model?.selectionSource, "session");
+    assert.equal(attached.registration?.status, "existing");
+  });
+});
+
+test("a Session that becomes read-only after launch keeps a receipt attach can finish", async () => {
+  await withTempDir("pilot-register-fail-", async (base) => {
+    const { store, projectId, sessionId, modelId } = await provisionStore(base);
+    const options = {
+      projectId,
+      sessionId,
+      runId: "round20-test-run",
+      workDir: join(base, "work"),
+      privateRoot: join(base, "private"),
+      seedDir: join(base, "seed"),
+      engineCheckout: "/opt/engine",
+      pythonExecutable: "/opt/python/bin/python",
+      readerScriptPath: "/opt/reader/snapshot.py",
+    };
+    const { paths } = researchPilotPlan(options);
+    let launched = false;
+    const gated = storeWithWriteGate(store, () => !launched);
+    const failed = await runResearchPilot(gated, options, {
+      launch: async () => {
+        launched = true;
+        return { outcome: "finished", status: "completed" };
+      },
+    });
+    assert.equal(launched, true);
+    assert.equal(failed.outcome.status, "registration-failed");
+    assert.equal(failed.outcome.failedStep, "register");
+    assert.equal(failed.outcome.engineRunId, "round20-test-run");
+    assert.equal(failed.model?.profileId, modelId);
+    assert.match(failed.outcome.message ?? "", /archived/u);
+
+    // The launch-time facts survive the registration failure on disk.
+    const written = JSON.parse(await readFile(paths.receiptPath, "utf8")) as {
+      outcome: { status: string; engineRunId: string | null };
+      model: { profileId: string; selectionSource: string } | null;
+      engine: { generatedInputs: { modelConfigPath: string } | null };
+    };
+    assert.equal(written.outcome.status, "registration-failed");
+    assert.equal(written.outcome.engineRunId, "round20-test-run");
+    assert.equal(written.model?.profileId, modelId);
+    assert.equal(written.model?.selectionSource, "session");
+    assert.equal(written.engine.generatedInputs?.modelConfigPath, paths.modelConfigPath);
+
+    // The engine record the real launch would have created.
+    const recordDir = join(paths.stateHome, "scienceflow", "managed_runs", "round20-test-run");
+    await mkdir(recordDir, { recursive: true });
+    await writeFile(join(recordDir, "control.json"), JSON.stringify({ run_id: "round20-test-run" }), "utf8");
+
+    // Once writable again, attach finishes registration and readback without
+    // launching another run.
+    let attachLaunches = 0;
+    const attached = await attachResearchPilotRun(store, options, {
+      launch: async () => {
+        attachLaunches += 1;
+        return { outcome: "finished" };
+      },
+      readSnapshot: async () => ({ status: "ok", snapshot: fakeSnapshot("round20-test-run") }),
+    });
+    assert.equal(attachLaunches, 0);
+    assert.equal(attached.outcome.status, "completed");
+    assert.equal(attached.model?.profileId, modelId);
+    assert.equal(attached.registration?.status, "created");
+  });
+});
+
+test("a launcher exception leaves a frozen launch-unknown receipt", async () => {
+  await withTempDir("pilot-launch-unknown-", async (base) => {
+    const { store, projectId, sessionId, modelId } = await provisionStore(base);
+    const options = {
+      projectId,
+      sessionId,
+      runId: "round20-test-run",
+      workDir: join(base, "work"),
+      privateRoot: join(base, "private"),
+      seedDir: join(base, "seed"),
+      engineCheckout: "/opt/engine",
+      pythonExecutable: "/opt/python/bin/python",
+      readerScriptPath: "/opt/reader/snapshot.py",
+    };
+    const { paths } = researchPilotPlan(options);
+    const receipt = await runResearchPilot(store, options, {
+      launch: async () => {
+        throw new Error("launcher died");
+      },
+    });
+    assert.equal(receipt.outcome.status, "launch-unknown");
+    assert.equal(receipt.outcome.failedStep, "launch");
+    assert.equal(receipt.outcome.engineRunId, "round20-test-run");
+    assert.equal(receipt.model?.profileId, modelId);
+    assert.match(receipt.outcome.message ?? "", /launcher died/u);
+    const written = JSON.parse(await readFile(paths.receiptPath, "utf8")) as {
+      outcome: { status: string; engineRunId: string | null };
+      model: { profileId: string } | null;
+    };
+    assert.equal(written.outcome.status, "launch-unknown");
+    assert.equal(written.outcome.engineRunId, "round20-test-run");
+    assert.equal(written.model?.profileId, modelId);
+  });
+});
+
+test("a read-only Session is refused before a credential file or launch", async () => {
+  await withTempDir("pilot-prelaunch-locked-", async (base) => {
+    const { store, projectId, sessionId } = await provisionStore(base);
+    const options = {
+      projectId,
+      sessionId,
+      runId: "round20-test-run",
+      workDir: join(base, "work"),
+      privateRoot: join(base, "private"),
+      seedDir: join(base, "seed"),
+      engineCheckout: "/opt/engine",
+      pythonExecutable: "/opt/python/bin/python",
+      readerScriptPath: "/opt/reader/snapshot.py",
+    };
+    const { paths } = researchPilotPlan(options);
+    let launches = 0;
+    const receipt = await runResearchPilot(storeWithWriteGate(store, () => false), options, {
+      launch: async () => {
+        launches += 1;
+        return { outcome: "finished" };
+      },
+    });
+    assert.equal(launches, 0);
+    assert.equal(receipt.outcome.status, "configuration-refused");
+    assert.equal(receipt.outcome.reason, "session-not-writable");
+    assert.equal(receipt.outcome.engineRunId, null);
+    assert.equal(receipt.model, null);
+    await assert.rejects(readFile(paths.modelConfigPath, "utf8"));
+    const written = JSON.parse(await readFile(paths.receiptPath, "utf8")) as {
+      outcome: { reason: string };
+    };
+    assert.equal(written.outcome.reason, "session-not-writable");
   });
 });
 
@@ -686,8 +879,11 @@ test("the launcher protocol is parsed strictly", () => {
   assert.equal(finished.supervisorAliveAfterFinish, false);
   assert.deepEqual(finished.record, { run_id: "r" });
   const garbage = parseLauncherOutput("not json\n", "Traceback: boom\n", false);
-  assert.equal(garbage.outcome, "launch-failed");
+  assert.equal(garbage.outcome, "observation-failed", "a silent launcher may have started the run");
   assert.equal(garbage.error?.type, "LauncherProtocolError");
+  const spawnFailure = parseLauncherOutput("", "", false, "spawn python ENOENT");
+  assert.equal(spawnFailure.outcome, "launch-failed", "a spawn error confirms the run did not start");
+  assert.equal(spawnFailure.error?.type, "LauncherSpawnFailed");
   const timedOut = parseLauncherOutput("", "", true);
   assert.equal(timedOut.outcome, "observation-timeout");
   assert.match(RESEARCH_PILOT_LAUNCHER_PROGRAM, /start_run/u);
@@ -807,6 +1003,24 @@ function neverUsedRegistrationStore() {
     get: () => undefined,
     list: () => [],
   } as unknown as Parameters<typeof runResearchPilot>[0]["scienceFlowRegistrations"];
+}
+
+/** The real store with its established write gate made conditional on `writable`. */
+function storeWithWriteGate(store: SessionStore, writable: () => boolean): SessionStore {
+  return new Proxy(store, {
+    get(target, property) {
+      if (property === "assertSessionWritable") {
+        return (sessionId: string) => {
+          if (!writable()) throw new Error("Session is archived and read-only");
+          return target.assertSessionWritable(sessionId);
+        };
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function"
+        ? (value as (...args: unknown[]) => unknown).bind(target)
+        : value;
+    },
+  });
 }
 
 async function writeFakeStageLedger(csvPath: string): Promise<void> {

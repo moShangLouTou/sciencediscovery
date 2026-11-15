@@ -273,9 +273,21 @@ selects a provider, credential or model name; those come only from the Session.
    provider-token cap.
 
 An engine run id names one run. Both the engine and this command refuse a second
-`launch` for an existing run id. `attach` re-registers and re-reads an existing
-run from its receipt without another paid launch, and keeps the launch-time
-model selection even if the Session's model changed afterwards.
+`launch` for an existing run id. That refusal is returned and never written: the
+receipt at the path may be the only record of the model and grant the run was
+actually started with. Before the paid launch the command writes a minimal
+frozen receipt (identity, selection, grant and generated-input paths). If the
+launcher itself throws, the receipt is replaced by `launch-unknown`, which keeps
+the run id but does not assert that the engine started or did not. If
+registration or readback then fails, that receipt is replaced by one that keeps
+those facts and records the failed step and run id, and a later `attach`
+completes registration and readback from it without another launch. A Session
+that is already read-only is refused before any credential file or process
+exists; the write gate is checked again after the launch, so a Session that
+becomes read-only mid-run leaves the same recoverable receipt rather than
+nothing. `attach` re-registers and re-reads an existing run from its receipt and
+keeps the launch-time model selection even if the Session's model changed
+afterwards.
 
 ### 8.2 What the round-20 runs showed
 

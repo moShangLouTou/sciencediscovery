@@ -123,6 +123,7 @@ export interface ResearchPilotReadbackStore extends ResearchPilotSessionStore {
 export type ResearchPilotRefusalReason =
   | "project-not-found"
   | "session-not-found"
+  | "session-not-writable"
   | "no-effective-model"
   | "model-unavailable"
   | "credential-unavailable"
@@ -377,6 +378,8 @@ export type ResearchPilotOutcomeStatus =
   | "completed"
   | "configuration-refused"
   | "invalid-option"
+  | "launch-pending"
+  | "launch-unknown"
   | "launch-failed"
   | "observation-failed"
   | "run-already-exists"
@@ -652,7 +655,10 @@ export function researchPilotManifest(input: {
  * The full operator invocation. Returns the receipt it also wrote to disk.
  * A refusal, launch failure or readback failure is reported at its own step;
  * once the engine created a run, `outcome.engineRunId` is retained so a retry
- * attaches to that run instead of starting another paid launch.
+ * attaches to that run instead of starting another paid launch. The frozen
+ * selection is written before the paid launch, so a duplicate `launch` refuses
+ * without touching that receipt and a post-launch failure still leaves
+ * `attach` something to read.
  */
 export async function runResearchPilot(
   store: ResearchPilotReadbackStore,
@@ -672,21 +678,21 @@ export async function runResearchPilot(
       request.receiptPath
         ? resolve(request.receiptPath)
         : join(resolve(request.workDir), "receipt.json"),
+      { preserveExisting: true },
     );
   }
   const context: ResearchPilotContext = { store, identity, request, ...plan, now };
 
   // A run id names one engine run. If the engine already owns it, the only
   // valid continuation is `attach`; starting again would be a second paid run.
+  // The refusal is returned, never written: the receipt at this path may be the
+  // only record of the model and grant the run was actually started with.
   if (
     await fileExists(
       join(plan.paths.stateHome, "scienceflow", "managed_runs", request.runId, "control.json"),
     )
   ) {
-    return writeReceipt(
-      existingRunReceipt({ identity, startedAt, now, request, plan }),
-      plan.paths.receiptPath,
-    );
+    return existingRunReceipt({ identity, startedAt, now, request, plan });
   }
 
   let resolved: ResearchPilotResolvedModel;
@@ -696,6 +702,31 @@ export async function runResearchPilot(
     return writeReceipt(
       refusalReceipt({ identity, startedAt, now, request, error, status: "configuration-refused", ...plan }),
       plan.paths.receiptPath,
+      { preserveExisting: true },
+    );
+  }
+
+  // A Session that is already read-only is refused before any credential file
+  // or process exists. The write gate is checked again after the launch, where
+  // the Session may have become read-only while the engine was running.
+  try {
+    store.assertSessionWritable(identity.sessionId);
+  } catch (error) {
+    return writeReceipt(
+      refusalReceipt({
+        identity,
+        startedAt,
+        now,
+        request,
+        error: new ResearchPilotRefusal(
+          "session-not-writable",
+          `The Session cannot be registered; refusing before launch: ${errorMessage(error)}`,
+        ),
+        status: "configuration-refused",
+        ...plan,
+      }),
+      plan.paths.receiptPath,
+      { preserveExisting: true },
     );
   }
 
@@ -722,18 +753,55 @@ export async function runResearchPilot(
   const noInstallPathPrefix = plan.grant.refusePackageInstall
     ? await writeInstallRefusalShims(plan.paths.workDir)
     : undefined;
+  // Persist the frozen identity/selection before the paid launch. If this
+  // process ends during the launch, registration or readback, `attach` can
+  // still recover from this receipt instead of starting another run.
+  await writeReceipt(
+    preLaunchReceipt({
+      identity,
+      startedAt,
+      now,
+      request,
+      grant: plan.grant,
+      paths: plan.paths,
+      model: resolved.selection,
+      status: "launch-pending",
+      message: "The run is frozen; no launch result has been recorded yet",
+    }),
+    plan.paths.receiptPath,
+  );
   const launch = dependencies.launch ?? launchManagedRun;
-  const launched = await launch({
-    manifestPath: plan.paths.manifestPath,
-    runId: request.runId,
-    totalAllowanceSec: plan.grant.totalAllowanceSec,
-    pythonExecutable: request.pythonExecutable,
-    engineCheckout: request.engineCheckout,
-    workDir: plan.paths.workDir,
-    stateHome: plan.paths.stateHome,
-    ...(noInstallPathPrefix ? { noInstallPathPrefix } : {}),
-    ...(resolved.proxyUrl ? { proxyUrl: resolved.proxyUrl } : {}),
-  });
+  let launched: ResearchPilotLaunchOutcome;
+  try {
+    launched = await launch({
+      manifestPath: plan.paths.manifestPath,
+      runId: request.runId,
+      totalAllowanceSec: plan.grant.totalAllowanceSec,
+      pythonExecutable: request.pythonExecutable,
+      engineCheckout: request.engineCheckout,
+      workDir: plan.paths.workDir,
+      stateHome: plan.paths.stateHome,
+      ...(noInstallPathPrefix ? { noInstallPathPrefix } : {}),
+      ...(resolved.proxyUrl ? { proxyUrl: resolved.proxyUrl } : {}),
+    });
+  } catch (error) {
+    // The launcher threw, so whether the engine started is not known from here.
+    // The run id is retained for `attach`; this command does not launch again.
+    return writeReceipt(
+      preLaunchReceipt({
+        identity,
+        startedAt,
+        now,
+        request,
+        grant: plan.grant,
+        paths: plan.paths,
+        model: resolved.selection,
+        status: "launch-unknown",
+        message: errorMessage(error),
+      }),
+      plan.paths.receiptPath,
+    );
+  }
 
   return finishResearchPilot({
     context,
@@ -898,78 +966,108 @@ async function finishResearchPilot(input: {
     resolveBinding: () => bindingFor(identity, request.runId, paths),
     store: () => store.scienceFlowRegistrations,
   });
-  const registration = await registrationService.create(
-    { projectId: identity.projectId, sessionId: identity.sessionId },
-    request.runId,
-  );
-  const registered =
-    registration.status === "created" || registration.status === "existing"
-      ? { status: registration.status, registration: registration.registration }
-      : null;
+  let registered: ResearchPilotReceipt["registration"] = null;
+  let step: "register" | "readback" = "register";
+  try {
+    const registration = await registrationService.create(
+      { projectId: identity.projectId, sessionId: identity.sessionId },
+      request.runId,
+    );
+    registered =
+      registration.status === "created" || registration.status === "existing"
+        ? { status: registration.status, registration: registration.registration }
+        : null;
 
-  const snapshotQuery = createScienceFlowRunSnapshotQuery({
-    identities: store,
-    resolveBinding: () => bindingFor(identity, request.runId, paths),
-    readerConfig: {
-      pythonExecutable: request.pythonExecutable,
-      readerScriptPath: request.readerScriptPath,
-      timeoutMs: 30_000,
-    },
-    ...(dependencies.readSnapshot ? { readSnapshot: dependencies.readSnapshot } : {}),
-  });
-  const query = await snapshotQuery({
-    projectId: identity.projectId,
-    sessionId: identity.sessionId,
-    runId: request.runId,
-  });
-
-  const stages = await readStageRows(paths.stageCsvPath);
-  const usage = await readUsage(paths.providerCallsPath);
-  const dto =
-    query.status === "ok"
-      ? projectScienceFlowRunSnapshot(request.runId, query.snapshot)
-      : null;
-  const status: ResearchPilotOutcomeStatus =
-    launch.outcome !== "finished"
-      ? "observation-failed"
-      : registered === null
-        ? "registration-failed"
-        : query.status !== "ok"
-          ? "readback-failed"
-          : "completed";
-  const failedStep =
-    status === "observation-failed"
-      ? "observe"
-      : status === "registration-failed"
-        ? "register"
-        : status === "readback-failed"
-          ? "readback"
-          : undefined;
-  const message =
-    status === "observation-failed" && launch.error
-      ? `${launch.error.type}: ${launch.error.message}`
-      : status === "registration-failed"
-        ? `registration ${registration.status}${"resource" in registration ? `: ${registration.resource}` : ""}`
-        : undefined;
-  return writeReceipt(
-    {
-      ...base,
-      finishedAt: context.now(),
-      outcome: {
-        status,
-        ...(failedStep ? { failedStep } : {}),
-        ...(status === "readback-failed" && query.status !== "ok" ? { reason: query.status } : {}),
-        ...(message ? { message } : {}),
-        engineRunId,
+    step = "readback";
+    const snapshotQuery = createScienceFlowRunSnapshotQuery({
+      identities: store,
+      resolveBinding: () => bindingFor(identity, request.runId, paths),
+      readerConfig: {
+        pythonExecutable: request.pythonExecutable,
+        readerScriptPath: request.readerScriptPath,
+        timeoutMs: 30_000,
       },
-      launch: launchRecord,
-      registration: registered,
-      snapshot: dto,
-      result: summarizeResult(stages, dto),
-      usage,
-    },
-    paths.receiptPath,
-  );
+      ...(dependencies.readSnapshot ? { readSnapshot: dependencies.readSnapshot } : {}),
+    });
+    const query = await snapshotQuery({
+      projectId: identity.projectId,
+      sessionId: identity.sessionId,
+      runId: request.runId,
+    });
+
+    const stages = await readStageRows(paths.stageCsvPath);
+    const usage = await readUsage(paths.providerCallsPath);
+    const dto =
+      query.status === "ok"
+        ? projectScienceFlowRunSnapshot(request.runId, query.snapshot)
+        : null;
+    const status: ResearchPilotOutcomeStatus =
+      launch.outcome !== "finished"
+        ? "observation-failed"
+        : registered === null
+          ? "registration-failed"
+          : query.status !== "ok"
+            ? "readback-failed"
+            : "completed";
+    const failedStep =
+      status === "observation-failed"
+        ? "observe"
+        : status === "registration-failed"
+          ? "register"
+          : status === "readback-failed"
+            ? "readback"
+            : undefined;
+    const message =
+      status === "observation-failed" && launch.error
+        ? `${launch.error.type}: ${launch.error.message}`
+        : status === "registration-failed"
+          ? `registration ${registration.status}${"resource" in registration ? `: ${registration.resource}` : ""}`
+          : undefined;
+    return writeReceipt(
+      {
+        ...base,
+        finishedAt: context.now(),
+        outcome: {
+          status,
+          ...(failedStep ? { failedStep } : {}),
+          ...(status === "readback-failed" && query.status !== "ok" ? { reason: query.status } : {}),
+          ...(message ? { message } : {}),
+          engineRunId,
+        },
+        launch: launchRecord,
+        registration: registered,
+        snapshot: dto,
+        result: summarizeResult(stages, dto),
+        usage,
+      },
+      paths.receiptPath,
+    );
+  } catch (error) {
+    // Registration and readback run after the paid launch. Their failure must
+    // not remove the receipt: it is what `attach` reads to retry this step
+    // without starting another run. The launch record keeps its own outcome;
+    // the failed step here is the step this attempt actually failed at.
+    const status: ResearchPilotOutcomeStatus =
+      step === "register" ? "registration-failed" : "readback-failed";
+    return writeReceipt(
+      {
+        ...base,
+        finishedAt: context.now(),
+        outcome: {
+          status,
+          failedStep: step,
+          message: errorMessage(error),
+          engineRunId,
+        },
+        launch: launchRecord,
+        registration: registered,
+        snapshot: null,
+        result: null,
+        usage: null,
+      },
+      paths.receiptPath,
+    );
+  }
 }
 
 /** The trusted binding the readback may use for this one operator run. */
@@ -1014,6 +1112,63 @@ function receiptLaunch(launch: ResearchPilotLaunchOutcome): ResearchPilotLaunchO
     ...launch,
     ...(record ? { record } : {}),
     ...(launch.stderrTail ? { stderrTail: launch.stderrTail.slice(-2_000) } : {}),
+  };
+}
+
+/**
+ * The credential-free receipt written around the paid launch: the frozen
+ * identity, selection, grant and generated-input paths, with no registration or
+ * readback. `launch-pending` is written first; `launch-unknown` replaces it when
+ * the launcher itself threw and whether the engine started cannot be told from
+ * here. Neither claims a confirmed engine run.
+ */
+function preLaunchReceipt(input: {
+  readonly identity: { readonly projectId: string; readonly sessionId: string };
+  readonly startedAt: string;
+  readonly now: () => string;
+  readonly request: ResearchPilotRequest;
+  readonly grant: ResearchPilotGrant;
+  readonly paths: ResearchPilotPaths;
+  readonly model: ResearchPilotModelSelection;
+  readonly status: "launch-pending" | "launch-unknown";
+  readonly message: string;
+}): ResearchPilotReceipt {
+  return {
+    schemaVersion: RESEARCH_PILOT_RECEIPT_VERSION,
+    invocation: "scienceflow-research-pilot",
+    startedAt: input.startedAt,
+    finishedAt: input.now(),
+    identity: input.identity,
+    model: input.model,
+    engine: {
+      entry: RESEARCH_PILOT_ENGINE_ENTRY,
+      checkout: input.request.engineCheckout,
+      runId: input.request.runId,
+      task: input.grant.task,
+      workDir: input.paths.workDir,
+      stateHome: input.paths.stateHome,
+      grant: input.grant,
+      generatedInputs: {
+        alias: modelAlias(input.model),
+        modelConfigPath: input.paths.modelConfigPath,
+        settingsPath: input.paths.settingsPath,
+        engineConfigPath: input.paths.engineConfigPath,
+      },
+      manifestPath: input.paths.manifestPath,
+    },
+    outcome: {
+      status: input.status,
+      ...(input.status === "launch-unknown" ? { failedStep: "launch" } : {}),
+      message: input.message,
+      // A pending launch has no confirmed run yet; an unknown one reserves this
+      // run id for `attach` but cannot assert that the engine created it.
+      engineRunId: input.status === "launch-unknown" ? input.request.runId : null,
+    },
+    launch: null,
+    registration: null,
+    snapshot: null,
+    result: null,
+    usage: null,
   };
 }
 
@@ -1155,7 +1310,11 @@ function planFallbackPaths(
 async function writeReceipt(
   receipt: ResearchPilotReceipt,
   receiptPath: string,
+  options: { readonly preserveExisting?: boolean } = {},
 ): Promise<ResearchPilotReceipt> {
+  // A refusal or a retry must not replace facts an earlier invocation froze
+  // about a run that already exists.
+  if (options.preserveExisting && (await fileExists(receiptPath))) return receipt;
   await mkdir(dirname(receiptPath), { recursive: true });
   // A receipt carries no credential: the private inputs appear as paths only,
   // and their content is never read here.
@@ -1484,8 +1643,11 @@ export function parseLauncherOutput(
   }
   const stderrTail = stderr.trim() ? stderr.trim().slice(-2_000) : undefined;
   if (!isRecord(payload)) {
+    // A spawn error means the process never ran, so the engine cannot have
+    // started. Without one the launcher may have died after `start_run`, so the
+    // outcome is unknown rather than a confirmed non-start.
     return {
-      outcome: timedOut ? "observation-timeout" : "launch-failed",
+      outcome: timedOut ? "observation-timeout" : spawnError ? "launch-failed" : "observation-failed",
       ...(stderrTail ? { stderrTail } : {}),
       error: {
         type: timedOut ? "LauncherTimeout" : spawnError ? "LauncherSpawnFailed" : "LauncherProtocolError",
@@ -1557,6 +1719,11 @@ function hostOf(value: string): string {
   } catch {
     return "";
   }
+}
+
+function errorMessage(error: unknown): string {
+  const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  return message.slice(0, 500);
 }
 
 function isUsableString(value: unknown): value is string {
