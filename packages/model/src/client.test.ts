@@ -74,7 +74,7 @@ for (const protocol of ["openai-chat-completions", "openai-responses", "anthropi
       assert.deepEqual(turn.toolCalls[0]?.args, { text: "report" });
       assert.deepEqual(turn.streamDiagnostics, {
         protocol, unparseableSsePayloads: 0,
-        ...(protocol === "openai-chat-completions" ? { toolCallDeltasWithoutIndex: 0 } : {}),
+        ...(protocol === "openai-chat-completions" ? { toolCallDeltasWithoutIndex: 0, toolCallIdsSynthesized: 0 } : {}),
       });
     });
   });
@@ -102,7 +102,7 @@ for (const protocol of ["openai-chat-completions", "openai-responses", "anthropi
       const first = await run();
       assert.deepEqual(first.streamDiagnostics, {
         protocol, unparseableSsePayloads: 1,
-        ...(protocol === "openai-chat-completions" ? { toolCallDeltasWithoutIndex: 2 } : {}),
+        ...(protocol === "openai-chat-completions" ? { toolCallDeltasWithoutIndex: 2, toolCallIdsSynthesized: 0 } : {}),
       });
       if (protocol === "openai-chat-completions") {
         assert.ok(first.toolCalls[0]?.argsParseError);
@@ -110,7 +110,7 @@ for (const protocol of ["openai-chat-completions", "openai-responses", "anthropi
       }
       assert.deepEqual((await run()).streamDiagnostics, {
         protocol, unparseableSsePayloads: 0,
-        ...(protocol === "openai-chat-completions" ? { toolCallDeltasWithoutIndex: 0 } : {}),
+        ...(protocol === "openai-chat-completions" ? { toolCallDeltasWithoutIndex: 0, toolCallIdsSynthesized: 0 } : {}),
       });
     });
   });

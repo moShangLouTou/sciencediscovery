@@ -113,6 +113,13 @@ for (const kind of ['missing-id', 'done-only', 'valid-finish'] as const) test(`C
     const client = new ProviderModelClient({ baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, model: 'synthetic', proxy: { mode: 'direct' } }, policy);
     const call = client.invoke(input, AbortSignal.timeout(2000), observer);
     if (kind === 'valid-finish') assert.equal((await call).assistantMessage.content, 'OK');
-    else await assert.rejects(call, kind === 'missing-id' ? /omitted a tool call ID/ : /without a completion event/);
+    else if (kind === 'missing-id') {
+      // Chat Completions mints a correlation id for a gateway that omits it
+      // instead of failing the turn; the completion-level test pins the count.
+      const turn = await call;
+      assert.equal(turn.toolCalls.length, 1);
+      assert.match(turn.toolCalls[0]!.id, /^call_[0-9a-f-]{36}$/);
+    }
+    else await assert.rejects(call, /without a completion event/);
   } finally { server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); }
 });
