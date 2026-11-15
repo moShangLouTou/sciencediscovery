@@ -223,12 +223,23 @@ node --import tsx services/api/src/scienceflow/research-pilot-cli.ts launch \
   --private-root <0700 dir outside the work dir> \
   --engine <pinned checkout> --python <interpreter> \
   --reader-script services/scienceflow-reader/snapshot.py \
-  --seed <traced seed dir> [--refuse-package-install] [--receipt <path>]
+  --seed <traced seed dir> [--refuse-package-install] [--receipt <path>] \
+  [--task-description <text file>]
 ```
 
 The same command with `attach` takes the same options, skips the launch, and
 re-registers/re-reads the run its receipt already records. Nothing in the options
 selects a provider, credential or model name; those come only from the Session.
+
+`--task-description` is the one option that changes what the researcher is asked
+to do: the file's text (at most 32 KiB, no NUL bytes) becomes the engine
+manifest's inline `task`, which the engine pins as the researcher's first user
+message instead of the task package's default description. It is execution
+input, not a research decision: the operator passes it unchanged, the receipt
+records it as part of the frozen grant, and `deliver` rejects the option. A run
+that omits it is unchanged. Round 22's run F uses it to state the Agent's
+already-authored command sequence and to forbid solver rewrites; the plan
+artifact remains the research decision and is linked separately.
 
 1. Opens a real `SessionStore` at the isolated data directory the operator names
    and resolves the Project and Session there — no in-memory identity adapter.
@@ -520,6 +531,9 @@ from the revised plan.
 | `round22-circle-packing-c` | `failed` after 60.3 s: the provider returned reasoning without an answer or tool call (`UnusableResponseError`) | none committed (S01 was evaluated but the run failed before the ledger row) | none |
 | `round22-circle-packing-d` | `completed`, 875.0 s, research finished | S01 2.6239750175348147 (the seed reproduced) | S01 = the seed, no new candidate |
 | `round22-circle-packing-e` | `stopped` at the operator's 900 s allowance, 910.3 s; research stopped, report ready | S01 2.6239750175348147 (the seed reproduced) | S01 = the seed, no arm candidate |
+| `round22-circle-packing-f` | `failed` after 198.3 s: the provider returned reasoning without an answer or tool call (`UnusableResponseError`) at iteration 9 | none committed; the workspace held only the seed copy | none |
+| `round22-circle-packing-g` | `stopped` at the operator's 900 s allowance, 909.7 s; research stopped | S01 2.6239750175348147 (the seed reproduced) | S01 = the seed; no trial log |
+| `round22-circle-packing-h` | `failed` after 432.3 s: the provider failed at iteration 22, after the B submit | S01 seed 2.6239750175348147; S02 Arm A best 2.624072517069772 | S02 (`df01c4a8…`); Arm B best submitted but not captured |
 
 Run A's researcher read the plan at t+5 s and wrote its own solver family; its
 solvers include the eviction operator, but mixed with multistart, global passes
@@ -538,12 +552,27 @@ and started it in the background at 600 s with 15 workers, wrote a new
 it at the operator allowance with only S01 captured. The workspace artifact
 changed after that stage but was never evaluated, so it is not counted.
 
-All four later runs are recorded with their deviations rather than smoothed: the
-model used nested `multiprocessing` pools inside its own commands (for example 15
-workers) and background processes, which exceeds the operator's single
-engine-worker allowance in spirit though not the engine's evaluation; runs A–D
-were not stopped by the 900 s allowance, while run E was; and neither the planned
-comparison nor the revised ablation was carried out.
+Run F pinned the Agent's command sequence as the task description and copied the
+seed, but the provider returned reasoning without an answer or tool call at
+iteration 9, so no search ran and no stage was committed. Run G reused the same
+package without the pinned text and deviated again: it wrote its own
+`packing_solver.py`, produced no trial log, and reached the allowance with only
+S01. Run H used the same package with the pinned task text actually carried
+through the launcher (the CLI had dropped it on the first attempt), and the
+researcher then executed the plan: eight labeled searches at 45 s, two submits,
+a reset between arms, and no solver authoring. The engine captured S01 (seed)
+and S02 (Arm A best `2.624072517069772`) before the provider failed at iteration
+22, immediately after the Arm B submit; the Arm B best (`2.624146247766`, from
+candidate `B_1`) exists in the workspace and is delivered as
+`submitted_not_captured`, with its score from the unchanged task evaluator run
+offline.
+
+Later runs are recorded with their deviations rather than smoothed: runs A, B,
+D, E and G used nested `multiprocessing` pools, background processes or their own
+solver code, which exceeds the operator's single-engine-worker allowance in
+spirit though not the engine's evaluation; runs A–D were not stopped by the
+900 s allowance, runs E and G were, and runs F and H died on an unusable provider
+response. The revised ablation itself was carried out only in run H.
 
 ### 10.3 Delivery with the plan, the incumbent and every attempt
 
@@ -575,7 +604,15 @@ seed bytes as its selected solution (version `e181e53c…`), a note (`b34869ef�
 and S01 as the selected carried seed. Run E delivered the seed bytes as the
 selected solution (`dc0b30ed…` / version `5c79b5ab…`), a note (`15c88be2…` /
 version `21d88195…`) linking plan version 2, and S01 as the selected carried
-seed; there was no arm stage to publish. One correction is in the record:
+seed; there was no arm stage to publish. Run H delivered S02 (`1b4274bd…`) as
+the selected solution, a note (`c61957bf…`) linking plan version 2, and attempts
+S01 (`carried_seed`) and S02 (`evaluated_attempt`, selected). Its Arm B best is
+not an engine stage: the operator published the submitted bytes as
+`scienceflow/round22-circle-packing-h/attempts/B_best/solution.json`
+(`f9254504…`, role `submitted_not_captured`) and the eight candidates' evaluator
+results as
+`scienceflow/round22-circle-packing-h/candidate-evaluations.md` (`3884178d…`),
+both labelled operator-extracted. One correction is in the record:
 delivery v1 labelled run A's S01 as the carried seed from the old parent-only
 rule; that attempt artifact was marked deleted and the stage republished with
 the corrected role, and the correction file keeps the reason.
@@ -626,29 +663,43 @@ execute the plan, not merely to receive it. The answer is version 3 of
 `scienceflow/round22/experiment-interpretation.md` (`f3eaebfd…`, 2,284 bytes),
 with plan version 2, the run E note and the run E summary as inputs.
 
+After run H, one more conversation (run
+`c54241e7-7d1b-41d5-bb7b-1ab492d68170`, 255.4 s, four successful artifact reads)
+compared plan version 2, run H's note, run H's execution summary and the operator
+candidate evaluations. Its verdict is **contradicted under the plan's rule**: the
+eight searches and both submits ran at the same fixed start with paired seeds
+and equal 45 s budgets, Arm A's best is the engine-captured S02
+`2.624072517070`, Arm B's best is the offline-scored `2.624146247766`, and
+`B_best − A_best = 7.37307e-5 < 5.0e-4`; `B_i ≥ A_i` on three of four pairs
+passes, so the conjunction fails. The missing engine capture of the Arm B best
+does not change the verdict; the delta fails either way. The answer is version 4
+of `scienceflow/round22/experiment-interpretation.md` (`6d0d4b20…`, 2,009
+bytes), with plan version 2, the run H note, the run H summary, the candidate
+evaluations and the Arm B bytes as inputs.
+
 ### 10.5 What round 22 establishes, and what it does not
 
 Established in this isolated operator scope: a real Agent authored plan is a
 fixed Session artifact, and after the review it authored a revised, narrower plan
-as version 2; the same persisted Session's SD-selected model drove five managed
+as version 2; the same persisted Session's SD-selected model drove eight managed
 runs from the exact incumbent and plan bytes; the plan reached the researcher's
 context and tool use; four new candidates were engine-evaluated in run A; every
-captured stage is separately delivered with its digest and role; run B's and run
-E's selected best is the seed and their null results are published rather than
-hidden; and real follow-up Agents read the evidence and gave explicitly
-unresolved verdicts, the last one against the revised ablation.
+captured stage is separately delivered with its digest and role; run B's, run E's
+and run G's selected best is the seed and their null results are published rather
+than hidden; run H executed the revised paired ablation and produced an
+engine-captured new candidate (S02); and real follow-up Agents read the evidence
+and gave verdicts, the last one a negative result under the plan's rule.
 
-Not established: the plan's controlled comparison and its revised ablation. No
-run executed Arm A versus Arm B at equal allowance with arm labels, so neither the
-original hypothesis nor the narrowed routing ablation is tested, and a higher
-score unrelated to that comparison is not treated as support. The third run was
-set up to do exactly that — seed first, two Arm A commands, six Arm B commands,
-one process, a trial log — but an unusable provider response ended the worker
-after the seed was evaluated and before any arm command committed a stage; the
-authorized fourth run reproduced the seed and then rewrote its own solver instead
-of running the arms. The fifth run received the revised plan and the paired
-runner, copied the seed, and then backgrounded its own `solver3.py` and a new
-`solver4.py` without calling the runner. This document does not claim statistical significance, a
+Not established: the original polish-only hypothesis. No run implemented or
+executed a polish-only Arm A, so that hypothesis remains untested. The revised
+routing ablation was executed only in run H: eight paired searches at one fixed
+start and equal budgets, with Arm A's best engine-captured and Arm B's best
+submitted but not captured because the provider failed after the submit. Its
+result does not meet the plan's support rule (`7.373e-5 < 5.0e-4`), so it is a
+negative result, not support. The earlier runs' failures are recorded above: an
+unusable provider response ended run C before any arm command committed; runs D,
+E and G rewrote or bypassed the runner; run F died on the same provider failure
+before searching. This document does not claim statistical significance, a
 benchmark campaign, a public research start, a HTTP/browser/Runner journey, or
 isolation of hostile code.
 
@@ -703,6 +754,13 @@ the reset restored the first stage's digest. This is still mechanics only: the
 short-budget scores are not evidence, and the paired comparison has never been
 executed in an engine run. Run E received this package and did not call the
 runner at all (10.2).
+
+The run-F/H package adds one more control: it pins the Agent's already-authored
+command sequence as the engine task text with `--task-description` (8.1),
+forbids solver authoring and background processes in that text, and uses the
+same frozen kernel and runner. Run H is the first run that followed the sequence
+end to end; the option is execution input, not a research decision, and the plan
+artifact remains the Agent's.
 
 ## 11. What this pilot does not claim
 
@@ -771,15 +829,19 @@ planning and interpretation conversations, including the revised-plan run
 `interrupted`), `evidence/planning-context-provenance.json` records the planning
 run's own tool calls and the predecessor turn's artifact reads,
 `evidence/delivery-*.json` are the delivery records, `seed/`, `seed-b/`,
-`seed-c/`, `seed-d/` and `seed-e/` are the seeds with their manifests,
+`seed-c/`, `seed-d/`, `seed-e/` and `seed-f/` are the seeds with their manifests,
 `evidence/execution-summary-*.json` and `evidence/interpretation-artifact*.json`
 are the published supporting artifacts' metadata,
 `evidence/run-a-attempt-correction.json` records the role correction,
-`evidence/plan-v2-artifact.json` and `evidence/interpretation-artifact-v3.json`
-identify the revised plan and the run E interpretation, and
-`evidence/verification.json` re-derives the chain's 47 invariants from the store,
-CAS and records. The prechecks add `seed-d`/`seed-e` manifests,
-`evidence/precheck-results.json`, `evidence/precheck-e-results.json` and the
-ignored `precheck/` and `precheck-e/` workspaces. The engine's own task state is
-under `pilot/runs/<run>/circle-packing/`, and the private generated model inputs
-stay outside the repository in a 0700 directory.
+`evidence/plan-v2-artifact.json`, `evidence/interpretation-artifact-v3.json` and
+`evidence/interpretation-artifact-v4.json` identify the revised plan and the run
+E/H interpretations, `evidence/run-f-failure.json` and
+`evidence/run-g-deviation.json` record those runs, and
+`evidence/run-h-candidate-evaluations.json` plus
+`evidence/run-h-evidence-artifacts.json` record the offline evaluator results and
+the published Arm B bytes. `evidence/verification.json` re-derives the chain's 57
+invariants from the store, CAS and records. The prechecks add `seed-d`/`seed-e`
+manifests, `evidence/precheck-results.json`, `evidence/precheck-e-results.json`
+and the ignored `precheck/` and `precheck-e/` workspaces. The engine's own task
+state is under `pilot/runs/<run>/circle-packing/`, and the private generated
+model inputs stay outside the repository in a 0700 directory.
