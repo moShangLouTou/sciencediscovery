@@ -18,8 +18,9 @@
  * This is an internal, local entry — not an HTTP route and not the public
  * research-start feature. It opens a real `SessionStore` at an isolated data
  * directory, resolves the Session's effective model from it, and either runs
- * the whole chain (`launch`) or only re-registers and re-reads a run an earlier
- * invocation already started (`attach`).
+ * the whole chain (`launch`), only re-registers and re-reads a run an earlier
+ * invocation already started (`attach`), or delivers an existing run's selected
+ * result into the Session as normal artifacts (`deliver`).
  *
  *   node --import tsx services/api/src/scienceflow/research-pilot-cli.ts launch \
  *     --data-dir <isolated store> --project <id> --session <id> \
@@ -30,11 +31,17 @@
  *     --seed <seed dir> [--refuse-package-install] ...
  *
  * Nothing here accepts a provider endpoint, credential or model name: those come
- * only from the resolved SD Session.
+ * only from the resolved SD Session. `deliver` accepts neither a score nor an
+ * artifact digest: the reader resolves the selected stage and its bytes.
  */
 import { resolve } from "node:path";
 
 import { SessionStore } from "../store.js";
+import {
+  deliverScienceFlowResult,
+  writeDeliveryRecord,
+  type ScienceFlowResultDeliveryRecord,
+} from "./result-delivery.js";
 import {
   attachResearchPilotRun,
   runResearchPilot,
@@ -42,7 +49,7 @@ import {
   type ResearchPilotReceipt,
 } from "./research-pilot.js";
 
-const USAGE = `usage: research-pilot-cli.ts <launch|attach> [options]
+const USAGE = `usage: research-pilot-cli.ts <launch|attach|deliver> [options]
 
 required:
   --data-dir <path>          isolated SessionStore data directory
@@ -50,10 +57,12 @@ required:
   --session <id>             persisted Session id (must belong to the Project)
   --run-id <id>              ScienceFlow managed run id for this attempt
   --work-dir <path>          operator working directory for this run
-  --private-root <path>      0700 directory outside the work dir for generated inputs
-  --engine <path>            pinned ScienceFlow checkout
   --python <path>            interpreter for the engine and the task evaluator
   --reader-script <path>     services/scienceflow-reader/snapshot.py
+
+launch and attach also require:
+  --private-root <path>      0700 directory outside the work dir for generated inputs
+  --engine <path>            pinned ScienceFlow checkout
   --seed <path>              traced seed directory linked into the run's dataset
 
 pilot limits (defaults are the round-20 standing allowance):
@@ -68,7 +77,15 @@ pilot limits (defaults are the round-20 standing allowance):
   --feedback-max-tokens <n>  default 4096
   --http-timeout-sec <n>     default 60
   --refuse-package-install   put pip/pip3/uv refusal shims on the run's PATH
-  --receipt <path>           default <work-dir>/receipt.json
+  --receipt <path>           launch/attach receipt; default <work-dir>/receipt.json
+
+deliver only:
+  --record <path>            delivery record output; default <work-dir>/delivery.json
+  --launch-receipt <path>    pilot receipt read for model/lifecycle facts;
+                             default <work-dir>/receipt.json
+
+deliver publishes the existing run's selected stage as normal Session artifacts.
+It starts no run, re-evaluates nothing and accepts no score or digest.
 `;
 
 function fail(message: string): never {
@@ -76,14 +93,15 @@ function fail(message: string): never {
   process.exit(2);
 }
 
-function parseOptions(argv: readonly string[]): ResearchPilotOptions & {
-  readonly command: "launch" | "attach";
-  readonly dataDir: string;
-  readonly projectId: string;
-  readonly sessionId: string;
+type Command = "launch" | "attach" | "deliver";
+
+function parseArgs(argv: readonly string[]): {
+  readonly command: Command;
+  readonly flags: ReadonlySet<string>;
+  readonly values: ReadonlyMap<string, string>;
 } {
   const command = argv[0];
-  if (command !== "launch" && command !== "attach") {
+  if (command !== "launch" && command !== "attach" && command !== "deliver") {
     fail(USAGE);
   }
   const values = new Map<string, string>();
@@ -105,21 +123,20 @@ function parseOptions(argv: readonly string[]): ResearchPilotOptions & {
     process.stdout.write(USAGE);
     process.exit(0);
   }
-  const required = [
-    "data-dir",
-    "project",
-    "session",
-    "run-id",
-    "work-dir",
-    "private-root",
-    "engine",
-    "python",
-    "reader-script",
-    "seed",
-  ];
+  const common = ["data-dir", "project", "session", "run-id", "work-dir", "python", "reader-script"];
+  const required = command === "deliver"
+    ? common
+    : [...common, "private-root", "engine", "seed"];
   for (const name of required) {
     if (!values.get(name)) fail(`Missing required option --${name}\n\n${USAGE}`);
   }
+  return { command, flags, values };
+}
+
+function pilotRequest(
+  values: ReadonlyMap<string, string>,
+  flags: ReadonlySet<string>,
+): ResearchPilotOptions {
   const number = (name: string): number | undefined => {
     const raw = values.get(name);
     if (raw === undefined) return undefined;
@@ -128,10 +145,6 @@ function parseOptions(argv: readonly string[]): ResearchPilotOptions & {
     return parsed;
   };
   return {
-    command,
-    dataDir: resolve(values.get("data-dir")!),
-    projectId: values.get("project")!,
-    sessionId: values.get("session")!,
     runId: values.get("run-id")!,
     workDir: resolve(values.get("work-dir")!),
     privateRoot: resolve(values.get("private-root")!),
@@ -200,13 +213,73 @@ function summarize(receipt: ResearchPilotReceipt, receiptPath: string): Record<s
   };
 }
 
+/** A short delivery summary; the record file holds the full result. */
+function summarizeDelivery(
+  record: ScienceFlowResultDeliveryRecord,
+  recordPath: string,
+): Record<string, unknown> {
+  return {
+    record: recordPath,
+    outcome: record.outcome,
+    identity: record.identity,
+    run: record.run,
+    registration: record.registration,
+    runState: record.runState,
+    selected: record.selected
+      ? {
+          stageId: record.selected.stageId,
+          metricName: record.selected.metricName,
+          metricValue: record.selected.metricValue,
+          artifactSha256: record.selected.artifactSha256,
+          digestVerified: record.selected.digestVerified,
+          bytes: record.selected.bytes,
+        }
+      : null,
+    artifacts: record.artifacts,
+  };
+}
+
 async function main(): Promise<number> {
-  const options = parseOptions(process.argv.slice(2));
-  const store = new SessionStore(options.dataDir);
+  const { command, flags, values } = parseArgs(process.argv.slice(2));
+  // A retargeted flag that this command does not read must fail loudly, not
+  // silently write (or read) the default path.
+  if (command === "deliver") {
+    if (values.has("receipt")) {
+      fail("--receipt applies to launch and attach; deliver writes --record and reads --launch-receipt");
+    }
+  } else if (values.has("record") || values.has("launch-receipt")) {
+    fail("--record and --launch-receipt apply to deliver only");
+  }
+  const dataDir = resolve(values.get("data-dir")!);
+  const store = new SessionStore(dataDir);
   await store.load();
+  const identity = {
+    projectId: values.get("project")!,
+    sessionId: values.get("session")!,
+  };
+  if (command === "deliver") {
+    const record = await deliverScienceFlowResult(store, {
+      ...identity,
+      runId: values.get("run-id")!,
+      workDir: resolve(values.get("work-dir")!),
+      pythonExecutable: resolve(values.get("python")!),
+      readerScriptPath: resolve(values.get("reader-script")!),
+      ...(values.get("task") ? { task: values.get("task")! } : {}),
+      ...(values.get("record") ? { recordPath: resolve(values.get("record")!) } : {}),
+      ...(values.get("launch-receipt")
+        ? { launchReceiptPath: resolve(values.get("launch-receipt")!) }
+        : {}),
+    });
+    const recordPath = values.get("record")
+      ? resolve(values.get("record")!)
+      : resolve(values.get("work-dir")!, "delivery.json");
+    await writeDeliveryRecord(recordPath, record);
+    process.stdout.write(`${JSON.stringify(summarizeDelivery(record, recordPath), null, 2)}\n`);
+    return record.outcome.status === "delivered" ? 0 : 1;
+  }
+  const options = pilotRequest(values, flags);
   const request = {
-    projectId: options.projectId,
-    sessionId: options.sessionId,
+    ...identity,
     runId: options.runId,
     workDir: options.workDir,
     privateRoot: options.privateRoot,
@@ -228,7 +301,7 @@ async function main(): Promise<number> {
     ...(options.receiptPath ? { receiptPath: options.receiptPath } : {}),
   };
   const receipt =
-    options.command === "launch"
+    command === "launch"
       ? await runResearchPilot(store, request)
       : await attachResearchPilotRun(store, request);
   const receiptPath = options.receiptPath ?? resolve(options.workDir, "receipt.json");

@@ -60,6 +60,13 @@ Files:
 | `prepared-inputs-repository.ts` | Additive SQLite table, conditional generation write, corruption detection |
 | `prepared-inputs.ts` | Prepare action: gates, contract re-read, Runner call, receipt |
 | `prepared-inputs-http.ts` | The two prepared-input routes and their status mapping |
+| `result-delivery.ts` | `deliver`: resolves one existing run's selected result and publishes it as Session Artifacts |
+
+`result-delivery.ts` backs `research-pilot-cli.ts deliver`: it re-registers the
+run, reads it through the same binding/reader/DTO path, requires the selected
+stage's bytes to match the recorded digest, and publishes the unchanged solution
+plus a factual result note as normal Artifacts (repeating a delivery reuses the
+same versions). It starts no run and adds no route.
 
 ## Enable and disable
 

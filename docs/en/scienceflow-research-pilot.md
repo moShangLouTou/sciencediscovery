@@ -12,7 +12,9 @@ registry, an ad hoc launcher and an in-memory Project/Session identity adapter �
 with one reusable internal operator command that resolves the Session's effective
 ScienceDiscovery model and reads the run back for that same persisted Session.
 Section 8 describes the command and the round-20 runs; sections 1–7 remain the
-round-19 record and their results are not rewritten.
+round-19 record and their results are not rewritten. Round 21 adds `deliver`,
+which publishes an existing run's selected result as normal Session artifacts for
+the Session's Agent (section 9); it starts no run and re-evaluates nothing.
 
 ## 1. What this pilot is
 
@@ -357,7 +359,87 @@ with a proxy configured, the same code carries it through the engine's
   answer or tool call; it fails the worker, as attempt b showed. Recovering from
   that means a new attempt, not a silent retry inside this command.
 
-## 9. What this pilot does not claim
+## 9. Round 21: delivering the result into the Session
+
+Rounds 19–20 left the result in an operator receipt and the engine's directories.
+Round 21 adds one operation that publishes an existing run's selected result as
+ordinary Session artifacts, so the Session's own Agent can read it.
+
+### 9.1 The `deliver` operation
+
+```sh
+node --import tsx services/api/src/scienceflow/research-pilot-cli.ts deliver \
+  --data-dir <isolated store> --project <id> --session <id> \
+  --run-id <engine run id> --work-dir <pilot dir> \
+  --python <interpreter> --reader-script services/scienceflow-reader/snapshot.py \
+  [--task circle-packing] [--launch-receipt <pilot receipt>] [--record <path>]
+```
+
+It accepts no score and no digest, and it never starts a run:
+
+1. Resolves the Project/Session in the named `SessionStore`, refuses a Session
+   that is read-only (`assertSessionWritable`), and re-registers the run through
+   `createScienceFlowRegistrationService` (the same row, so a second delivery
+   reports `existing`).
+2. Reads the run through `createScienceFlowRunSnapshotQuery` with the same
+   trusted binding the pilot uses, and projects it through the DTO allow-list.
+3. Takes the selected captured stage from that snapshot. The reader has already
+   resolved the artifact inside the allowed task root and hashed it; delivery
+   re-checks the path, reads the bytes once and requires them to match the
+   recorded digest. A missing file, a path outside the root, a digest mismatch
+   or no captured candidate is a returned failure — never an empty artifact or
+   a substituted score. The operator receipt is read only for the model identity
+   and the launch lifecycle it recorded, and only when it names this Project,
+   Session and run; it is never the artifact locator.
+4. Publishes two artifacts through `store.createArtifactVersion` with
+   `origin: "server_generated"`: the selected file unchanged (json) and a
+   factual result-note.md built from the DTO, the engine's stage ledger and the
+   receipt facts. The note depends on the solution version
+   (`inputArtifactVersionIds`), and carries no host paths, endpoints,
+   credentials or model interpretation.
+5. Reuses an existing version of the same artifact whose bytes are identical, so
+   repeating a delivery adds no version, and a retry after a partial publication
+   finishes only the missing output.
+
+The record it writes (`--record`, default `<work-dir>/delivery.json`) holds the
+registration, the public snapshot, the selected stage and the artifact/version
+references. The run's own files are never modified.
+
+### 9.2 What the Session Agent did with it
+
+The artifacts are ordinary catalog entries, so the existing `list_artifacts`,
+`read_artifact` and `materialize_artifact` tools expose them with no new wiring.
+In round 21 the persisted round-20 Session was driven through the product's own
+service composition (`createQueuedRun` + `scheduleSessionRuns`, no HTTP listener
+and no browser) with its frozen Qwen3.8-Flash profile. Asked "what did this
+experiment establish, what is the selected solution, and what experiment should
+we try next?", the Agent called `list_artifacts`, read both delivered versions by
+artifact id and version, materialized the solution into its workspace, and
+answered from them: it named S03 = 2.6239750175348147, labelled S01 as the
+carried-in seed, reported the `stopped` lifecycle and the operator allowance,
+cited both artifact versions, and proposed a seeded follow-up with an explicit
+acceptance margin while stating that it had not been run. Its shell verification
+attempts were declined by the Session's approval mode, and it said so instead of
+inventing the numbers. A model-client compatibility fix was needed first: this
+gateway streams Chat Completions tool calls without ids, so the parser now mints
+a correlation id and records it in the turn's stream diagnostics
+(`docs/en/model-api-compatibility.md`); Responses and Messages keep the strict
+check.
+
+### 9.3 What delivery does not claim
+
+- It is still an operator entry: no HTTP route, no Runner gateway, no sandbox
+  path. `canStart` stays `false` and the five blockers are unchanged.
+- The score is the engine's; delivery re-reads the bytes and digest but does not
+  re-evaluate the solution, and the note says so.
+- Selection is the best *captured* stage in the engine's ledger. Evaluated
+  candidates that never became a stage are not representable and are not
+  delivered.
+- The note is a deterministic factual record. Any interpretation the Agent adds
+  on top of it is separate from the delivered artifact, and this document does
+  not claim a UI journey was run.
+
+## 10. What this pilot does not claim
 
 - No Runner gateway, sandbox or `canStart` change. `canStart` stays `false` and
   the five blockers stay in place.
@@ -376,7 +458,7 @@ with a proxy configured, the same code carries it through the engine's
 - The seeded incumbent A was produced by the model in run 3; run 5's model
   re-materialized it, and B and C are the model's own work in run 5.
 
-## 10. Where the evidence lives
+## 11. Where the evidence lives
 
 Ignored local artifacts under `.tmp/r/round19/` (never committed):
 
@@ -408,3 +490,10 @@ carried an engine stage block, and the recorded provider usage,
 generated private inputs — the engine model registry, the pilot settings, the
 engine config and the credential — live outside the repository in a 0700
 directory and are never copied into evidence.
+
+Round 21 evidence lives under the ignored `.tmp/r/round21/` directory: `store/`
+is an isolated copy of the round-20 store (same Project, Session and registration
+identity), `evidence/delivery-*.json` are delivery records taken from the final
+code, `evidence/agent-run-*.json` hold the Agent's tool calls, permission
+decisions and answer, and `agent-harness.mts` is the local service-level harness
+that drove the conversation.
