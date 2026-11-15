@@ -117,6 +117,20 @@ export interface ScienceFlowResultDeliveryRequest {
    * lifecycle it recorded; defaults to `<work-dir>/receipt.json`.
    */
   readonly launchReceiptPath?: string;
+  /**
+   * Who started the engine run. `external` (the default) keeps the operator
+   * pilot's wording: SD only registered and read a run it did not start.
+   * `experimental-local` states that this deployment's experimental local
+   * research mode started the managed run from the Session.
+   */
+  readonly runOrigin?: "external" | "experimental-local";
+  /**
+   * Publish the researcher's own run records (`trial_log.tsv`,
+   * `submit_log.tsv`) unchanged, so the Session can see which commands actually
+   * ran and what they submitted. Absent files are reported `unresolved`, never
+   * fabricated and never a delivery failure.
+   */
+  readonly includeResearcherRecords?: boolean;
 }
 
 export interface ScienceFlowResultDeliveryDependencies {
@@ -155,6 +169,7 @@ export type ScienceFlowResultDeliveryStep =
   | "plan"
   | "publish-solution"
   | "publish-attempts"
+  | "publish-researcher-records"
   | "publish-note";
 
 /** The selected captured stage, as the reader resolved and verified it. */
@@ -211,6 +226,20 @@ export interface ScienceFlowDeliveredAttempt {
   readonly reason?: string;
 }
 
+/**
+ * One file the researcher's run left in its workspace, copied unchanged. It is
+ * the run's own record of what it executed, not a ScienceDiscovery evaluation.
+ */
+export interface ScienceFlowDeliveredResearcherRecord {
+  readonly name: "trial-log" | "submit-log";
+  readonly logicalName: string;
+  /** Path relative to the researcher's workspace; never an absolute host path. */
+  readonly sourcePath: string;
+  readonly status: "published" | "unresolved";
+  readonly artifact?: ScienceFlowDeliveredArtifact;
+  readonly reason?: string;
+}
+
 export interface ScienceFlowResultDeliveryRecord {
   readonly schemaVersion: typeof SCIENCE_FLOW_RESULT_DELIVERY_VERSION;
   readonly invocation: "scienceflow-result-delivery";
@@ -233,6 +262,8 @@ export interface ScienceFlowResultDeliveryRecord {
   readonly plan: ScienceFlowLinkedVersion | null;
   readonly incumbent: ScienceFlowLinkedVersion | null;
   readonly attempts: readonly ScienceFlowDeliveredAttempt[];
+  /** The researcher's own run records, when they were requested and readable. */
+  readonly researcherRecords: readonly ScienceFlowDeliveredResearcherRecord[];
   readonly stages: readonly ResearchPilotStageRow[] | null;
   readonly artifacts: {
     readonly solution?: ScienceFlowDeliveredArtifact;
@@ -293,6 +324,7 @@ export async function deliverScienceFlowResult(
   let plan: ScienceFlowLinkedVersion | null = null;
   let incumbent: ScienceFlowLinkedVersion | null = null;
   let attempts: readonly ScienceFlowDeliveredAttempt[] = [];
+  let researcherRecords: readonly ScienceFlowDeliveredResearcherRecord[] = [];
   let stages: readonly ResearchPilotStageRow[] | null = null;
 
   const failed = (
@@ -302,6 +334,7 @@ export async function deliverScienceFlowResult(
   ): ScienceFlowResultDeliveryRecord => ({
     artifacts,
     attempts,
+    researcherRecords,
     finishedAt: now(),
     identity,
     invocation: "scienceflow-result-delivery",
@@ -410,14 +443,21 @@ export async function deliverScienceFlowResult(
         })
       : [];
 
+    step = "publish-researcher-records";
+    researcherRecords = request.includeResearcherRecords
+      ? await publishResearcherRecords(store, { identity, target })
+      : [];
+
     step = "publish-note";
     const noteText = buildResultNote({
       attempts,
       identity,
       incumbent,
+      origin: request.runOrigin ?? "external",
       plan,
       receipt,
       registration,
+      researcherRecords,
       runState,
       selected,
       snapshot,
@@ -447,6 +487,7 @@ export async function deliverScienceFlowResult(
     return {
       artifacts,
       attempts,
+      researcherRecords,
       finishedAt: now(),
       identity,
       invocation: "scienceflow-result-delivery",
@@ -473,7 +514,8 @@ export async function deliverScienceFlowResult(
           : "The Session is read-only; nothing was published",
       );
     }
-    if (step === "publish-solution" || step === "publish-attempts" || step === "publish-note") {
+    if (step === "publish-solution" || step === "publish-attempts"
+      || step === "publish-researcher-records" || step === "publish-note") {
       return failed(step, "publication-failed", errorMessage(error));
     }
     if (step === "resolve" || step === "verify") {
@@ -906,6 +948,84 @@ async function publishCapturedAttempts(
   return attempts;
 }
 
+/**
+ * The researcher's own run records, copied unchanged. The paths are relative to
+ * the worker workspace the engine created, never operator-selected.
+ */
+const RESEARCHER_RECORDS = [
+  { logicalName: "trial-log.tsv", name: "trial-log", sourcePath: "artifacts/trial_log.tsv" },
+  { logicalName: "submit-log.tsv", name: "submit-log", sourcePath: "artifacts/submit_log.tsv" },
+] as const;
+
+/** A run record is one small tab-separated log, not a workspace export. */
+const MAX_RESEARCHER_RECORD_BYTES = 256 * 1024;
+
+/**
+ * Publish each researcher record that exists in the run's workspace. A missing
+ * file is recorded as unresolved: the run may legitimately not have written one,
+ * and a delivery must not invent it or fail because of it.
+ */
+async function publishResearcherRecords(
+  store: SessionStore,
+  input: {
+    readonly identity: { readonly projectId: string; readonly sessionId: string };
+    readonly target: DeliveryTarget;
+  },
+): Promise<readonly ScienceFlowDeliveredResearcherRecord[]> {
+  const workspace = join(input.target.taskRoot, "workers", "w00", "workspace");
+  const records: ScienceFlowDeliveredResearcherRecord[] = [];
+  for (const spec of RESEARCHER_RECORDS) {
+    const logicalName = `scienceflow/${input.target.runId}/researcher/${spec.logicalName}`;
+    const read = await readResearcherRecord(input.target.taskRoot, workspace, spec.sourcePath);
+    if (read.status === "unresolved") {
+      records.push({ logicalName, name: spec.name, reason: read.reason, sourcePath: spec.sourcePath, status: "unresolved" });
+      continue;
+    }
+    const artifact = await publishDeliveredArtifact(store, {
+      bytes: read.bytes,
+      description: `Unchanged researcher run record from ScienceFlow run ${input.target.runId}`,
+      digest: undefined,
+      kind: "dataset",
+      logicalName,
+      mediaType: "text/tab-separated-values",
+      originMeta: {
+        deliveredBy: "scienceflow-result-delivery",
+        externalEngine: "scienceflow",
+        researcherRecord: spec.name,
+        sourcePath: spec.sourcePath,
+        sourceRunId: input.target.runId,
+      },
+      sessionId: input.identity.sessionId,
+      title: `ScienceFlow ${input.target.runId} researcher ${spec.name}`,
+    });
+    records.push({ artifact, logicalName, name: spec.name, sourcePath: spec.sourcePath, status: "published" });
+  }
+  return records;
+}
+
+/** Read one record only when it resolves inside the run's task root. */
+async function readResearcherRecord(
+  taskRoot: string,
+  workspace: string,
+  sourcePath: string,
+): Promise<
+  { readonly status: "ok"; readonly bytes: Buffer } | { readonly status: "unresolved"; readonly reason: string }
+> {
+  try {
+    const realRoot = await realpath(taskRoot);
+    const realFile = await realpath(resolve(workspace, sourcePath));
+    if (!isWithin(realRoot, realFile)) return { reason: "record-path-out-of-bounds", status: "unresolved" };
+    const metadata = await stat(realFile);
+    if (!metadata.isFile()) return { reason: "record-file-missing", status: "unresolved" };
+    if (metadata.size > MAX_RESEARCHER_RECORD_BYTES) return { reason: "record-too-large", status: "unresolved" };
+    return { bytes: await readFile(realFile), status: "ok" };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return { reason: "record-file-missing", status: "unresolved" };
+    return { reason: "record-unreadable", status: "unresolved" };
+  }
+}
+
 function roleLabel(role: ScienceFlowDeliveredAttempt["role"]): string {
   return role === "carried_seed"
     ? "carried seed"
@@ -1013,9 +1133,11 @@ function buildResultNote(input: {
   readonly attempts: readonly ScienceFlowDeliveredAttempt[];
   readonly identity: { readonly projectId: string; readonly sessionId: string };
   readonly incumbent: ScienceFlowLinkedVersion | null;
+  readonly origin: "external" | "experimental-local";
   readonly plan: ScienceFlowLinkedVersion | null;
   readonly receipt: ReceiptFacts;
   readonly registration: NonNullable<ScienceFlowResultDeliveryRecord["registration"]>;
+  readonly researcherRecords: readonly ScienceFlowDeliveredResearcherRecord[];
   readonly runState: NonNullable<ScienceFlowResultDeliveryRecord["runState"]>;
   readonly selected: ScienceFlowDeliveredSelection;
   readonly snapshot: ScienceFlowRunSnapshotDto;
@@ -1023,7 +1145,7 @@ function buildResultNote(input: {
   readonly stages: readonly ResearchPilotStageRow[];
   readonly target: DeliveryTarget;
 }): string {
-  const { attempts, identity, incumbent, plan, receipt, registration, runState, selected, solution, stages, target } = input;
+  const { attempts, identity, incumbent, origin, plan, receipt, registration, researcherRecords, runState, selected, solution, stages, target } = input;
   const lines: string[] = [];
   const direction = selected.lowerIsBetter === true
     ? "lower is better"
@@ -1033,10 +1155,21 @@ function buildResultNote(input: {
 
   lines.push(`# ScienceFlow research result: \`${target.runId}\``, "");
   lines.push(
-    "This Session holds the delivered output of one **external ScienceFlow managed run**.",
-    "ScienceDiscovery did not start or evaluate this experiment, and this note is a factual",
-    "delivery record, not a model interpretation of it.",
-    "",
+    ...(origin === "experimental-local"
+      ? [
+        "This Session holds the delivered output of one **ScienceFlow managed run started by this",
+        "ScienceDiscovery deployment's experimental local research mode**. The Agent started it from",
+        "this conversation with this Session's model; the engine's own task-package evaluator produced",
+        "the scores below. This is experimental local execution, not a formal Runner sandbox, and this",
+        "note is a factual delivery record, not a model interpretation of the experiment.",
+        "",
+      ]
+      : [
+        "This Session holds the delivered output of one **external ScienceFlow managed run**.",
+        "ScienceDiscovery did not start or evaluate this experiment, and this note is a factual",
+        "delivery record, not a model interpretation of it.",
+        "",
+      ]),
     "## Task and identity",
     "",
     `- Engine task: \`${target.task}\`${taskDescription(target.task)}.`,
@@ -1148,6 +1281,30 @@ function buildResultNote(input: {
       } else {
         lines.push(
           `- \`${codeText(attempt.stageId)}\` (${role}) \`${codeText(attempt.metricName)}\` = ${formatNumber(attempt.metricValue)}: artifact not published (\`${cell(attempt.reason ?? "unresolved")}\`).`,
+        );
+      }
+    }
+    lines.push("");
+  }
+
+  if (researcherRecords.length) {
+    lines.push(
+      "## Researcher run records",
+      "",
+      "These files were copied unchanged from the researcher's run workspace. They are the run's own",
+      "record of the commands it executed and the candidates it submitted; they are not ScienceDiscovery",
+      "evaluations, and the engine's stage ledger above remains the authoritative capture record.",
+      "",
+    );
+    for (const record of researcherRecords) {
+      if (record.status === "published" && record.artifact) {
+        const artifact = record.artifact;
+        lines.push(
+          `- \`${record.logicalName}\` version ${artifact.version} (artifact \`${artifact.artifactId}\`, version \`${artifact.versionId}\`, content sha256 \`${artifact.content.hash}\`): copied unchanged from \`${codeText(record.sourcePath)}\` in the run workspace.`,
+        );
+      } else {
+        lines.push(
+          `- \`${codeText(record.sourcePath)}\` was not published (\`${cell(record.reason ?? "unresolved")}\`).`,
         );
       }
     }

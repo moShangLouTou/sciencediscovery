@@ -82,6 +82,8 @@ import {
   type ScienceFlowPrepareInputsService,
 } from "../scienceflow/prepared-inputs.js";
 import { createScienceFlowContractBuilder } from "../scienceflow/execution-contract.js";
+import { createLocalResearchService } from "../scienceflow/local-research.js";
+import { setLocalResearchService } from "../scienceflow/local-research-runtime.js";
 
 export interface ApiServerDependencies {
   /** Embedding/test seam: exercise governed Web tools without contacting a live search engine. */
@@ -669,6 +671,16 @@ export function createPlatformServices(
         runnerId === "local" ? runnerClient : remoteCompute.runnerClient(runnerId),
     });
 
+  // Experimental local research: opt-in deployment configuration, one service
+  // per process. Constructing it starts nothing; the conversation tool assembly
+  // and the Session cancel path read it through the module slot. When the mode
+  // is off the slot is cleared, so an earlier composition cannot leave a tool
+  // behind in a shared process.
+  const scienceFlowLocalResearch = config.scienceFlowLocalResearch
+    ? createLocalResearchService({ store, settings: config.scienceFlowLocalResearch })
+    : undefined;
+  setLocalResearchService(scienceFlowLocalResearch);
+
   return {
     connectorPlugins,
     artifactManager,
@@ -696,6 +708,7 @@ export function createPlatformServices(
     remoteCompute,
     runnerClient,
     scienceFlowExecutionPlans,
+    scienceFlowLocalResearch,
     scienceFlowPreparedInputs,
     scienceFlowRegistrations,
     scienceFlowRunSnapshot,

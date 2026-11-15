@@ -41,6 +41,7 @@ import type { ConnectorConfigurationRequest } from "@sciencediscovery/schema";
 import { ConfigurationRepository } from "./configuration/repository.js";
 import { ConfigurationCredentialBridge } from "./configuration/credential-bridge.js";
 import { ScienceFlowRegistrationRepository } from "./scienceflow/registration-repository.js";
+import { ScienceFlowLocalResearchRepository } from "./scienceflow/local-research-repository.js";
 import { ScienceFlowExecutionPlanRepository } from "./scienceflow/execution-plan-repository.js";
 import { ScienceFlowRuntimeCheckRepository } from "./scienceflow/runtime-check-repository.js";
 import { ScienceFlowPreparedInputsRepository } from "./scienceflow/prepared-inputs-repository.js";
@@ -641,6 +642,7 @@ export class SessionStore {
   private scienceFlowExecutionPlanStore?: ScienceFlowExecutionPlanRepository;
   private scienceFlowRuntimeCheckStore?: ScienceFlowRuntimeCheckRepository;
   private scienceFlowPreparedInputsStore?: ScienceFlowPreparedInputsRepository;
+  private scienceFlowLocalResearchStore?: ScienceFlowLocalResearchRepository;
   private loaded = false;
   private saveQueue = Promise.resolve();
   /** Physical reclamation outlives the request that asked for it; deletes queue
@@ -720,6 +722,13 @@ export class SessionStore {
   get scienceFlowPreparedInputs(): ScienceFlowPreparedInputsRepository {
     if (!this.scienceFlowPreparedInputsStore) throw new Error("ScienceFlow prepared input storage is not initialized");
     return this.scienceFlowPreparedInputsStore;
+  }
+
+  /** Experimental local research operations, including the ones a rebuilt
+   *  service still has to observe. */
+  get scienceFlowResearchOperations(): ScienceFlowLocalResearchRepository {
+    if (!this.scienceFlowLocalResearchStore) throw new Error("ScienceFlow local research storage is not initialized");
+    return this.scienceFlowLocalResearchStore;
   }
 
   get transfers(): WorkspaceTransfers {
@@ -883,6 +892,7 @@ export class SessionStore {
     this.scienceFlowExecutionPlanStore = new ScienceFlowExecutionPlanRepository(this.database);
     this.scienceFlowRuntimeCheckStore = new ScienceFlowRuntimeCheckRepository(this.database);
     this.scienceFlowPreparedInputsStore = new ScienceFlowPreparedInputsRepository(this.database);
+    this.scienceFlowLocalResearchStore = new ScienceFlowLocalResearchRepository(this.database);
     this.secretKey = await this.loadOrCreateSecretKey();
     this.migrateRemoteHostTokens();
     const modelIdsWithSecrets = new Set((this.database.prepare("SELECT model_id FROM model_secrets").all() as Array<{ model_id: string }>).map((row) => row.model_id));
@@ -1609,6 +1619,7 @@ export class SessionStore {
     if (exists("science_flow_execution_plans")) this.scienceFlowExecutionPlanStore?.deleteSession(sessionId);
     if (exists("science_flow_runtime_checks")) this.scienceFlowRuntimeCheckStore?.deleteSession(sessionId);
     if (exists("science_flow_prepared_inputs")) this.scienceFlowPreparedInputsStore?.deleteSession(sessionId);
+    if (exists("science_flow_local_research_operations")) this.scienceFlowLocalResearchStore?.deleteSession(sessionId);
   }
 
 
@@ -6228,6 +6239,7 @@ export class SessionStore {
     this.scienceFlowExecutionPlanStore?.deleteProject(projectId);
     this.scienceFlowRuntimeCheckStore?.deleteProject(projectId);
     this.scienceFlowPreparedInputsStore?.deleteProject(projectId);
+    this.scienceFlowLocalResearchStore?.deleteProject(projectId);
     for (const session of sessions) {
       this.database?.prepare("DELETE FROM specialist_runtime_secrets WHERE session_id IN (?, ?, ?)").run(session.id, `claude-code:${session.id}`, `acp:${session.id}`);
       this.database?.prepare("DELETE FROM connector_configuration_requests WHERE session_id = ?").run(session.id);

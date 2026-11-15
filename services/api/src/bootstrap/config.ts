@@ -46,6 +46,10 @@ import {
   SCIENCE_FLOW_RUNTIME_CONFIG_ENV,
   type ScienceFlowRuntimeSettings,
 } from "../scienceflow/runtime-config.js";
+import {
+  loadScienceFlowLocalResearchConfig,
+  type ScienceFlowLocalResearchSettings,
+} from "../scienceflow/local-research-config.js";
 
 export interface ServerConfig {
   authToken: string;
@@ -117,6 +121,12 @@ export interface ServerConfig {
    * check then answers 503 while stored results stay readable.
    */
   scienceFlowRuntime?: ScienceFlowRuntimeSettings;
+  /**
+   * Admin-trusted profile for the experimental local research mode. Absent when
+   * `SCIENCE_AGENT_SCIENCEFLOW_LOCAL_RESEARCH_CONFIG_PATH` is unset or the file
+   * is disabled; no research tool is then exposed and no engine run can start.
+   */
+  scienceFlowLocalResearch?: ScienceFlowLocalResearchSettings;
   usageExchangeRates?: {
     enabled: boolean;
     sourceUrl: string;
@@ -282,6 +292,10 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
   // server, never a silently unchecked plan.
   const scienceFlowRuntime = loadScienceFlowRuntimeConfig(env, repositoryRoot);
   assertRuntimeBindingsExist(scienceFlowExecution, scienceFlowRuntime);
+  // The experimental local research mode is opt-in and independent of the
+  // read-only/planning configuration above. Unset or `"enabled": false` exposes
+  // no research tool and can start no engine process from a conversation.
+  const scienceFlowLocalResearch = loadScienceFlowLocalResearchConfig(env, repositoryRoot);
   return {
     authToken: authToken.token,
     authTokenSource: authToken.source,
@@ -310,6 +324,7 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
     ...(scienceFlowReader === undefined ? {} : { scienceFlowReader }),
     ...(scienceFlowExecution === undefined ? {} : { scienceFlowExecution }),
     ...(scienceFlowRuntime === undefined ? {} : { scienceFlowRuntime }),
+    ...(scienceFlowLocalResearch === undefined ? {} : { scienceFlowLocalResearch }),
     sshConfigPath: resolve(env.SCIENCE_AGENT_SSH_CONFIG_PATH?.trim() || resolve(homedir(), ".ssh/config")),
     staticDir: resolve(repositoryRoot, env.SCIENCE_AGENT_WEB_DIR?.trim() || "apps/web/dist"),
     workspaceUpload: {
