@@ -492,6 +492,7 @@ the third run's seed fixes the arm order and forbids nested multiprocessing.
 | `round22-circle-packing-a` | `completed`, 880.8 s, research finished | S01 2.631640653898, S02 2.6325585398458324, S03 2.6329437164770155, S04 2.633134264465223 | S04 (`178312f7…`), +0.009159 over the seed |
 | `round22-circle-packing-b` | `completed`, 844.7 s, research finished | S01 2.6239750175348147 (the seed reproduced) | S01 = the seed, no new candidate |
 | `round22-circle-packing-c` | `failed` after 60.3 s: the provider returned reasoning without an answer or tool call (`UnusableResponseError`) | none committed (S01 was evaluated but the run failed before the ledger row) | none |
+| `round22-circle-packing-d` | `completed`, 875.0 s, research finished | S01 2.6239750175348147 (the seed reproduced) | S01 = the seed, no new candidate |
 
 Run A's researcher read the plan at t+5 s and wrote its own solver family; its
 solvers include the eviction operator, but mixed with multistart, global passes
@@ -547,18 +548,24 @@ versions are `89e818af…` (run A) and `bbd2394d…` (run B).
 
 A second real Agent conversation (run `5a4d98c2-68a9-4db2-904c-51993adf7f38`,
 50.1 s, six tool calls) read the plan, both notes and both execution summaries
-through the normal tools. Its verdict is **unresolved**: run A's selected best is
+through the normal tools; when run D's evidence arrived, an authorized follow-up
+conversation (run `aa10a55f-d5f2-4a68-b6d7-7e15aee79c2c`, 231.6 s, three artifact
+reads) read the plan, the three notes and the two run summaries and kept the same
+verdict. Its verdict is **unresolved**: run A's selected best is
 +0.009159 over the incumbent (about 18× the plan's margin), but no run carried out
 the Arm A / Arm B control, and run A's gain is confounded with solver rewrites and
 other operators, so it is not evidence for the specific hypothesis. It proposes
 one next action: run the same plan with the arm separation enforced.
 
-The answer is preserved as `scienceflow/round22/experiment-interpretation.md`
-(version `4fdb23d1…`), labelled Agent-authored, with a separate labelled operator
-correction. The correction records that the Agent first read summary versions
-that omitted post-stage commands, that run B did attempt optimization, the exact
-run lifecycles (880.8 s and 844.7 s, both research-completed), and the nested-pool
-deviation. Two conversations that reached the authorized five-minute limit
+The answer is preserved as `scienceflow/round22/experiment-interpretation.md`,
+labelled Agent-authored, with a separate labelled operator correction per
+version; the current version is `a928052e…` (version 2, 231.6 s conversation).
+The correction records that the Agent first read summary versions that omitted
+post-stage commands, that run B did attempt optimization, the exact run
+lifecycles (880.8 s, 844.7 s and 875.0 s, all research-completed), run C's provider
+failure, and the nested-pool deviation. Artifact-level `originMeta` is fixed when
+the artifact is first published, so it names the first interpretation run; the
+version 2 text names the run that produced it. Two conversations that reached the authorized five-minute limit
 (`dc090802…`, `613404f6…`) are recorded as `interrupted` with the reason; no
 answer is attributed to them.
 
@@ -579,7 +586,8 @@ designed, and a higher score unrelated to that comparison is not treated as
 support. The third run was set up to do exactly that — seed first, two Arm A
 commands, six Arm B commands, one process, a trial log — but an unusable provider
 response ended the worker after the seed was evaluated and before any arm command
-committed a stage. This document does not claim statistical significance, a
+committed a stage; the authorized fourth run reproduced the seed and then rewrote
+its own solver instead of running the arms. This document does not claim statistical significance, a
 benchmark campaign, a public research start, a HTTP/browser/Runner journey, or
 isolation of hostile code.
 
@@ -650,7 +658,9 @@ are the delivery records, `seed/`, `seed-b/` and `seed-c/` are the seeds with th
 manifests, `evidence/execution-summary-*.json` and
 `evidence/interpretation-artifact.json` are the published supporting artifacts'
 metadata, `evidence/run-a-attempt-correction.json` records the role correction,
-and `evidence/verification.json` re-derives the chain's invariants from the
-store, CAS and records. The engine's own task state is under
+and `evidence/verification.json` re-derives the chain's 29 invariants from the
+store, CAS and records; `evidence/agent-run-5.json` is the run D interpretation
+conversation and `evidence/interpretation-artifact-v2.json` its published
+metadata. The engine's own task state is under
 `pilot/runs/<run>/circle-packing/`, and the private generated model inputs stay
 outside the repository in a 0700 directory.
