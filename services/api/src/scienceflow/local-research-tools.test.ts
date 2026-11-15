@@ -22,6 +22,7 @@ import {
   createLocalResearchTools,
   GET_RESEARCH_TOOL,
   localResearchInstructions,
+  PUBLISH_RESEARCH_PLAN_TOOL,
   START_RESEARCH_TOOL,
   STOP_RESEARCH_TOOL,
 } from "./local-research-tools.js";
@@ -56,6 +57,7 @@ function baseView(overrides: Partial<Record<string, unknown>> = {}): ScienceFlow
       totalAllowanceSec: 320,
     },
     incumbentVersionId: null,
+    inputMode: "fixed",
     inputs: [],
     instruction: "Observe the run with get_research.",
     intent: "Run the bounded experiment.",
@@ -76,10 +78,21 @@ function fakeService(overrides: Partial<LocalResearchService> = {}): LocalResear
   return {
     enabled: true,
     get: async () => baseView(),
+    inputMode: "fixed",
     latest: () => undefined,
     observeMaxWaitMs: 3_000,
     permissionResource: LOCAL_RESEARCH_PERMISSION_RESOURCE,
     profileId: "round23-local",
+    publishPlan: async () => ({
+      artifactId: "plan-artifact-1",
+      contentHash: "0".repeat(64),
+      logicalName: "research-plan.md",
+      mediaType: "text/markdown",
+      reused: false,
+      size: 12,
+      version: 1,
+      versionId: "plan-version-1",
+    }),
     requestStopForConversationRun: async () => undefined,
     retryDelivery: async () => baseView({ delivery: baseView().delivery }),
     start: async () => ({ attached: false, operation: baseView() }),
@@ -274,4 +287,73 @@ test("host paths and credentials never reach the model even if a view carried on
     assert.ok(!serialized.includes(forbidden), `the tool result must not expose ${forbidden}`);
   }
   assert.equal(result.operationId, "operation-1");
+});
+
+test("a dynamic profile exposes plan publication and says the Agent authors the plan", () => {
+  const { tools } = toolsFor(fakeService({ inputMode: "dynamic" }));
+  assert.deepEqual(
+    tools.map((tool) => tool.name),
+    [PUBLISH_RESEARCH_PLAN_TOOL, START_RESEARCH_TOOL, GET_RESEARCH_TOOL, STOP_RESEARCH_TOOL],
+  );
+  const instructions = localResearchInstructions(fakeService({ inputMode: "dynamic" }));
+  assert.match(instructions, /publish_research_plan/);
+  assert.match(instructions, /dynamic inputs/);
+  assert.match(instructions, /incumbent_version_id/);
+  // The fixed-mode wording must not survive into a dynamic profile.
+  assert.doesNotMatch(instructions, /byte-identical/);
+  const startTool = tools.find((tool) => tool.name === START_RESEARCH_TOOL);
+  assert.match(String(startTool?.description), /plan_version_id \(required\)/);
+});
+
+test("publish_research_plan passes the Agent's text and returns the stable version", async () => {
+  const calls: Array<Record<string, unknown>> = [];
+  const service = fakeService({
+    inputMode: "dynamic",
+    publishPlan: async (input) => {
+      calls.push(input as unknown as Record<string, unknown>);
+      return {
+        artifactId: "plan-artifact-9",
+        contentHash: "a".repeat(64),
+        logicalName: "experiment-plan.md",
+        mediaType: "text/markdown",
+        reused: false,
+        size: 42,
+        version: 3,
+        versionId: "plan-version-9",
+      };
+    },
+  });
+  const { tools } = toolsFor(service);
+  const result = text(await byName(tools, PUBLISH_RESEARCH_PLAN_TOOL).execute("call-7", {
+    content: "# Plan\n\nChange one operator and rerun.\n",
+    name: "experiment-plan.md",
+    title: "Revised plan",
+  }, undefined));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.runId, "conversation-run-1");
+  assert.equal(calls[0]!.sessionId, "session-1");
+  assert.equal(calls[0]!.projectId, "project-1");
+  assert.equal(calls[0]!.publicationId, "conversation-run-1:call-7");
+  assert.equal(calls[0]!.name, "experiment-plan.md");
+  assert.match(String(calls[0]!.content), /Change one operator/);
+  const plan = result.plan as Record<string, unknown>;
+  assert.equal(plan.versionId, "plan-version-9");
+  assert.match(String(result.instruction), /plan_version_id/);
+});
+
+test("publish_research_plan reports a refusal instead of throwing", async () => {
+  const service = fakeService({
+    inputMode: "dynamic",
+    publishPlan: async () => {
+      throw new LocalResearchRefusal("plan-version-mismatch", "The plan changed since the base version");
+    },
+  });
+  const { tools } = toolsFor(service);
+  const result = text(await byName(tools, PUBLISH_RESEARCH_PLAN_TOOL).execute("call-8", {
+    artifact_id: "plan-artifact-1",
+    base_version_id: "stale-version",
+    content: "# Plan\n",
+  }, undefined));
+  assert.equal(result.error, "plan-version-mismatch");
+  assert.match(String(result.message), /changed since the base version/);
 });

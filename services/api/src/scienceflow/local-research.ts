@@ -39,7 +39,7 @@
  */
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { CasStore } from "@sciencediscovery/cas";
@@ -58,6 +58,19 @@ import {
   SCIENCE_FLOW_LOCAL_RESEARCH_INPUT_MAX_BYTES,
   type ScienceFlowLocalResearchSettings,
 } from "./local-research-config.js";
+import {
+  composeDynamicTaskText,
+  InputPreparationRefusal,
+  sha256,
+  stageResearchOperationInputs,
+  type StagedInputSelection,
+} from "./local-research-inputs.js";
+import {
+  publishResearchPlan,
+  ResearchPlanRefusal,
+  type ResearchPlanPublication,
+  type ResearchPlanStore,
+} from "./research-plan-publication.js";
 import {
   isTerminalResearchState,
   SCIENCE_FLOW_LOCAL_RESEARCH_OPERATION_VERSION,
@@ -111,8 +124,20 @@ export type LocalResearchRefusalReason =
   | "link-not-supported"
   | "link-version-mismatch"
   | "link-version-unreadable"
+  | "link-version-missing"
   | "configured-input-unavailable"
-  | "conversation-cancelled";
+  | "conversation-cancelled"
+  | "staging-conflict"
+  | "staging-failed"
+  | "staging-unsafe"
+  | "staging-too-large"
+  | "staging-bytes-mismatch"
+  | "task-text-invalid"
+  | "model-selection-changed"
+  | "plan-text-invalid"
+  | "plan-not-found"
+  | "plan-version-mismatch"
+  | "plan-publication-failed";
 
 /** A refusal with a stable reason; messages never carry a credential or path. */
 export class LocalResearchRefusal extends Error {
@@ -141,9 +166,16 @@ export interface LocalResearchServiceStore extends ResearchPilotReadbackStore {
   } | undefined;
   readonly getProjectArtifact: (projectId: string, artifactId: string) => {
     readonly createdInSessionId?: string;
+    readonly currentVersion: number;
     readonly deletedAt?: string;
     readonly id: string;
+    readonly kind: string;
+    readonly origin?: string;
   } | undefined;
+  /** The plan-publication surface: the same catalog the artifact tools write. */
+  readonly getArtifactByName: ResearchPlanStore["getArtifactByName"];
+  readonly listProjectArtifactVersions: ResearchPlanStore["listProjectArtifactVersions"];
+  readonly createArtifactVersion: ResearchPlanStore["createArtifactVersion"];
 }
 
 export interface LocalResearchStartInput {
@@ -154,6 +186,24 @@ export interface LocalResearchStartInput {
   readonly intent: string;
   readonly planVersionId?: string;
   readonly incumbentVersionId?: string;
+  /** The tool's abort signal: a cancelled conversation must not reach a launch. */
+  readonly signal?: AbortSignal;
+}
+
+export interface LocalResearchPlanInput {
+  readonly projectId: string;
+  readonly sessionId: string;
+  /** The conversation run whose Agent authored the text (provenance only). */
+  readonly runId: string;
+  readonly content: string;
+  readonly name?: string;
+  readonly title?: string;
+  readonly description?: string;
+  readonly artifactId?: string;
+  readonly baseVersionId?: string;
+  /** The tool call that authored this text; makes a retry resolve to one version. */
+  readonly publicationId?: string;
+  readonly signal?: AbortSignal;
 }
 
 export interface LocalResearchOperationInput {
@@ -174,6 +224,7 @@ export interface ScienceFlowLocalResearchView {
   readonly updatedAt: string;
   readonly planVersionId: string | null;
   readonly incumbentVersionId: string | null;
+  readonly inputMode: "fixed" | "dynamic";
   /** The fixed input bytes this run used, including the verified version id. */
   readonly inputs: readonly ScienceFlowLocalResearchInput[];
   readonly model: { readonly profileName: string; readonly providerModel: string; readonly selectionSource: string } | null;
@@ -230,6 +281,8 @@ export interface LocalResearchService {
   readonly enabled: true;
   readonly profileId: string;
   readonly permissionResource: string;
+  /** `fixed` unless the administrator enabled Session-supplied inputs. */
+  readonly inputMode: "fixed" | "dynamic";
   /** Upper bound for one bounded observation wait a tool may request. */
   readonly observeMaxWaitMs: number;
   start(input: LocalResearchStartInput): Promise<LocalResearchStartOutcome>;
@@ -239,6 +292,8 @@ export interface LocalResearchService {
   ): Promise<ScienceFlowLocalResearchView>;
   stop(input: LocalResearchOperationInput): Promise<LocalResearchStopOutcome>;
   retryDelivery(input: LocalResearchOperationInput): Promise<ScienceFlowLocalResearchView>;
+  /** Publish plan text the Agent authored as an ordinary Session artifact version. */
+  publishPlan(input: LocalResearchPlanInput): Promise<ResearchPlanPublication>;
   /** Conversation cancellation: request stop for the run's owned experiments. */
   requestStopForConversationRun(sessionId: string, runId: string): Promise<void>;
   latest(projectId: string, sessionId: string): ScienceFlowLocalResearchOperation | undefined;
@@ -272,6 +327,8 @@ export function createLocalResearchService(input: {
   const activeWorkers = new Set<string>();
   /** Operations with a delivery attempt in flight in this process. */
   const deliveryInFlight = new Set<string>();
+  /** Per-operation abort for the preparation window before a launch exists. */
+  const operationAborts = new Map<string, AbortController>();
 
   const operations = (): ScienceFlowLocalResearchStore => store.scienceFlowResearchOperations;
 
@@ -318,9 +375,15 @@ export function createLocalResearchService(input: {
     engineCheckout: record.launch.engineCheckout,
     pythonExecutable: record.launch.pythonExecutable,
     readerScriptPath: record.launch.readerScriptPath,
-    seedDir: record.launch.seedDir,
+    // A dynamic operation reads the directory it staged itself; a fixed one
+    // reads the administrator's seed, exactly as before.
+    seedDir: record.stagedInputs?.dataDir ?? record.launch.seedDir,
     task: record.task,
-    ...(settings.taskDescription ? { taskDescription: settings.taskDescription } : {}),
+    ...(record.launch.taskDescription !== undefined
+      ? { taskDescription: record.launch.taskDescription }
+      : settings.taskDescription
+        ? { taskDescription: settings.taskDescription }
+        : {}),
     researchBudgetSec: record.launch.grant.researchBudgetSec,
     reportBudgetSec: record.launch.grant.reportBudgetSec,
     totalAllowanceSec: record.launch.grant.totalAllowanceSec,
@@ -577,11 +640,122 @@ export function createLocalResearchService(input: {
     }
   };
 
-  /** The background worker: one launch-and-observe stage, then one delivery. */
+  /**
+   * Stage this operation's own input directory, if the profile uses dynamic
+   * inputs. The staged bytes are proven equal to the digests frozen at start, and
+   * the manifest is written beside the work dir so the engine's dataset holds
+   * only the assets and the selected plan/incumbent.
+   *
+   * Returns the updated record, or `undefined` when preparation failed or was
+   * abandoned: the caller must not launch in that case.
+   */
+  const stageInputs = async (
+    record: ScienceFlowLocalResearchOperation,
+    signal: AbortSignal,
+  ): Promise<ScienceFlowLocalResearchOperation | undefined> => {
+    const roles: StagedInputSelection[] = (record.inputs ?? []).flatMap((input) =>
+      input.stagedName !== undefined && input.versionId !== null
+        ? [{
+            role: input.role,
+            sha256: input.sha256,
+            size: input.size,
+            stagedName: input.stagedName,
+            versionId: input.versionId,
+          }]
+        : []);
+    const destination = join(record.workDir, "input");
+    const manifestPath = join(record.workDir, "input-manifest.json");
+    try {
+      if (roles.length === 0) {
+        throw new InputPreparationRefusal("staging-failed", "This operation has no accepted input to stage");
+      }
+      // The operation's own work dir may not exist yet; the input directory
+      // itself is created non-recursively so a second staging attempt (or
+      // another operation's leftovers) is a conflict, not a silent overwrite.
+      await mkdir(record.workDir, { recursive: true, mode: 0o755 });
+      const staged = await stageResearchOperationInputs({
+        assetsDir: settings.seedDir,
+        destination,
+        readBytes: readArtifactBytes,
+        roles,
+        signal,
+      }, now);
+      await writeFile(manifestPath, staged.manifestJson, "utf8");
+      // Re-read the manifest so the recorded digest is the digest on disk.
+      const written = await readFile(manifestPath);
+      if (sha256(written) !== staged.manifestSha256) {
+        throw new InputPreparationRefusal("staging-failed", "The input manifest did not retain its bytes");
+      }
+      return mutate(record.operationId, (current) => ({
+        ...current,
+        stagedInputs: {
+          dataDir: destination,
+          entries: staged.manifest.assets.entries,
+          manifestPath,
+          manifestSha256: staged.manifestSha256,
+          stagedAt: staged.manifest.stagedAt,
+          totalBytes: staged.manifest.assets.totalBytes,
+        },
+      }));
+    } catch (error) {
+      if (signal.aborted) {
+        // A cancel landed during preparation: record the stop, never launch.
+        mutate(record.operationId, (current) => ({
+          ...current,
+          state: isTerminalResearchState(current.state) ? current.state : "stopped",
+          stop: current.stop.requestedAt
+            ? current.stop
+            : { ...current.stop, requestedAt: now(), requestedBy: "conversation-cancel" },
+        }));
+        return undefined;
+      }
+      // Every reason below is actionable: the record says the operation was
+      // accepted and never launched, and why. A stop that landed during the
+      // failure keeps its stopped state instead of becoming a failure.
+      mutate(record.operationId, (current) => current.stop.requestedAt
+        ? { ...current, state: isTerminalResearchState(current.state) ? current.state : "stopped" }
+        : {
+            ...current,
+            state: "failed",
+            error: {
+              step: "staging",
+              message: error instanceof InputPreparationRefusal
+                ? `${error.reason}: ${error.message}`
+                : errorMessage(error),
+            },
+          });
+      return undefined;
+    }
+  };
+
+  /** The model the Session resolves to must still be the one this start froze. */
+  const frozenModelRefusal = (record: ScienceFlowLocalResearchOperation): string | undefined => {
+    const frozen = record.launch.model;
+    if (!frozen) return undefined;
+    let resolved;
+    try {
+      resolved = resolveResearchPilotModel(store, {
+        projectId: record.identity.projectId,
+        sessionId: record.identity.sessionId,
+      });
+    } catch (error) {
+      return error instanceof ResearchPilotRefusal ? error.message : errorMessage(error);
+    }
+    const mismatch = resolved.selection.providerModel !== frozen.providerModel
+      || resolved.selection.selectionSource !== frozen.selectionSource
+      || resolved.selection.profileName !== frozen.profileName;
+    return mismatch
+      ? "The Session's effective model changed after this operation was accepted; it was not launched"
+      : undefined;
+  };
+
+  /** The background worker: prepare, launch-and-observe, then one delivery. */
   const execute = async (operationId: string): Promise<void> => {
     activeWorkers.add(operationId);
+    const controller = new AbortController();
+    operationAborts.set(operationId, controller);
     try {
-      const current = operations().get(operationId);
+      let current = operations().get(operationId);
       if (!current) return;
       // A stop requested before the launch began must not be overtaken by one.
       if (current.stop.requestedAt) {
@@ -600,6 +774,37 @@ export function createLocalResearchService(input: {
             : { ...record.stop, requestedAt: now(), requestedBy: "conversation-cancel" },
         }));
         return;
+      }
+      if (settings.inputMode === "dynamic") {
+        const staged = await stageInputs(current, controller.signal);
+        if (!staged) return;
+        current = staged;
+        // Preparation is asynchronous: the session may have been cancelled or
+        // the run stopped while the bytes were staged, with no worker left to
+        // read a result. Re-check both before the launch.
+        if (current.stop.requestedAt) {
+          mutate(operationId, (record) => ({ ...record, state: "stopped" }));
+          return;
+        }
+        if (await ownerStopped(current.identity.sessionId, current.ownerRunId)) {
+          mutate(operationId, (record) => ({
+            ...record,
+            state: "stopped",
+            stop: record.stop.requestedAt
+              ? record.stop
+              : { ...record.stop, requestedAt: now(), requestedBy: "conversation-cancel" },
+          }));
+          return;
+        }
+        const modelRefusal = frozenModelRefusal(current);
+        if (modelRefusal !== undefined) {
+          mutate(operationId, (record) => ({
+            ...record,
+            state: "failed",
+            error: { step: "model-selection", message: modelRefusal },
+          }));
+          return;
+        }
       }
       mutate(operationId, (record) => ({ ...record, state: "running" }));
       const receipt = await runResearchPilot(store, pilotRequest(current), {
@@ -623,6 +828,7 @@ export function createLocalResearchService(input: {
         error: { step: "launch", message: errorMessage(error) },
       }));
     } finally {
+      operationAborts.delete(operationId);
       activeWorkers.delete(operationId);
     }
   };
@@ -659,6 +865,7 @@ export function createLocalResearchService(input: {
     updatedAt: record.updatedAt,
     planVersionId: record.planVersionId ?? null,
     incumbentVersionId: record.incumbentVersionId ?? null,
+    inputMode: record.launch.inputMode ?? "fixed",
     inputs: record.inputs ?? [],
     model: record.launch.model,
     grant: record.launch.grant,
@@ -754,18 +961,53 @@ export function createLocalResearchService(input: {
 
   /**
    * Bind the accepted request to the bytes the engine will actually receive.
-   * A named version is accepted only when the profile declares that role and
-   * the version's content is byte-identical to the configured seed file; a
+   *
+   * Fixed mode accepts a named version only when the profile declares that role
+   * and the version's content is byte-identical to the configured seed file; a
    * start never runs the old seed while linking a different version to it.
+   *
+   * Dynamic mode requires a live same-Session version for every staged role and
+   * freezes its verified digest and staging name: the bytes are then staged into
+   * this operation's own directory, so a later version, profile edit or rebuild
+   * cannot change what runs.
    */
   const resolveInputs = async (
     request: LocalResearchStartInput,
   ): Promise<readonly ScienceFlowLocalResearchInput[]> => {
-    const bindings = settings.inputs ?? {};
+    const dynamic = settings.dynamicInputs;
     const named: Partial<Record<ScienceFlowLocalResearchInputRole, string>> = {
       ...(request.planVersionId ? { plan: request.planVersionId } : {}),
       ...(request.incumbentVersionId ? { incumbent: request.incumbentVersionId } : {}),
     };
+    if (dynamic) {
+      const inputs: ScienceFlowLocalResearchInput[] = [];
+      for (const role of ["plan", "incumbent"] as const) {
+        const stagedName = dynamic[role];
+        if (stagedName === undefined) {
+          // A named version for a role this profile does not stage would be
+          // silently ignored, so it is refused instead.
+          if (named[role]) {
+            throw new LocalResearchRefusal(
+              "link-not-supported",
+              `This research profile does not stage a ${role} input`,
+            );
+          }
+          continue;
+        }
+        const versionId = named[role];
+        if (!versionId) {
+          throw new LocalResearchRefusal(
+            "link-version-missing",
+            `This research profile runs ${role === "plan" ? "a plan" : "an incumbent"} you select; pass its version id`,
+          );
+        }
+        const version = assertLinkVersion(request.sessionId, request.projectId, versionId, role);
+        const actual = await readLinkedInput(role, version);
+        inputs.push({ role, sha256: actual.sha256, size: actual.size, stagedName, versionId });
+      }
+      return inputs;
+    }
+    const bindings = settings.inputs ?? {};
     const inputs: ScienceFlowLocalResearchInput[] = [];
     for (const role of ["plan", "incumbent"] as const) {
       const configured = bindings[role];
@@ -805,9 +1047,11 @@ export function createLocalResearchService(input: {
     enabled: true,
     profileId: settings.profileId,
     permissionResource: LOCAL_RESEARCH_PERMISSION_RESOURCE,
+    inputMode: settings.inputMode ?? "fixed",
     observeMaxWaitMs: settings.defaults.observeMaxWaitMs,
 
     async start(request: LocalResearchStartInput): Promise<LocalResearchStartOutcome> {
+      request.signal?.throwIfAborted();
       const intent = request.intent.trim();
       if (!intent || intent.length > 2_000 || intent.includes("\u0000")) {
         throw new LocalResearchRefusal("invalid-option", "The research intent must be 1-2000 characters without NUL bytes");
@@ -860,13 +1104,35 @@ export function createLocalResearchService(input: {
           "The conversation run that would own this experiment was cancelled",
         );
       }
+      request.signal?.throwIfAborted();
       // Freeze the fixed input bytes this run will actually use, and prove a
       // named version is exactly that input before any record or launch exists.
       const inputs = await resolveInputs(request);
+      request.signal?.throwIfAborted();
 
       const operationId = newOperationId();
       const createdAt = now();
       const workDir = join(settings.workRoot, "operations", operationId);
+      // Dynamic mode resolves the researcher's instruction now, from the input
+      // versions and the Session's intent, so the meaning of this operation is
+      // fixed before any background work starts. A template problem refuses the
+      // start instead of launching a run with an unfilled instruction.
+      const taskDescription = settings.inputMode === "dynamic"
+        ? composeDynamicTaskText(settings.taskTemplate ?? "", {
+            intent,
+            operationId,
+            roles: inputs.flatMap((input) =>
+              input.stagedName === undefined || input.versionId === null
+                ? []
+                : [{
+                    role: input.role,
+                    sha256: input.sha256,
+                    size: input.size,
+                    stagedName: input.stagedName,
+                    versionId: input.versionId,
+                  }]),
+          })
+        : settings.taskDescription;
       const grant: ScienceFlowLocalResearchGrant = {
         task: settings.task,
         researchBudgetSec: settings.defaults.researchBudgetSec,
@@ -879,7 +1145,7 @@ export function createLocalResearchService(input: {
         feedbackMaxTokens: settings.defaults.feedbackMaxTokens,
         httpTimeoutSec: settings.defaults.httpTimeoutSec,
         refusePackageInstall: settings.refusePackageInstall,
-        taskDescriptionPinned: settings.taskDescription !== undefined,
+        taskDescriptionPinned: taskDescription !== undefined,
       };
       const record: ScienceFlowLocalResearchOperation = {
         schemaVersion: SCIENCE_FLOW_LOCAL_RESEARCH_OPERATION_VERSION,
@@ -912,6 +1178,8 @@ export function createLocalResearchService(input: {
             selectionSource: resolvedModel.selection.selectionSource,
           },
           grant,
+          ...(settings.inputMode === "dynamic" ? { inputMode: "dynamic" as const } : {}),
+          ...(taskDescription === undefined ? {} : { taskDescription }),
         },
         engine: {},
         progress: { stages: [], usage: null },
@@ -934,30 +1202,33 @@ export function createLocalResearchService(input: {
       const deadline = Date.now() + waitMs;
       while (true) {
         options.signal?.throwIfAborted();
+        // Re-read before observing: the launch worker may have advanced this
+        // operation since the previous poll, and its state is authoritative.
+        record = operations().get(record.operationId) ?? record;
         const facts = await readEngineFacts(record);
         const progress = await readProgress(record);
         // With no engine record, the receipt is the only local record of how the
         // launch ended. It is read, never trusted as a run identity.
         const receiptOutcome = facts.status === undefined ? await readReceiptOutcome(record) : undefined;
-        let derived = stateFromFacts(record, facts, receiptOutcome);
-        if (derived === record.state && facts.status === undefined
-          && !activeWorkers.has(record.operationId)
-          && (record.state === "accepted" || record.state === "running")) {
-          // The process that was launching this experiment is gone and the
-          // engine left no record: the outcome is unknown, not a silent relaunch.
-          derived = "unknown";
-        }
-        if (derived !== record.state || progress.stages.length !== record.progress.stages.length
-          || facts.status !== record.engine.status) {
-          record = mutate(record.operationId, (current) => ({
+        // The state is derived against the record as it stands at write time:
+        // the reads above are asynchronous, and a stale snapshot must not
+        // overwrite a state the worker recorded while they were in flight.
+        record = mutate(record.operationId, (current) => {
+          let derived = stateFromFacts(current, facts, receiptOutcome);
+          if (derived === current.state && facts.status === undefined
+            && !activeWorkers.has(current.operationId)
+            && (current.state === "accepted" || current.state === "running")) {
+            // The process that was launching this experiment is gone and the
+            // engine left no record: the outcome is unknown, not a silent relaunch.
+            derived = "unknown";
+          }
+          return {
             ...current,
             state: derived,
             engine: facts,
             progress: { ...progress, observedAt: now() },
-          }));
-        } else {
-          record = { ...record, engine: facts, progress: { ...progress, observedAt: facts.observedAt } };
-        }
+          };
+        });
         if (isTerminalResearchState(record.state)) {
           // An existing terminal run is read back, never relaunched. Delivery is
           // the only step this observation may reconcile, and only when the
@@ -992,6 +1263,9 @@ export function createLocalResearchService(input: {
         state: current.state === "completed" || current.state === "failed" ? current.state : "stopping",
         stop: { ...current.stop, requestedAt, requestedBy: "tool" },
       }));
+      // A stop during the preparation window must abort the staging copy rather
+      // than let a launch follow it.
+      operationAborts.get(record.operationId)?.abort();
       const outcome = await stopEngineRun(record);
       const confirmed = await confirmStop(record, sleep);
       const updated = mutate(record.operationId, (current) => ({
@@ -1024,6 +1298,9 @@ export function createLocalResearchService(input: {
         .filter((candidate) => candidate.ownerRunId === runId && !isTerminalResearchState(candidate.state));
       for (const record of owned) {
         try {
+          // Trip the preparation abort even when no engine record exists yet: a
+          // cancel that lands while the operation is staging must not launch.
+          operationAborts.get(record.operationId)?.abort();
           const facts = await readEngineFacts(record);
           if (facts.status && TERMINAL_ENGINE_STATUSES.has(facts.status)) continue;
           mutate(record.operationId, (current) => ({
@@ -1035,6 +1312,38 @@ export function createLocalResearchService(input: {
           // Cancellation is best effort: a failed stop leaves the recorded
           // request visible instead of failing the conversation cancellation.
         }
+      }
+    },
+
+    async publishPlan(request: LocalResearchPlanInput): Promise<ResearchPlanPublication> {
+      request.signal?.throwIfAborted();
+      try {
+        return await publishResearchPlan(store, {
+          projectId: request.projectId,
+          sessionId: request.sessionId,
+          runId: request.runId,
+          content: request.content,
+          ...(request.name ? { name: request.name } : {}),
+          ...(request.title ? { title: request.title } : {}),
+          ...(request.description ? { description: request.description } : {}),
+          ...(request.artifactId ? { artifactId: request.artifactId } : {}),
+          ...(request.baseVersionId ? { baseVersionId: request.baseVersionId } : {}),
+          ...(request.publicationId ? { publicationId: request.publicationId } : {}),
+        });
+      } catch (error) {
+        if (error instanceof ResearchPlanRefusal) {
+          throw new LocalResearchRefusal(
+            error.reason === "invalid-option"
+              ? "plan-text-invalid"
+              : error.reason === "session-not-found"
+                ? "session-not-found"
+                : error.reason === "session-not-writable"
+                  ? "session-not-writable"
+                  : error.reason,
+            error.message,
+          );
+        }
+        throw error;
       }
     },
 

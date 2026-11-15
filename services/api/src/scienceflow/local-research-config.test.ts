@@ -204,3 +204,79 @@ test("fixed input bindings must be real files contained by the seed dir", async 
     /unsupported key/,
   );
 });
+
+test("dynamic input mode names staging destinations and requires a usable template", async (context) => {
+  const target = await fixture(context);
+  await writeFile(
+    target.taskTextPath,
+    "Read {{plan_file}} and carry it out. Intent: {{research_intent}}. Start: {{incumbent_file}}.\n",
+    "utf8",
+  );
+  const research = () => configValue(target).research as Record<string, unknown>;
+  const settings = await load(target, configValue(target, {
+    research: {
+      ...research(),
+      dynamicInputs: { incumbent: "start_solution.json", plan: "experiment_plan.md" },
+      inputs: undefined,
+      inputMode: "dynamic",
+    },
+  }));
+  assert.ok(settings);
+  assert.equal(settings.inputMode, "dynamic");
+  assert.equal(settings.inputs, undefined);
+  assert.deepEqual(settings.dynamicInputs, {
+    incumbent: "start_solution.json",
+    plan: "experiment_plan.md",
+  });
+  // The template stays a template: the fixed text field is not populated, so a
+  // caller cannot mistake it for an instruction that is already composed.
+  assert.equal(settings.taskDescription, undefined);
+  assert.match(settings.taskTemplate ?? "", /\{\{plan_file\}\}/);
+
+  const dynamic = (overrides: Record<string, unknown>) => configValue(target, {
+    research: {
+      ...research(),
+      dynamicInputs: { incumbent: "start_solution.json", plan: "experiment_plan.md" },
+      inputs: undefined,
+      inputMode: "dynamic",
+      ...overrides,
+    },
+  });
+
+  await assert.rejects(load(target, dynamic({ inputMode: "elsewhere" })), /inputMode must be/);
+  await assert.rejects(load(target, dynamic({ inputs: { plan: "experiment_plan.md" } })), /only valid in fixed/);
+  await assert.rejects(load(target, dynamic({ dynamicInputs: { plan: "/abs/plan.md" } })), /relative file name/);
+  await assert.rejects(load(target, dynamic({ dynamicInputs: { plan: "../plan.md" } })), /must not contain/);
+  await assert.rejects(
+    load(target, dynamic({ dynamicInputs: { plan: "same.md", incumbent: "same.md" } })),
+    /distinct names/,
+  );
+  await assert.rejects(load(target, dynamic({ dynamicInputs: {} })), /must be a non-empty relative file name/);
+  await assert.rejects(load(target, dynamic({ seedDir: join(target.root, "missing") })), /supporting-asset directory/);
+});
+
+test("a dynamic task template must fill the placeholders it uses", async (context) => {
+  const target = await fixture(context);
+  const research = () => configValue(target).research as Record<string, unknown>;
+  const dynamic = async (text: string) => {
+    await writeFile(target.taskTextPath, text, "utf8");
+    return load(target, configValue(target, {
+      research: {
+        ...research(),
+        dynamicInputs: { incumbent: "start_solution.json", plan: "experiment_plan.md" },
+        inputs: undefined,
+        inputMode: "dynamic",
+      },
+    }));
+  };
+  await assert.rejects(dynamic("Carry out the plan and report.\n"), /must name \{\{plan_file\}\}/);
+  await assert.rejects(dynamic("Read {{plan_file}} and report.\n"), /must name \{\{research_intent\}\}/);
+  await assert.rejects(
+    dynamic("Read {{plan_file}} for {{research_intent}}.\n"),
+    /must name \{\{incumbent_file\}\}/,
+  );
+  await assert.rejects(
+    dynamic("Read {{plan_file}} for {{research_intent}} from {{incumbent_file}} via {{unknown_token}}.\n"),
+    /unsupported placeholder/,
+  );
+});

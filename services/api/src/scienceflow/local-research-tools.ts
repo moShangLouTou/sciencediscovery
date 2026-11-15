@@ -34,10 +34,12 @@ import {
   type LocalResearchService,
   type ScienceFlowLocalResearchView,
 } from "./local-research.js";
+import { RESEARCH_PLAN_MAX_BYTES } from "./research-plan-publication.js";
 
 export const START_RESEARCH_TOOL = "start_research";
 export const GET_RESEARCH_TOOL = "get_research";
 export const STOP_RESEARCH_TOOL = "stop_research";
+export const PUBLISH_RESEARCH_PLAN_TOOL = "publish_research_plan";
 
 export const LOCAL_RESEARCH_TOOL_NAMES = [START_RESEARCH_TOOL, GET_RESEARCH_TOOL, STOP_RESEARCH_TOOL] as const;
 
@@ -48,17 +50,42 @@ const WAIT_SECONDS_MAX = 300;
 
 const startParameters = Type.Object({
   intent: Type.String({
-    description: "One or two sentences naming the bounded experiment to run and what its result should answer.",
+    description: "One or two sentences naming the bounded experiment to run and what its result should answer. In dynamic mode this text is also carried into the researcher's instruction.",
     maxLength: INTENT_MAX_CHARACTERS,
     minLength: 1,
   }),
   plan_version_id: Type.Optional(Type.String({
-    description: "Optional: the Session's plan artifact version whose content is exactly this profile's configured plan input. A different version is refused before launch. Business id only.",
+    description: "Dynamic mode: required. The Session Artifact version holding the plan the researcher must carry out; its exact bytes are staged for this run. A version from another Session or with unreadable content is refused before launch. Business id only.",
     maxLength: 200,
     minLength: 1,
   })),
   incumbent_version_id: Type.Optional(Type.String({
-    description: "Optional: the Session's incumbent artifact version whose content is exactly this profile's configured incumbent input. A different version is refused before launch. Business id only.",
+    description: "Dynamic mode: required when the profile stages an incumbent. The Session Artifact version holding the starting solution (for a follow-up run, an evaluated candidate the previous run delivered). Its exact bytes become the researcher's fixed start. Business id only.",
+    maxLength: 200,
+    minLength: 1,
+  })),
+}, { additionalProperties: false });
+
+const publishPlanParameters = Type.Object({
+  content: Type.String({
+    description: "The plan text itself, in Markdown. State the question, the concrete method change this run makes, the starting solution, the budget and the acceptance rule, using the evidence actually read.",
+    maxLength: RESEARCH_PLAN_MAX_BYTES,
+    minLength: 1,
+  }),
+  name: Type.Optional(Type.String({
+    description: 'Logical artifact name ending in ".md". Defaults to "research-plan.md".',
+    maxLength: 200,
+    minLength: 1,
+  })),
+  title: Type.Optional(Type.String({ maxLength: 200, minLength: 1 })),
+  description: Type.Optional(Type.String({ maxLength: 2_000, minLength: 1 })),
+  artifact_id: Type.Optional(Type.String({
+    description: "Revise an existing plan: its artifact id. Requires base_version_id.",
+    maxLength: 200,
+    minLength: 1,
+  })),
+  base_version_id: Type.Optional(Type.String({
+    description: "The plan version this revision is written against. A stale base is refused; read the plan again before revising.",
     maxLength: 200,
     minLength: 1,
   })),
@@ -109,21 +136,39 @@ export interface LocalResearchToolInput {
 /**
  * Prompt text for a Session whose deployment enabled the mode. It states the
  * experimental boundary and the start→observe→read-artifacts workflow in the
- * same voice as the other governance instructions.
+ * same voice as the other governance instructions, and states which input mode
+ * this deployment actually runs.
  */
 export function localResearchInstructions(service: LocalResearchService): string {
+  const boundary = `Experimental local research is enabled for this Session (profile ${service.profileId}). It runs one bounded ScienceFlow experiment on this host with the Session's own model and the administrator's pinned engine, interpreter, task package and evaluator. This is experimental local execution, not the formal Runner sandbox: formal execution-plan readiness and its blockers are unchanged and this mode makes no sandbox claim.`;
+  const observe = `start_research returns an operation id immediately. Call get_research with wait_seconds (at most ${Math.floor(service.observeMaxWaitMs / 1_000)}) to observe the real engine lifecycle and the evaluated stages. Do not call start_research again for the same experiment; a replayed start attaches to the same operation.`;
+  const delivery = `When the run ends, its result artifacts are delivered to this Session automatically. Read them with list_artifacts and read_artifact and answer from what was actually evaluated. If delivery failed, call get_research action retry_delivery; that republishes without rerunning research. Use stop_research for an explicit user stop and distinguish a requested stop from confirmed engine termination.`;
+  const honesty = `Do not claim success, a score or a scientific conclusion that the delivered evidence does not support.`;
+  if (service.inputMode === "dynamic") {
+    return [
+      `<local_research_mode>`,
+      boundary,
+      `This deployment runs dynamic inputs: you author the plan as ordinary research text. Call publish_research_plan with the plan body to publish it as a Session Artifact version, then call start_research with that exact plan_version_id and the incumbent_version_id that this run must start from. The bytes of those two versions - not a copy in the administrator's seed - are staged for the run, and no later version or edit changes what a started run reads. Get version ids with list_artifacts and read_artifact (read_artifact returns the version record, including its id) or from the delivery references get_research returns.`,
+      `The research intent you pass to start_research becomes part of the researcher's instruction, together with the staged plan path and this run's version identities. Write the intent as the concrete research direction of this run. This deployment supports one task package only: if the user asks for a different task family, say that it is unsupported instead of running this task under a misleading label. Never supply host paths, an interpreter, a model, an endpoint, a credential, commands or a task description.`,
+      observe,
+      delivery,
+      `To continue research, read the delivered result note, the evaluated attempt artifacts and the researcher's records, interpret what the run actually did, then publish a revised plan and start a second run whose incumbent_version_id is a real evaluated candidate version delivered by the earlier run. Do not relabel a run as a continuation or reuse the seed while claiming a new candidate.`,
+      honesty,
+      `</local_research_mode>`,
+    ].join(" ");
+  }
   return [
     `<local_research_mode>`,
-    `Experimental local research is enabled for this Session (profile ${service.profileId}). It runs one bounded ScienceFlow experiment on this host with the Session's own model and the administrator's fixed engine/task inputs. This is experimental local execution, not the formal Runner sandbox: formal execution-plan readiness and its blockers are unchanged and this mode makes no sandbox claim.`,
+    boundary,
     `When the user asks to run the configured experiment, call start_research with a short intent. This profile runs one administrator-configured bounded experiment: its pinned task text is the instruction the researcher executes, and the intent is recorded only as this run's label and as the purpose you report. If you name plan_version_id or incumbent_version_id, they must be this Session's versions whose content is byte-identical to the profile's configured plan/incumbent inputs; a different version is refused before anything runs. Omit them to run the configured fixed inputs. Never supply host paths, an interpreter, a model, an endpoint, a credential, commands or a task description: those are administrator and Session configuration.`,
-    `start_research returns an operation id immediately. Call get_research with wait_seconds (at most ${Math.floor(service.observeMaxWaitMs / 1_000)}) to observe the real engine lifecycle and the evaluated stages. Do not call start_research again for the same experiment; a replayed start attaches to the same operation.`,
-    `When the run ends, its result artifacts are delivered to this Session automatically. Read them with list_artifacts and read_artifact and answer from what was actually evaluated. If delivery failed, call get_research action retry_delivery; that republishes without rerunning research. Use stop_research for an explicit user stop and distinguish a requested stop from confirmed engine termination.`,
-    `Do not claim success, a score or a scientific conclusion that the delivered evidence does not support.`,
+    observe,
+    delivery,
+    honesty,
     `</local_research_mode>`,
   ].join(" ");
 }
 
-/** The three tools, assembled once per conversation run. */
+/** The three tools, plus the plan-authoring tool in dynamic mode. */
 export function createLocalResearchTools(input: LocalResearchToolInput): AgentTool[] {
   const { service, projectId, sessionId, runId, requirePrivilege, beginExternalWait } = input;
 
@@ -142,12 +187,19 @@ export function createLocalResearchTools(input: LocalResearchToolInput): AgentTo
   const start: AgentTool<typeof startParameters> = {
     name: START_RESEARCH_TOOL,
     label: "Start local research",
-    description: [
-      "Start this deployment's one configured bounded experimental ScienceFlow research run for this Session.",
-      "The administrator's pinned task text is the instruction the researcher executes; intent is recorded as this run's label and the purpose you report.",
-      "Supply business identities only: intent and, optionally, this Session's plan_version_id and incumbent_version_id, which must exactly match the profile's configured fixed inputs. A different version is refused before launch.",
-      "This is experimental local execution on this host, not the formal Runner sandbox. It returns an operation id at once; observe it with get_research. Do not start the same experiment twice.",
-    ].join(" "),
+    description: service.inputMode === "dynamic"
+      ? [
+          "Start one bounded experimental ScienceFlow research run for this Session, using a plan and a starting solution you selected from this Session's artifacts.",
+          "Pass plan_version_id (required) and incumbent_version_id (required when the profile stages an incumbent). Their exact bytes are staged for this run; a version that is not a live artifact version of this Session is refused before launch.",
+          "The intent becomes part of the researcher's instruction together with the staged plan; write it as this run's concrete research direction. Business identities only: never paths, interpreter, model, endpoint, credential or commands.",
+          "This is experimental local execution on this host, not the formal Runner sandbox. It returns an operation id at once; observe it with get_research. Do not start the same experiment twice.",
+        ].join(" ")
+      : [
+          "Start this deployment's one configured bounded experimental ScienceFlow research run for this Session.",
+          "The administrator's pinned task text is the instruction the researcher executes; intent is recorded as this run's label and the purpose you report.",
+          "Supply business identities only: intent and, optionally, this Session's plan_version_id and incumbent_version_id, which must exactly match the profile's configured fixed inputs. A different version is refused before launch.",
+          "This is experimental local execution on this host, not the formal Runner sandbox. It returns an operation id at once; observe it with get_research. Do not start the same experiment twice.",
+        ].join(" "),
     parameters: startParameters,
     async execute(toolCallId, parameters, signal) {
       signal?.throwIfAborted();
@@ -171,6 +223,7 @@ export function createLocalResearchTools(input: LocalResearchToolInput): AgentTo
           intent: parameters.intent,
           ...(parameters.plan_version_id ? { planVersionId: parameters.plan_version_id } : {}),
           ...(parameters.incumbent_version_id ? { incumbentVersionId: parameters.incumbent_version_id } : {}),
+          ...(signal ? { signal } : {}),
         });
         return result({
           operation: outcome.operation,
@@ -258,7 +311,44 @@ export function createLocalResearchTools(input: LocalResearchToolInput): AgentTo
     },
   };
 
-  return [start, get, stop];
+  const publishPlan: AgentTool<typeof publishPlanParameters> = {
+    name: PUBLISH_RESEARCH_PLAN_TOOL,
+    label: "Publish research plan",
+    description: [
+      "Publish the plan text you authored as an ordinary Session Artifact version, and return its stable version id for start_research.",
+      "The content is the plan itself (Markdown): the question, the concrete method change, the starting solution, the budget and the acceptance rule. It is stored through the same Artifact, version and content-store path as any other declared artifact, with this Agent run recorded as its origin.",
+      "To revise a plan, pass artifact_id and base_version_id together; a stale base is refused instead of overwriting a newer plan. Re-publishing identical bytes returns the version that already holds them. At most 64 KiB.",
+    ].join(" "),
+    parameters: publishPlanParameters,
+    async execute(toolCallId, parameters, signal) {
+      signal?.throwIfAborted();
+      try {
+        const published = await service.publishPlan({
+          projectId,
+          sessionId,
+          runId,
+          content: parameters.content,
+          ...(parameters.name ? { name: parameters.name } : {}),
+          ...(parameters.title ? { title: parameters.title } : {}),
+          ...(parameters.description ? { description: parameters.description } : {}),
+          ...(parameters.artifact_id ? { artifactId: parameters.artifact_id } : {}),
+          ...(parameters.base_version_id ? { baseVersionId: parameters.base_version_id } : {}),
+          publicationId: `${runId}:${toolCallId}`,
+          ...(signal ? { signal } : {}),
+        });
+        return result({
+          plan: published,
+          instruction: published.reused
+            ? "This exact plan content already is the artifact's current version; no new version was written. Use plan_version_id from this result."
+            : "The plan is published. Pass this versionId as plan_version_id to start_research; that run stages exactly these bytes.",
+        });
+      } catch (error) {
+        return refused(error);
+      }
+    },
+  };
+
+  return service.inputMode === "dynamic" ? [publishPlan, start, get, stop] : [start, get, stop];
 }
 
 /** The service view is already public; keep one explicit mapping point. */

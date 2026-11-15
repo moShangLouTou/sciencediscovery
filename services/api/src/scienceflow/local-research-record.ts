@@ -144,6 +144,22 @@ export interface ScienceFlowLocalResearchInput {
   readonly sha256: string;
   readonly size: number;
   readonly versionId: string | null;
+  /** Where the bytes were staged inside the operation's input directory. */
+  readonly stagedName?: string;
+}
+
+/**
+ * The operation-owned input directory the engine's manifest pointed at. Recorded
+ * so a rebuilt service (and an auditor) can tell which directory this run read,
+ * and so nothing can silently re-point it at the administrator's seed later.
+ */
+export interface ScienceFlowLocalResearchStagedInputs {
+  readonly dataDir: string;
+  readonly entries: number;
+  readonly manifestPath: string;
+  readonly manifestSha256: string;
+  readonly stagedAt: string;
+  readonly totalBytes: number;
 }
 
 /** What the engine's own record last said about this run. */
@@ -192,8 +208,14 @@ export interface ScienceFlowLocalResearchOperation {
     readonly privateRoot: string;
     readonly model: ScienceFlowLocalResearchModel | null;
     readonly grant: ScienceFlowLocalResearchGrant;
+    /** `fixed` for records written before dynamic input existed. */
+    readonly inputMode?: "fixed" | "dynamic";
+    /** The exact instruction pinned for this run, when one was composed. */
+    readonly taskDescription?: string;
   };
   readonly engine: ScienceFlowLocalResearchEngineFacts;
+  /** Present once the operation's own input directory has been staged. */
+  readonly stagedInputs?: ScienceFlowLocalResearchStagedInputs;
   readonly progress: {
     readonly stages: readonly ScienceFlowLocalResearchStage[];
     readonly usage: ScienceFlowLocalResearchUsage | null;

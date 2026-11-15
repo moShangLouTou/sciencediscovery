@@ -1005,7 +1005,156 @@ service 12, tools 8, cancel 2, delivery 20, pilot 20), source-mapped
 `tsc --noEmit` exit 0 and `git diff --check` clean. No full suite, browser,
 product-stack or formal Runner run was repeated for these two fixes.
 
-## 12. What this pilot does not claim
+## 12. Round 24: dynamic plans and a second experiment from the first result
+
+Round 23 made one administrator-staged experiment callable from a conversation:
+the plan and the starting solution were fixed on disk, and a Session version was
+accepted only if its bytes were exactly those files. Round 24 removes that
+limitation for the same task package. The Session Agent now writes the plan, the
+service stages the exact version it accepted, and the Agent can start a second
+run whose starting solution is a candidate the first run produced.
+
+The administrator still owns everything that executes: the engine checkout, the
+interpreter, the reader script, the task package and its evaluator, the supporting
+assets, the run and private roots, and the budget defaults. A conversation still
+supplies only business identities and research intent.
+
+### 12.1 Two input modes
+
+`research.inputMode` selects the mode. It is optional and defaults to `fixed`, so
+every round-23 profile keeps its behaviour and its refusal rules unchanged.
+
+| | `fixed` (default) | `dynamic` |
+| --- | --- | --- |
+| Who chooses the plan and the starting solution | the administrator, staged under `seedDir` | the Session, as Artifact versions |
+| `research.inputs` | seed file per role; a named version must be byte-identical to it | not allowed |
+| `research.dynamicInputs` | not allowed | staging destination per role (`plan` required) |
+| The engine's `input_data_dir` | `seedDir` | the operation's own staged directory |
+| Task text | `taskDescriptionPath` pinned verbatim | `taskDescriptionPath` used as a template |
+
+```json
+{
+  "inputMode": "dynamic",
+  "seedDir": "/abs/task-owned/assets",
+  "dynamicInputs": { "plan": "experiment_plan.md", "incumbent": "start_solution.json" },
+  "taskDescriptionPath": "/abs/task-owned/task-template.md"
+}
+```
+
+In dynamic mode `seedDir` is a read-only root of **supporting assets** — the
+kernel, the checker, the runner script, notes about their origin — and must be an
+existing directory. `dynamicInputs` names where the Session's bytes are staged
+inside each operation's input directory. A name is a short relative path; it may
+not be absolute, may not contain `.` or `..` segments, and the plan and incumbent
+names must differ. A staged role whose name collides with a supporting asset is
+refused rather than silently replacing it.
+
+### 12.2 The Agent authors the plan
+
+A dynamic profile exposes one more tool, `publish_research_plan`. It takes the
+plan text (Markdown, at most 64 KiB) plus an optional title and an optional
+`artifact_id` + `base_version_id` pair to revise an existing plan, and publishes
+it through the same Artifact/version/content-store path as `declare_artifact`: the
+same catalog row, content hash, revision chain and provenance. The version records
+`origin: llm_declared` with `publishedBy: research-plan-tool` and the Agent run id,
+so a model-authored plan is distinguishable from a plan an operator wrote.
+
+It exists because `declare_artifact` publishes a *workspace file*, which needs a
+writable run workspace. A conversation that only reasons has no shell, so the tool
+takes the text itself instead of requiring an unrelated Runner setup. It is not a
+document editor and not a plan registry: bounded Markdown in, one stable version
+reference out.
+
+Re-publishing identical bytes returns the version that already holds them, so a
+retried tool call never writes an empty revision. A revision with a stale base is
+refused (`plan-version-mismatch`) instead of overwriting a newer plan.
+
+### 12.3 What one accepted operation freezes
+
+`start_research` in dynamic mode requires `plan_version_id` and, when the profile
+stages an incumbent, `incumbent_version_id`. Both must be live Artifact versions
+created in this Session; the start reads their content-store bytes, verifies each
+against its recorded digest and size, and freezes:
+
+- the role, the SHA-256, the size, the staging name and the version id of each input;
+- the composed researcher instruction, built from the administrator's template;
+- the credential-free model selection the Session resolved;
+- the work directory, private root, receipt and delivery paths.
+
+A missing version, a version from another Session, an unreadable or corrupt
+content-store object, or an unsupported model refuses the start **before** an
+operation exists. The bytes are then staged into `<operation>/input/` — a copy of
+the supporting assets plus the selected plan and incumbent — and every staged file
+is re-hashed after the write. The engine's manifest points at that directory, and
+the operation records the directory, the manifest's own digest and the effective
+instruction. Once staged, a newer Artifact version, an edited seed or supporting
+asset, a profile change or a rebuilt service cannot change what the operation
+reads: the staged copy is the input, and the manifest digest is the record of
+exactly which asset tree and which selected bytes that copy holds.
+
+Staging is bounded: at most 512 supporting-asset entries, 16 MiB per asset, 64 MiB
+in total and eight levels of nesting. Symbolic links and non-regular files are
+refused, so an asset cannot point the engine outside the asset root.
+
+The template uses a small fixed placeholder set — `{{plan_file}}`,
+`{{incumbent_file}}`, `{{research_intent}}`, `{{plan_version_id}}`,
+`{{incumbent_version_id}}`, `{{operation_id}}` — and the staged paths are rendered
+as `dataset/<name>`, which is how the engine exposes the input directory inside the
+researcher's workspace. The loader refuses an unknown placeholder, a template that
+omits `{{plan_file}}` or `{{research_intent}}`, and a template that omits
+`{{incumbent_file}}` while the profile stages an incumbent. Nothing is left for a
+run to fill in silently, and a composed instruction over 32 KiB refuses the start.
+
+### 12.4 Continuing from a delivered result
+
+Delivery is unchanged: when the run ends, the selected stage, every captured
+attempt and the researcher's own records are published as ordinary Session
+Artifacts, with the run id in the logical name. Those version ids are what
+`get_research` reports in `delivery.solution`, `delivery.staged` and
+`delivery.researcher`, and what the Agent passes as the next run's
+`incumbent_version_id`.
+
+A second experiment is a second user request in the same Session. It is a new
+conversation run, so it is a new operation with its own engine run, its own staged
+input directory and its own delivery artifacts; nothing overwrites the first run
+and nothing labels a rerun as a continuation. Replaying an accepted start — a tool
+retry, a provider replay, a reconnect — attaches to the same operation because the
+idempotency key covers the Project, the Session, the owner run, the intent and both
+version ids.
+
+A start this Session cannot honour is refused with a stable reason instead of
+being approximated:
+
+| Reason | When |
+| --- | --- |
+| `link-version-missing` | a role the profile stages was not named |
+| `link-version-not-found` | the version is not a live artifact version of this Session |
+| `link-version-unreadable` | the content-store bytes are unreadable or do not match the recorded digest |
+| `staging-conflict` | the operation's input directory already exists, or a staged name collides with an asset |
+| `staging-unsafe` / `staging-too-large` | a supporting asset is a link, a special file, or over the bounds |
+| `staging-bytes-mismatch` | the staged copy is not the accepted bytes |
+| `task-text-invalid` | the composed instruction is unusable or over 32 KiB |
+| `model-selection-changed` | the Session's effective model changed between acceptance and launch |
+| `conversation-cancelled` | the conversation run that would own the experiment was cancelled first |
+
+A staging failure leaves the operation recorded as `failed` with `error.step =
+"staging"` and never launches. Cancellation is checked again after staging and
+before the launch, and a stop during preparation aborts the copy: no operation
+that lost its reader starts an engine.
+
+### 12.5 What dynamic mode still does not claim
+
+One task package, one evaluator, one CPU worker, one administrator-chosen engine.
+The plan is bounded research text the researcher reads; the service never evaluates
+it, never executes it and never lets it replace the task package, the evaluator or
+the runtime. Supporting assets may be model-authored from earlier rounds — the
+plan template and the operation record keep their origin separate from the newly
+authored plan. A request for a different task family is unsupported and must be
+reported as such, not mapped onto this task. `canStart` stays `false` and the
+formal Runner blockers are untouched: this is experimental local execution without
+a sandbox.
+
+## 13. What this pilot does not claim
 - No Runner gateway, sandbox or `canStart` change. `canStart` stays `false` and
   the five blockers stay in place.
 - Generated code ran in the task workspace through the engine's normal tools.
@@ -1035,10 +1184,16 @@ product-stack or formal Runner run was repeated for these two fixes.
   prove arm independence. The delivered trial and submit logs do record the
   eight labelled searches and both submits. This is a product demonstration, not
   a new scientific result or a benchmark.
-- No browser/UI journey is claimed for the mode. The demonstration used the
-  ordinary Session run creation and scheduling path without an HTTP listener.
+- No browser/UI journey is claimed for the mode. Round 23 used the ordinary
+  Session run creation and scheduling path without an HTTP listener; round 24
+  drove the normal authenticated HTTP API and still claims no browser journey.
+- Dynamic input mode is not arbitrary task support, a plan registry, a document
+  editor or a sandbox. It stages the exact bytes of two named roles for the one
+  configured task package; it does not download datasets, install dependencies
+  beyond a small CPU package the task-owned isolation already carries, or accept a
+  second task family.
 
-## 13. Where the evidence lives
+## 14. Where the evidence lives
 
 Ignored local artifacts under `.tmp/r/round19/` (never committed):
 
