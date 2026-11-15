@@ -1,6 +1,6 @@
 # ScienceFlow research pilot: one evaluated circle-packing loop
 
-Status: operator-run research pilot (rounds 19–20). Round 19 executed five
+Status: operator-run research pilot (rounds 19–22). Round 19 executed five
 bounded managed runs on the engine's own `circle-packing` task. Runs 1–3
 established the task, evaluator and process evidence; runs 4–5 closed the loop:
 a model-produced candidate was captured and evaluated by the engine, the engine's
@@ -14,7 +14,9 @@ ScienceDiscovery model and reads the run back for that same persisted Session.
 Section 8 describes the command and the round-20 runs; sections 1–7 remain the
 round-19 record and their results are not rewritten. Round 21 adds `deliver`,
 which publishes an existing run's selected result as normal Session artifacts for
-the Session's Agent (section 9); it starts no run and re-evaluates nothing.
+the Session's Agent (section 9); it starts no run and re-evaluates nothing. Round
+22 makes an Agent-authored plan the input of a real managed run and brings its
+evaluated attempts back with an Agent interpretation (section 10).
 
 ## 1. What this pilot is
 
@@ -439,7 +441,141 @@ check.
   on top of it is separate from the delivered artifact, and this document does
   not claim a UI journey was run.
 
-## 10. What this pilot does not claim
+## 10. Round 22: the Agent's plan becomes an evaluated experiment
+
+Rounds 19–21 left the loop at "the Session Agent can read a delivered result".
+Round 22 closes the research decision: a real Session Agent authors one
+hypothesis and experiment as an ordinary Session artifact; that fixed plan and
+the fixed incumbent are carried into a new managed run; every captured stage is
+delivered back with its digest; and a second real Agent conversation compares
+intended versus executed method and states whether the evidence supports,
+contradicts or leaves the hypothesis unresolved.
+
+### 10.1 The planning conversation
+
+The Session's own service composition (`createQueuedRun` +
+`scheduleSessionRuns`, no HTTP listener and no browser) ran one conversation in
+the isolated store with the Session's frozen Qwen3.8-Flash profile. The prompt
+gave only the task contract, the bounded environment, and two corrections to the
+earlier analysis (the interval from S03 to the stop was about 17 s, not 2–3
+minutes; the note's "twice the largest step" margin was a template suggestion, not
+a requirement). It supplied no hypothesis. The Agent read the delivered solution
+(`7e04c23b…` / version `6dbe930a…`) and result note (`158312ff…` / version
+`fd6f08fd…`) with `list_artifacts` / `read_artifact` and answered in 177.7 s
+(run `b3aba5c1-4504-4fc9-af19-fe6ca8864b6e`, `completed`; one shell attempt was
+declined by the Session's approval mode, and the answer says the numbers came
+from the artifacts).
+
+The answer is preserved unchanged as `scienceflow/round22/experiment-plan.md`,
+version `c031031b-53bb-437e-8c07-89cd34adf0b7` (4,400 bytes, sha256
+`7159960e…`). Its provenance records that it is Agent-authored
+(`agentAuthored`, the Agent run and message ids, the model), and its input
+versions are the two artifacts it read. It proposes one change — an
+`evict → re-jam → regrow` operator added to a rattle/inflate polish kernel — and
+one controlled comparison: Arm A polish-only, then Arm B the same polish plus one
+distinct evictee per command, at the same allowance, with validity checked first
+and support only when Arm B's best exceeds Arm A's and the incumbent by a stated
+margin.
+
+### 10.2 The two bounded runs
+
+The seed was materialized from the store's CAS by digest, not retyped: the
+incumbent bytes (`ec060f2f…`, 1655 bytes), the plan bytes (`7159960e…`, 4400
+bytes), the engine's own evaluation of those incumbent bytes from the previous
+run, the model-written solver from that run, and the operator submission helper.
+A manifest records every seed file's digest. The corrected run's seed also
+carries the kernel the previous round-22 run wrote, with its source run named.
+
+| Run | Allowance outcome | Captured stages | Selected best |
+| --- | --- | --- | --- |
+| `round22-circle-packing-a` | `completed`, 880.8 s, research finished | S01 2.631640653898, S02 2.6325585398458324, S03 2.6329437164770155, S04 2.633134264465223 | S04 (`178312f7…`), +0.009159 over the seed |
+| `round22-circle-packing-b` | `completed`, 844.7 s, research finished | S01 2.6239750175348147 (the seed reproduced) | S01 = the seed, no new candidate |
+
+Run A's researcher read the plan at t+5 s and wrote its own solver family; its
+solvers include the eviction operator, but mixed with multistart, global passes
+and other escape moves, and its first captured stage was already a new candidate,
+so the plan's Arm A baseline was never captured. Run B reproduced the seed as
+S01, then wrote its own solver files; its first long search command was cut with
+about 20 s left in the research budget, and no changed artifact was scored.
+
+Both are recorded with their deviations rather than smoothed: the model used
+nested `multiprocessing` pools inside its own commands (for example 15 workers),
+which exceeds the operator's single-engine-worker allowance in spirit though not
+the engine's evaluation; neither run was stopped by the 900 s allowance; and the
+plan's controlled comparison was not carried out in either run.
+
+### 10.3 Delivery with the plan, the incumbent and every attempt
+
+`deliver` gained three optional inputs; its existing behaviour is unchanged when
+they are absent:
+
+- `--plan-version <version-id>` and `--incumbent-version <version-id>` must be
+  live artifact versions of the same Session. Delivery reads and re-hashes them,
+  links them to the note through `inputArtifactVersionIds`, and never authors or
+  rewrites their content.
+- `--attempts` publishes every captured stage as its own artifact
+  (`scienceflow/<run>/attempts/<stage>/solution.json`), re-checking the engine's
+  recorded digest. A stage is called the carried seed only when its digest equals
+  the linked incumbent; a first stage with a different digest is `first_captured`;
+  later stages are `evaluated_attempt`; a stage whose bytes cannot be read or
+  verified is recorded `unresolved` with a stable reason instead of being dropped
+  or replaced.
+
+The note gains an `## Experiment plan tested` section naming both fixed versions
+and, when a plan is linked, stops substituting the old template's "proposed next
+experiment" paragraph for the Agent's own plan. Run A delivered its solution
+(version `9b53b2e8…`), a note (version `25bddde3…`), and attempts `d49bc970…`
+(S01 `first_captured`), `b35803f0…` (S02), `2f6f1fa3…` (S03). Run B delivered the
+seed bytes as its selected solution (version `e181e53c…`), a note (`b34869ef…`)
+and S01 as the selected carried seed. One correction is in the record: delivery
+v1 labelled run A's S01 as the carried seed from the old parent-only rule; that
+attempt artifact was marked deleted and the stage republished with the corrected
+role, and the correction file keeps the reason.
+
+An operator-extracted execution summary (from the engine's per-stage tool logs,
+the worker's main log and the workspace files) is published per run as an
+ordinary artifact, so the interpretation can see what actually ran without
+exposing host paths. Two incomplete summary versions were corrected; the final
+versions are `89e818af…` (run A) and `bbd2394d…` (run B).
+
+### 10.4 The interpretation and its verdict
+
+A second real Agent conversation (run `5a4d98c2-68a9-4db2-904c-51993adf7f38`,
+50.1 s, six tool calls) read the plan, both notes and both execution summaries
+through the normal tools. Its verdict is **unresolved**: run A's selected best is
++0.009159 over the incumbent (about 18× the plan's margin), but no run carried out
+the Arm A / Arm B control, and run A's gain is confounded with solver rewrites and
+other operators, so it is not evidence for the specific hypothesis. It proposes
+one next action: run the same plan with the arm separation enforced.
+
+The answer is preserved as `scienceflow/round22/experiment-interpretation.md`
+(version `4fdb23d1…`), labelled Agent-authored, with a separate labelled operator
+correction. The correction records that the Agent first read summary versions
+that omitted post-stage commands, that run B did attempt optimization, the exact
+run lifecycles (880.8 s and 844.7 s, both research-completed), and the nested-pool
+deviation. Two conversations that reached the authorized five-minute limit
+(`dc090802…`, `613404f6…`) are recorded as `interrupted` with the reason; no
+answer is attributed to them.
+
+### 10.5 What round 22 establishes, and what it does not
+
+Established in this isolated operator scope: a real Agent authored plan is a
+fixed Session artifact; the same persisted Session's SD-selected model drove two
+managed runs from the exact incumbent and plan bytes; the plan reached the
+researcher's context and tool use; four new candidates were engine-evaluated in
+run A; every captured stage is separately delivered with its digest and role; run
+B's selected best is the seed and its null result is published rather than hidden;
+and a real follow-up Agent read the evidence and gave an explicitly unresolved
+verdict.
+
+Not established: the plan's controlled comparison. No run executed Arm A versus
+Arm B at equal allowance with arm labels, so the hypothesis is not tested as
+designed, and a higher score unrelated to that comparison is not treated as
+support. This document does not claim statistical significance, a benchmark
+campaign, a public research start, a HTTP/browser/Runner journey, or isolation of
+hostile code.
+
+## 11. What this pilot does not claim
 
 - No Runner gateway, sandbox or `canStart` change. `canStart` stays `false` and
   the five blockers stay in place.
@@ -458,7 +594,7 @@ check.
 - The seeded incumbent A was produced by the model in run 3; run 5's model
   re-materialized it, and B and C are the model's own work in run 5.
 
-## 11. Where the evidence lives
+## 12. Where the evidence lives
 
 Ignored local artifacts under `.tmp/r/round19/` (never committed):
 
@@ -497,3 +633,16 @@ identity), `evidence/delivery-*.json` are delivery records taken from the final
 code, `evidence/agent-run-*.json` hold the Agent's tool calls, permission
 decisions and answer, and `agent-harness.mts` is the local service-level harness
 that drove the conversation.
+
+Round 22 evidence lives under the ignored `.tmp/r/round22/` directory: `store/`
+is a consistent isolated copy of the round-21 store (same Project, Session,
+model and prior artifact identities), `evidence/agent-run-*.json` hold the two
+planning/interpretation conversations and the two capped ones, `evidence/delivery-*.json`
+are the delivery records, `seed/` and `seed-b/` are the two seeds with their
+manifests, `evidence/execution-summary-*.json` and
+`evidence/interpretation-artifact.json` are the published supporting artifacts'
+metadata, `evidence/run-a-attempt-correction.json` records the role correction,
+and `evidence/verification.json` re-derives the chain's invariants from the
+store, CAS and records. The engine's own task state is under
+`pilot/runs/<run>/circle-packing/`, and the private generated model inputs stay
+outside the repository in a 0700 directory.
