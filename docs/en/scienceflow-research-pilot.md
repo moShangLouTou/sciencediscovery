@@ -459,18 +459,22 @@ the isolated store with the Session's frozen Qwen3.8-Flash profile. The prompt
 gave only the task contract, the bounded environment, and two corrections to the
 earlier analysis (the interval from S03 to the stop was about 17 s, not 2–3
 minutes; the note's "twice the largest step" margin was a template suggestion, not
-a requirement). It supplied no hypothesis. The Agent read the delivered solution
-(`7e04c23b…` / version `6dbe930a…`) and result note (`158312ff…` / version
-`fd6f08fd…`) with `list_artifacts` / `read_artifact` and answered in 177.7 s
-(run `b3aba5c1-4504-4fc9-af19-fe6ca8864b6e`, `completed`; one shell attempt was
-declined by the Session's approval mode, and the answer says the numbers came
-from the artifacts).
+a requirement). It supplied no hypothesis. The artifact versions the answer cites
+(`7e04c23b…` / version `6dbe930a…`, `158312ff…` / version `fd6f08fd…`) had been
+read through `list_artifacts` / `read_artifact` by an earlier Agent turn in the
+same Session (run `5dd41e1b…`, finished 2026-11-15T09:12:42Z); that turn's tool
+results are part of the planning run's model input. The planning run itself called
+only `check_runner` (Runner unreachable) and `run_shell`, which the Session's
+approval mode declined, and it answered in 177.7 s (run
+`b3aba5c1-4504-4fc9-af19-fe6ca8864b6e`, `completed`). Its answer therefore reused
+context already in the conversation; it did not re-read the artifacts with tools
+in that turn, and the answer does not claim it did.
 
 The answer is preserved unchanged as `scienceflow/round22/experiment-plan.md`,
 version `c031031b-53bb-437e-8c07-89cd34adf0b7` (4,400 bytes, sha256
 `7159960e…`). Its provenance records that it is Agent-authored
 (`agentAuthored`, the Agent run and message ids, the model), and its input
-versions are the two artifacts it read. It proposes one change — an
+versions are the two artifact versions it cites. It proposes one change — an
 `evict → re-jam → regrow` operator added to a rattle/inflate polish kernel — and
 one controlled comparison: Arm A polish-only, then Arm B the same polish plus one
 distinct evictee per command, at the same allowance, with validity checked first
@@ -527,9 +531,13 @@ they are absent:
   verified is recorded `unresolved` with a stable reason instead of being dropped
   or replaced.
 
-The note gains an `## Experiment plan tested` section naming both fixed versions
+The note gains a `## Linked experiment plan` section naming both fixed versions
 and, when a plan is linked, stops substituting the old template's "proposed next
-experiment" paragraph for the Agent's own plan. Run A delivered its solution
+experiment" paragraph for the Agent's own plan. The section states what the link
+is — a fixed artifact version, not restated or rewritten — and what it is not:
+linking does not establish that the researcher read or followed the plan, so
+method compliance has to be read from the engine's interaction logs and the
+evaluated stages. Run A delivered its solution
 (version `9b53b2e8…`), a note (version `25bddde3…`), and attempts `d49bc970…`
 (S01 `first_captured`), `b35803f0…` (S02), `2f6f1fa3…` (S03). Run B delivered the
 seed bytes as its selected solution (version `e181e53c…`), a note (`b34869ef…`)
@@ -653,12 +661,14 @@ that drove the conversation.
 Round 22 evidence lives under the ignored `.tmp/r/round22/` directory: `store/`
 is a consistent isolated copy of the round-21 store (same Project, Session,
 model and prior artifact identities), `evidence/agent-run-*.json` hold the two
-planning/interpretation conversations and the two capped ones, `evidence/delivery-*.json`
+planning/interpretation conversations and the two capped ones,
+`evidence/planning-context-provenance.json` records the planning run's own tool
+calls and the predecessor turn's artifact reads, `evidence/delivery-*.json`
 are the delivery records, `seed/`, `seed-b/` and `seed-c/` are the seeds with their
 manifests, `evidence/execution-summary-*.json` and
 `evidence/interpretation-artifact.json` are the published supporting artifacts'
 metadata, `evidence/run-a-attempt-correction.json` records the role correction,
-and `evidence/verification.json` re-derives the chain's 29 invariants from the
+and `evidence/verification.json` re-derives the chain's 32 invariants from the
 store, CAS and records; `evidence/agent-run-5.json` is the run D interpretation
 conversation and `evidence/interpretation-artifact-v2.json` its published
 metadata. The engine's own task state is under
