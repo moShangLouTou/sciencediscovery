@@ -599,6 +599,37 @@ its own solver instead of running the arms. This document does not claim statist
 benchmark campaign, a public research start, a HTTP/browser/Runner journey, or
 isolation of hostile code.
 
+### 10.6 Offline mechanical precheck (no engine run)
+
+After the review, the operator ran the planned arm sequence offline against a
+frozen task package, without an engine, model or network call, to establish that
+the command sequence is mechanically executable before spending another run.
+The package `seed-d` carries the same incumbent and plan bytes, the model-written
+`solver3.py` with one gated operator —
+`elif u < 0.62 and os.environ.get("ARM") == "B":`, recorded as a one-hunk diff —
+and `run_arm.py`, which refuses a kernel whose sha256 is not the frozen value,
+runs it with `nw=1`, checks the artifact with the carried strict checker, and
+appends one row (arm, index, seed, elapsed, `radii_sum`, status, exit code) to
+`artifacts/trial_log.tsv`. It decides nothing about the search.
+
+With a 12 s command budget (the run's 55 s budget is not exercised here), all
+eight commands exited 0 after about 9 s each, wrote a strictly valid artifact,
+appended exactly one valid trial row, and kept at most one descendant process
+(the kernel with `nw=1`). An in-process counter recorded zero `evict_rejam`
+calls under `ARM=A` and three under `ARM=B` in a two-second search, so the gate
+selects the operator as intended. Each command started from the artifact the
+previous command left, exactly as the seed specifies.
+
+This validates mechanics only. It does not evaluate a stage, does not compare
+arms at equal allowance, and its short-budget numbers are not evidence about the
+plan's hypothesis. It also surfaced one limitation to carry into any
+interpretation: gating the evict draw does not make Arm A "polish only" — the
+kernel keeps its other operators, and in Arm A the gated draw falls through to
+the next operator in the same kernel. A future run with this package compares
+"the kernel without the evict draw" against "the kernel with it", which is
+narrower than the plan's wording. The operator did not rewrite the kernel to
+close that gap; that decision belongs to the Agent.
+
 ## 11. What this pilot does not claim
 
 - No Runner gateway, sandbox or `canStart` change. `canStart` stays `false` and
@@ -668,9 +699,11 @@ are the delivery records, `seed/`, `seed-b/` and `seed-c/` are the seeds with th
 manifests, `evidence/execution-summary-*.json` and
 `evidence/interpretation-artifact.json` are the published supporting artifacts'
 metadata, `evidence/run-a-attempt-correction.json` records the role correction,
-and `evidence/verification.json` re-derives the chain's 32 invariants from the
+`evidence/verification.json` re-derives the chain's 37 invariants from the
 store, CAS and records; `evidence/agent-run-5.json` is the run D interpretation
 conversation and `evidence/interpretation-artifact-v2.json` its published
-metadata. The engine's own task state is under
+metadata. The precheck adds `seed-d/` with `evidence/seed-d-manifest.json`,
+`evidence/precheck-results.json` and the ignored `precheck/` workspace. The
+engine's own task state is under
 `pilot/runs/<run>/circle-packing/`, and the private generated model inputs stay
 outside the repository in a 0700 directory.
