@@ -786,6 +786,28 @@ start_stack() {
 
   echo "Starting the control API..." >&2
   if [[ "$api_foreground" -eq 1 ]]; then
+    if [[ "${SCIENCE_DISCOVERY_PRINT_AUTH_TOKEN:-0}" == "1" ]]; then
+      # The pilot asks for a final, easy-to-copy credential after readiness.
+      # Own the API child just like the sidecars, so signals and failed startup
+      # still clean up this stack rather than leaving detached processes.
+      "${api_command[@]}" &
+      local api_pid="$!"
+      pids+=("$api_pid")
+      wait_healthy "control API" "http://127.0.0.1:${SCIENCE_AGENT_PORT:-4310}/health"
+      kill -0 "$api_pid" 2>/dev/null || { wait "$api_pid"; return 1; }
+      printf '\nScienceDiscovery is ready. Login auth token:\n'
+      local startup_auth_token="${SCIENCE_AGENT_AUTH_TOKEN:-}"
+      startup_auth_token="${startup_auth_token#"${startup_auth_token%%[![:space:]]*}"}"
+      startup_auth_token="${startup_auth_token%"${startup_auth_token##*[![:space:]]}"}"
+      if [[ -n "$startup_auth_token" ]]; then
+        printf '%s\n' "$startup_auth_token"
+      else
+        cat "$data_dir/secrets/auth-token"
+        printf '\n'
+      fi
+      wait "$api_pid"
+      return
+    fi
     "${api_command[@]}"
     return
   fi

@@ -21,7 +21,7 @@
 
 </div>
 
-融合分支试用：[ScienceFlow 中文测试指南](docs/zh/scienceflow-pilot-testing.md)（拉取代码、启用科研、反馈迭代与当前边界）。
+融合分支试用：[ScienceFlow 中文试用指南](docs/zh/scienceflow-pilot-testing.md)（准备隔离环境，在对话中选择已有任务或现场准备新任务并运行真实实验）。
 
 ## 为什么选择 ScienceDiscovery
 
