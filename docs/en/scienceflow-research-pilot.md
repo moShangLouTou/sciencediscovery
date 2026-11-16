@@ -1154,7 +1154,77 @@ reported as such, not mapped onto this task. `canStart` stays `false` and the
 formal Runner blockers are untouched: this is experimental local execution without
 a sandbox.
 
-## 13. What this pilot does not claim
+## 13. Round 25: the research workflow in the Web conversation
+
+Round 24 proved the HTTP/Agent/engine chain. Round 25 exposes the same durable
+operation in the Web conversation so a person can run, watch, stop, inspect and
+continue an experiment without a CLI, an HTTP driver or a database id. The
+complete browser journey and its evidence are recorded in the round-25 report
+under the migration plan directory; the user instructions are in
+[Running research from the conversation](scienceflow-research-ui.md), and this
+section records what the UI actually does.
+
+### 13.1 What the conversation shows
+
+A compact **Experimental local research** card sits above the composer in every
+Session. When the deployment has not enabled the mode the card is absent: no
+label, no action. When it is enabled the card lists this Session's operations,
+newest first, and shows for each one:
+
+- a short title from the recorded research intent, the ordinal, the operation id
+  and the engine run id;
+- the lifecycle: Preparing, Running, Stop requested, Stopped, Completed, Failed
+  or Outcome unknown;
+- captured engine stages and the latest evaluated metric, when the engine has
+  recorded one;
+- a separate **Delivery** line: not delivered yet, delivered, delivery failed
+  (with the failure message) or no candidate to deliver.
+
+Lifecycle and delivery are deliberately separate. A run that completed research
+but failed delivery is not shown as a delivered success, and a separately
+evaluated candidate that was never captured as a stage is not counted as one.
+The card polls the operation itself while it is active, so it keeps updating
+when the Agent is between tool calls, and it recovers the same operation after a
+browser refresh or a reopened Session without starting a second run.
+
+### 13.2 Stopping research
+
+The card's **Stop research** action calls the same owned stop path as the
+`stop_research` tool. It reports the request first and shows *Stop requested*
+until the engine confirms termination; the button then becomes *Stopping…* and
+cannot be sent twice. Stopping a conversation does not silently discard an
+experiment: the existing conversation cancel path asks the engine to stop only
+the operation that conversation run owns, while the card's Stop action names the
+selected operation directly.
+
+### 13.3 Finding and downloading the result
+
+When delivery completes, the new artifacts appear in the Session's existing
+artifact surfaces without a manual reload. The card links to the delivered result
+note and selected solution; both open in the normal artifact viewer, where the
+immutable version number can be inspected and the version downloaded. The latest
+captured stage, delivered attempts and the researcher's own records are listed
+separately so a reader can tell an engine-selected solution from a support log.
+
+### 13.4 Continuing from a result
+
+**Continue from this result** prefills the ordinary composer with an editable
+request that names the delivered solution's exact Artifact version id. Nothing
+starts when the card is clicked: the user reviews the request and sends it, and
+the Agent then follows the existing publish-plan / start / observe / deliver
+path with that version as the next incumbent. The first and second operations
+keep separate titles, ids, plans and delivered outputs.
+
+### 13.5 Enabling the mode
+
+Enabling is a one-time administrator action: provide the dynamic research
+profile (pinned engine checkout, interpreter, task package, supporting-asset
+directory and task template), then start the API with that profile. This adds the
+Agent's research tools and the card; it does not change `canStart`, clear the
+formal Runner blockers, or provide a sandbox. Markdown details belong to the
+administrator guide, not the user flow.
+
+## 14. What this pilot does not claim
 - No Runner gateway, sandbox or `canStart` change. `canStart` stays `false` and
   the five blockers stay in place.
 - Generated code ran in the task workspace through the engine's normal tools.
@@ -1163,7 +1233,12 @@ a sandbox.
   enforced monetary budget or provider-token hard cap.
 - One worker, CPU only, one task package. No benchmark campaign, no dataset, no
   general resume, no multi-tenant credentials, no budget tables.
-- No user-visible HTTP or browser journey is claimed.
+- Round 25 claims one real browser journey on the round-24 isolated stack: a
+  normal composer request started a real experiment, the card showed its live
+  status and recovered it after a refresh, the delivered artifacts were opened
+  and the selected solution downloaded, and a continuation prefilled from its
+  exact version started a second operation that was then stopped from the card.
+  That is a product demonstration, not a general browser/UI guarantee.
 - Package installation was disabled for these runs by operator control; the
   shims are part of the pilot's environment, not of the engine.
 - Candidate C is an engine-evaluated, gate-accepted, archived candidate, not a
@@ -1184,16 +1259,18 @@ a sandbox.
   prove arm independence. The delivered trial and submit logs do record the
   eight labelled searches and both submits. This is a product demonstration, not
   a new scientific result or a benchmark.
-- No browser/UI journey is claimed for the mode. Round 23 used the ordinary
-  Session run creation and scheduling path without an HTTP listener; round 24
-  drove the normal authenticated HTTP API and still claims no browser journey.
+- Round 23 used the ordinary Session run creation and scheduling path without an
+  HTTP listener; round 24 drove the normal authenticated HTTP API. Round 25 adds
+  the browser journey described in section 13 for this one deployment and task;
+  it does not generalize to other tasks, formal Runner execution or native
+  Windows.
 - Dynamic input mode is not arbitrary task support, a plan registry, a document
   editor or a sandbox. It stages the exact bytes of two named roles for the one
   configured task package; it does not download datasets, install dependencies
   beyond a small CPU package the task-owned isolation already carries, or accept a
   second task family.
 
-## 14. Where the evidence lives
+## 15. Where the evidence lives
 
 Ignored local artifacts under `.tmp/r/round19/` (never committed):
 
@@ -1273,3 +1350,12 @@ accepted-start replay and the real confirmed stop. The review follow-up adds
 checks) and `evidence/review-targeted-tests.tap`. The engine's own task state,
 receipts and delivery records are under `research/operations/<operation>/`, and
 the generated model inputs stay outside the repository in a 0700 directory.
+
+Round 25 evidence lives under the ignored `.tmp/r/round25/` directory: `store/`
+is a consistent copy of the round-24 store plus one new Session for this journey;
+`local-research.json` and `task-template.md` are the copied dynamic profile and
+task text with round-25 work paths; `evidence/` holds the browser trace,
+screenshots of the initial, active, delivered and stopped states, the composer
+prompt text, the operation and run ids, the downloaded solution bytes and their
+sha256, the read-only continuation identity check, and the targeted test logs.
+The engine's task state and receipts remain under `research/operations/<operation>/`.
