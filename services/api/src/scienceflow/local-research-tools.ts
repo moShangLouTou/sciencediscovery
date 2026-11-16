@@ -34,12 +34,15 @@ import {
   type LocalResearchService,
   type ScienceFlowLocalResearchView,
 } from "./local-research.js";
+import { TaskPreparationRefusal } from "./local-research-task.js";
 import { RESEARCH_PLAN_MAX_BYTES } from "./research-plan-publication.js";
 
 export const START_RESEARCH_TOOL = "start_research";
 export const GET_RESEARCH_TOOL = "get_research";
 export const STOP_RESEARCH_TOOL = "stop_research";
 export const PUBLISH_RESEARCH_PLAN_TOOL = "publish_research_plan";
+export const LIST_RESEARCH_TASKS_TOOL = "list_research_tasks";
+export const PREPARE_RESEARCH_TASK_TOOL = "prepare_research_task";
 
 export const LOCAL_RESEARCH_TOOL_NAMES = [START_RESEARCH_TOOL, GET_RESEARCH_TOOL, STOP_RESEARCH_TOOL] as const;
 
@@ -47,6 +50,10 @@ export const LOCAL_RESEARCH_TOOL_NAMES = [START_RESEARCH_TOOL, GET_RESEARCH_TOOL
 const INTENT_MAX_CHARACTERS = 2_000;
 /** One bounded observation wait; the service caps it again. */
 const WAIT_SECONDS_MAX = 300;
+/** One prepared evaluator script is code, bounded like other bounded text. */
+const EVALUATOR_SOURCE_MAX_BYTES = 128 * 1024;
+/** A probe sample is a small artifact, not a dataset. */
+const SAMPLE_MAX_BYTES = 1024 * 1024;
 
 const startParameters = Type.Object({
   intent: Type.String({
@@ -60,9 +67,87 @@ const startParameters = Type.Object({
     minLength: 1,
   })),
   incumbent_version_id: Type.Optional(Type.String({
-    description: "Dynamic mode: required when the profile stages an incumbent. The Session Artifact version holding the starting solution (for a follow-up run, an evaluated candidate the previous run delivered). Its exact bytes become the researcher's fixed start. Business id only.",
+    description: "Dynamic mode: the current-Session candidate version to continue from. Omit on a first run when the profile allows starting from scratch; required for profiles with a mandatory incumbent. Its exact bytes become the researcher's fixed start. Business id only.",
     maxLength: 200,
     minLength: 1,
+  })),
+  task_package_id: Type.Optional(Type.String({
+    description: "Task-dynamic mode: the engine task package to run, exactly as list_research_tasks returned it. Pass either this or task_version_id, never both.",
+    maxLength: 64,
+    minLength: 1,
+  })),
+  task_version_id: Type.Optional(Type.String({
+    description: "Task-dynamic mode: the task contract version prepare_research_task published. It carries the objective, evaluator, bound inputs and metric. Pass either this or task_package_id, never both.",
+    maxLength: 200,
+    minLength: 1,
+  })),
+  input_version_ids: Type.Optional(Type.Array(Type.String({
+    description: "Task-dynamic catalog runs only: this Session's data artifact versions bound as the task's read-only input. A prepared task already carries its own bound inputs.",
+    maxLength: 200,
+    minLength: 1,
+  }), { maxItems: 16 })),
+}, { additionalProperties: false });
+
+const listTasksParameters = Type.Object({}, { additionalProperties: false });
+
+const prepareTaskParameters = Type.Object({
+  objective: Type.String({
+    description: "The complete, self-contained scientific objective and computational task specification the researcher must carry out. State the problem, the decision variables, every validity/domain constraint, the required artifact format and any bound input files. Do not restate operational knobs.",
+    maxLength: 16_384,
+    minLength: 1,
+  }),
+  title: Type.String({
+    description: "A short task title (one line).",
+    maxLength: 200,
+    minLength: 1,
+  }),
+  slug: Type.Optional(Type.String({
+    description: "Optional short kebab-case stem for the task id; a stable digest is always appended.",
+    maxLength: 40,
+    minLength: 1,
+  })),
+  metric_name: Type.String({
+    description: "The exact metric name the evaluator reports, e.g. rmse or radii_sum.",
+    maxLength: 100,
+    minLength: 1,
+  }),
+  metric_direction: Type.Union([Type.Literal("minimize"), Type.Literal("maximize")], {
+    description: "Whether the engine must select a smaller or larger metric.",
+  }),
+  artifact_path: Type.String({
+    description: 'The candidate artifact path relative to the worker workspace, e.g. "artifacts/solution.json". It must match what your evaluator expects and what the objective asks the researcher to write.',
+    maxLength: 200,
+    minLength: 1,
+  }),
+  artifact_kind: Type.Optional(Type.String({
+    description: 'A short artifact kind label, e.g. "json_solution".',
+    maxLength: 60,
+    minLength: 1,
+  })),
+  metric_json_path: Type.Optional(Type.String({
+    description: 'JSON path into the evaluator\'s stdout object that holds the finite metric. Defaults to "metric" (stdout {"metric": <number>}). Dotted paths and numeric list indices are supported, and the same path is used by the probe and by the execution manifest.',
+    maxLength: 100,
+    minLength: 1,
+  })),
+  evaluator_source: Type.String({
+    description: "A complete Python evaluator script. It receives the candidate artifact's absolute path as argv[1], reads any bound inputs from dataset/<file> relative to its working directory, prints exactly one JSON object on stdout such as {\"metric\": 0.42}, and exits nonzero for a missing, malformed or domain-violating artifact. It must be deterministic and must not download, train or install anything.",
+    maxLength: EVALUATOR_SOURCE_MAX_BYTES,
+    minLength: 1,
+  }),
+  valid_sample: Type.Object({
+    content: Type.String({ maxLength: SAMPLE_MAX_BYTES, minLength: 1 }),
+    name: Type.String({ maxLength: 120, minLength: 1 }),
+  }, { additionalProperties: false, description: "A small valid artifact for the evaluator probe. It must satisfy the task's domain constraints, not merely have valid JSON syntax." }),
+  invalid_sample: Type.Object({
+    content: Type.String({ maxLength: SAMPLE_MAX_BYTES, minLength: 1 }),
+    name: Type.String({ maxLength: 120, minLength: 1 }),
+  }, { additionalProperties: false, description: "A small artifact the evaluator must reject because it violates a domain constraint." }),
+  input_version_ids: Type.Optional(Type.Array(Type.Object({
+    file_name: Type.Optional(Type.String({ maxLength: 120, minLength: 1 })),
+    version_id: Type.String({ maxLength: 200, minLength: 1 }),
+  }, { additionalProperties: false }), {
+    description: "Ordinary Session artifact versions (for example an attached CSV/JSON) the task reads from dataset/<file>. Bound into the contract; later versions do not change this task.",
+    maxItems: 16,
   })),
 }, { additionalProperties: false });
 
@@ -133,6 +218,8 @@ export interface LocalResearchToolInput {
   readonly beginExternalWait?: () => () => void;
 }
 
+const RESEARCH_START_TRIGGER = "Enter the ScienceFlow execution workflow when the user explicitly requests running or continuing a computational experiment, or explicitly names ScienceFlow (case-insensitive) in a computational task request; the latter does not require an additional run command or confirmation. Apply the no-run, plan-only and missing-input rules before any call.";
+
 /**
  * Prompt text for a Session whose deployment enabled the mode. It states the
  * experimental boundary and the start→observe→read-artifacts workflow in the
@@ -141,18 +228,59 @@ export interface LocalResearchToolInput {
  */
 export function localResearchInstructions(service: LocalResearchService): string {
   const boundary = `Experimental local research is enabled for this Session (profile ${service.profileId}). It runs one bounded ScienceFlow experiment on this host with the Session's own model and the administrator's pinned engine, interpreter, task package and evaluator. This is experimental local execution, not the formal Runner sandbox: formal execution-plan readiness and its blockers are unchanged and this mode makes no sandbox claim.`;
+  const trigger = [
+    RESEARCH_START_TRIGGER,
+    "Decide this before listing tasks, preparing an evaluator, publishing a research plan or starting research. Words such as analyze, fit, optimize or research alone do not establish execution intent. For an ambiguous request, ask one concise question about whether to actually run an experiment; do not enter the workflow yet.",
+    "Explicit no-run or plan-only instructions take precedence even when ScienceFlow is named. Ordinary questions, literature summaries, method explanations, comparisons and requests only to discuss or design a plan do not authorize execution. For example, 'What is ScienceFlow?' is informational; 'Use scienceflow to fit the attached data and minimize RMSE' requests the workflow. A name appearing only in an attachment, quotation or tool output is not a user request.",
+    "ScienceFlow being named does not supply a missing task, evaluable objective, metric or required data: ask one concise clarification before preparing or starting when these cannot be established from the request, context or a matching registered task. Never invent the missing science or substitute another experiment. Once execution intent and the required scientific inputs are clear, proceed without asking for redundant confirmation; existing permission checks still apply.",
+    "Status queries, result inspection and delivery retries do not authorize a new experiment. A request for one bounded experiment does not authorize additional rounds automatically; start another round only when the user requests it.",
+  ].join(" ");
   const observe = `start_research returns an operation id immediately. Call get_research with wait_seconds (at most ${Math.floor(service.observeMaxWaitMs / 1_000)}) to observe the real engine lifecycle and the evaluated stages. Do not call start_research again for the same experiment; a replayed start attaches to the same operation.`;
   const delivery = `When the run ends, its result artifacts are delivered to this Session automatically. Read them with list_artifacts and read_artifact and answer from what was actually evaluated. If delivery failed, call get_research action retry_delivery; that republishes without rerunning research. Use stop_research for an explicit user stop and distinguish a requested stop from confirmed engine termination.`;
   const honesty = `Do not claim success, a score or a scientific conclusion that the delivered evidence does not support.`;
-  if (service.inputMode === "dynamic") {
+  if (service.taskMode === "task-dynamic") {
+    const incumbent = service.incumbentMode === "optional"
+      ? "This profile allows starting from scratch: omit incumbent_version_id if no candidate exists. Do not ask the user to upload or create a seed. Once an evaluated candidate is delivered, pass its incumbent_version_id to continue from its exact bytes."
+      : service.incumbentMode === "none"
+        ? "This profile stages only a plan: omit incumbent_version_id. The researcher creates the first candidate from scratch."
+        : "This profile requires incumbent_version_id naming the current Session's starting candidate.";
     return [
       `<local_research_mode>`,
       boundary,
-      `This deployment runs dynamic inputs: you author the plan as ordinary research text. Call publish_research_plan with the plan body to publish it as a Session Artifact version, then call start_research with that exact plan_version_id and the incumbent_version_id that this run must start from. The bytes of those two versions - not a copy in the administrator's seed - are staged for the run, and no later version or edit changes what a started run reads. Get version ids with list_artifacts and read_artifact (read_artifact returns the version record, including its id) or from the delivery references get_research returns.`,
+      trigger,
+      `This deployment allows the research task to be chosen from the conversation. The administrator still owns the engine, interpreter, private roots and operational defaults; you own only the scientific contract. Do not supply host paths, an interpreter, model, endpoint, credential or launch commands.`,
+      `Task intake: first call list_research_tasks. If a registered package matches the user's objective, pass its id as task_package_id to start_research and use that package's evaluator and metric unchanged; never silently replace an official scoring contract. If no package matches a sufficiently specified CPU computational task, call prepare_research_task with the complete objective, the artifact path, the metric name and direction, a Python evaluator that prints one JSON object with the finite metric and exits nonzero for invalid artifacts, a valid sample and a domain-violating invalid sample. If the metric is not the top-level "metric" field, pass metric_json_path matching the evaluator's output; the same path drives both the probe and the run. The probe runs through the engine's real evaluator backend, and only an accepted probe publishes a task version; then pass its task version id as task_version_id. A generated evaluator is exploratory, not an authoritative benchmark.`,
+      `If the request lacks a scientific fact, the evaluable objective, the metric or usable data, ask one concise clarification and do not prepare a task or start a run. Do not invent a metric, do not substitute another task and never fall back to a different experiment.`,
+      `A probe sample is a small artifact that satisfies or violates the task's domain constraints; it does not need to be optimal or computed from the data. Do not call shell, subagents or other tools to derive sample values. If workspace code execution is denied or unavailable, that does not block task preparation: the prepare tool runs the evaluator probe itself.`,
+      `Input data: ordinary attached data is already a Session artifact. Pass its artifact version id in input_version_ids for a registered task, or bind it with input_version_ids in prepare_research_task so the contract carries it. Get version ids with list_artifacts and read_artifact. If a named file is missing or unusable, say which input is missing instead of fabricating one.`,
+      `This deployment runs dynamic inputs: you author the plan as ordinary research text. Call publish_research_plan with the plan body to publish it as a Session Artifact version, then call start_research with that exact plan_version_id. ${incumbent} The selected versions' exact bytes are staged for the run, and no later version or edit changes what a started run reads.`,
+      `The research intent you pass to start_research becomes part of the researcher's instruction together with the frozen task contract, the staged plan path and this run's version identities. Write the intent as the concrete research direction of this run.`,
+      observe,
+      delivery,
+      service.incumbentMode === "none"
+        ? `To run again, read the delivered feedback and publish a revised plan. This profile does not stage a prior candidate; do not claim candidate continuation.`
+        : `To continue research, read the delivered result note, the evaluated attempt artifacts and the researcher's records, interpret what the run actually did, then publish a revised plan and start a second run whose incumbent_version_id is a real evaluated candidate version delivered by the earlier run and whose task is the same frozen contract. A candidate delivered under a different or re-prepared task contract is refused. Do not relabel a run as a continuation or reuse the seed while claiming a new candidate. A scientific-contract change is a new task version and a new experiment, not a continuation.`,
+      honesty,
+      `</local_research_mode>`,
+    ].join(" ");
+  }
+  if (service.inputMode === "dynamic") {
+    const incumbent = service.incumbentMode === "optional"
+      ? "This profile allows starting from scratch: omit incumbent_version_id if no candidate exists. Do not ask the user to upload or create a seed. Once an evaluated candidate is delivered, pass its incumbent_version_id to continue from its exact bytes."
+      : service.incumbentMode === "none"
+        ? "This profile stages only a plan: omit incumbent_version_id. The researcher creates the first candidate from scratch."
+        : "This profile requires incumbent_version_id naming the current Session's starting candidate.";
+    return [
+      `<local_research_mode>`,
+      boundary,
+      trigger,
+      `This deployment runs dynamic inputs: you author the plan as ordinary research text. Call publish_research_plan with the plan body to publish it as a Session Artifact version, then call start_research with that exact plan_version_id. ${incumbent} The selected versions' exact bytes are staged for the run, and no later version or edit changes what a started run reads. Get version ids with list_artifacts and read_artifact (read_artifact returns the version record, including its id) or from the delivery references get_research returns.`,
       `The research intent you pass to start_research becomes part of the researcher's instruction, together with the staged plan path and this run's version identities. Write the intent as the concrete research direction of this run. This deployment supports one task package only: if the user asks for a different task family, say that it is unsupported instead of running this task under a misleading label. Never supply host paths, an interpreter, a model, an endpoint, a credential, commands or a task description.`,
       observe,
       delivery,
-      `To continue research, read the delivered result note, the evaluated attempt artifacts and the researcher's records, interpret what the run actually did, then publish a revised plan and start a second run whose incumbent_version_id is a real evaluated candidate version delivered by the earlier run. Do not relabel a run as a continuation or reuse the seed while claiming a new candidate.`,
+      service.incumbentMode === "none"
+        ? `To run again, read the delivered feedback and publish a revised plan. This profile does not stage a prior candidate; do not claim candidate continuation.`
+        : `To continue research, read the delivered result note, the evaluated attempt artifacts and the researcher's records, interpret what the run actually did, then publish a revised plan and start a second run whose incumbent_version_id is a real evaluated candidate version delivered by the earlier run. Do not relabel a run as a continuation or reuse the seed while claiming a new candidate.`,
       honesty,
       `</local_research_mode>`,
     ].join(" ");
@@ -160,6 +288,7 @@ export function localResearchInstructions(service: LocalResearchService): string
   return [
     `<local_research_mode>`,
     boundary,
+    trigger,
     `When the user asks to run the configured experiment, call start_research with a short intent. This profile runs one administrator-configured bounded experiment: its pinned task text is the instruction the researcher executes, and the intent is recorded only as this run's label and as the purpose you report. If you name plan_version_id or incumbent_version_id, they must be this Session's versions whose content is byte-identical to the profile's configured plan/incumbent inputs; a different version is refused before anything runs. Omit them to run the configured fixed inputs. Never supply host paths, an interpreter, a model, an endpoint, a credential, commands or a task description: those are administrator and Session configuration.`,
     observe,
     delivery,
@@ -178,7 +307,7 @@ export function createLocalResearchTools(input: LocalResearchToolInput): AgentTo
   };
 
   const refused = (error: unknown): { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> } => {
-    if (error instanceof LocalResearchRefusal) {
+    if (error instanceof LocalResearchRefusal || error instanceof TaskPreparationRefusal) {
       return result({ error: error.reason, message: error.message });
     }
     throw error;
@@ -187,15 +316,27 @@ export function createLocalResearchTools(input: LocalResearchToolInput): AgentTo
   const start: AgentTool<typeof startParameters> = {
     name: START_RESEARCH_TOOL,
     label: "Start local research",
-    description: service.inputMode === "dynamic"
+    description: service.taskMode === "task-dynamic"
       ? [
-          "Start one bounded experimental ScienceFlow research run for this Session, using a plan and a starting solution you selected from this Session's artifacts.",
-          "Pass plan_version_id (required) and incumbent_version_id (required when the profile stages an incumbent). Their exact bytes are staged for this run; a version that is not a live artifact version of this Session is refused before launch.",
+          "Start one bounded experimental ScienceFlow research run for this Session on the task you selected or prepared.",
+          RESEARCH_START_TRIGGER,
+          "Pass exactly one of task_package_id (a registered package from list_research_tasks) or task_version_id (a task contract version from prepare_research_task). The task's evaluator, metric direction, metric JSON path, artifact path and bound inputs are frozen for the run.",
+          `Pass plan_version_id (required). Incumbent policy: ${service.incumbentMode}. Omit incumbent_version_id for a first run when optional, and provide a real delivered candidate to continue. A candidate delivered under a different or re-prepared task contract is refused.`,
+          "input_version_ids binds this Session's data artifact versions for a registered task; a prepared task already carries its own bound inputs. Selected exact bytes are staged; versions outside this Session are refused before launch.",
+          "The intent becomes part of the researcher's instruction together with the frozen task contract and the staged plan. Business identities only: never paths, interpreter, model, endpoint, credential or commands.",
+          "This is experimental local execution on this host, not the formal Runner sandbox. It returns an operation id at once; observe it with get_research. Do not start the same experiment twice.",
+        ].join(" ")
+      : service.inputMode === "dynamic"
+      ? [
+          "Start one bounded experimental ScienceFlow research run for this Session, using a plan and, when supplied, a starting solution selected from this Session's artifacts.",
+          RESEARCH_START_TRIGGER,
+          `Pass plan_version_id (required). Incumbent policy: ${service.incumbentMode}. Omit incumbent_version_id for a first run when optional, always omit when none, and provide it when required or continuing from a candidate. Selected exact bytes are staged; versions outside this Session are refused before launch.`,
           "The intent becomes part of the researcher's instruction together with the staged plan; write it as this run's concrete research direction. Business identities only: never paths, interpreter, model, endpoint, credential or commands.",
           "This is experimental local execution on this host, not the formal Runner sandbox. It returns an operation id at once; observe it with get_research. Do not start the same experiment twice.",
         ].join(" ")
       : [
           "Start this deployment's one configured bounded experimental ScienceFlow research run for this Session.",
+          RESEARCH_START_TRIGGER,
           "The administrator's pinned task text is the instruction the researcher executes; intent is recorded as this run's label and the purpose you report.",
           "Supply business identities only: intent and, optionally, this Session's plan_version_id and incumbent_version_id, which must exactly match the profile's configured fixed inputs. A different version is refused before launch.",
           "This is experimental local execution on this host, not the formal Runner sandbox. It returns an operation id at once; observe it with get_research. Do not start the same experiment twice.",
@@ -223,6 +364,9 @@ export function createLocalResearchTools(input: LocalResearchToolInput): AgentTo
           intent: parameters.intent,
           ...(parameters.plan_version_id ? { planVersionId: parameters.plan_version_id } : {}),
           ...(parameters.incumbent_version_id ? { incumbentVersionId: parameters.incumbent_version_id } : {}),
+          ...(parameters.task_package_id ? { taskPackageId: parameters.task_package_id } : {}),
+          ...(parameters.task_version_id ? { taskVersionId: parameters.task_version_id } : {}),
+          ...(parameters.input_version_ids?.length ? { inputVersionIds: parameters.input_version_ids } : {}),
           ...(signal ? { signal } : {}),
         });
         return result({
@@ -311,10 +455,86 @@ export function createLocalResearchTools(input: LocalResearchToolInput): AgentTo
     },
   };
 
+  const listTasks: AgentTool<typeof listTasksParameters> = {
+    name: LIST_RESEARCH_TASKS_TOOL,
+    label: "List research tasks",
+    description: [
+      "List the engine's registered task packages with their artifact path and kind, metric name and direction, evaluator entrypoint and benchmark authority.",
+      "Use it to decide whether the user's objective matches an existing package. A matching package's evaluator and scoring contract must be used unchanged; do not create a replacement for it.",
+    ].join(" "),
+    parameters: listTasksParameters,
+    async execute(_toolCallId, _parameters, signal) {
+      signal?.throwIfAborted();
+      try {
+        return result({ tasks: await service.listTasks({ projectId, sessionId }) });
+      } catch (error) {
+        return refused(error);
+      }
+    },
+  };
+
+  const prepareTask: AgentTool<typeof prepareTaskParameters> = {
+    name: PREPARE_RESEARCH_TASK_TOOL,
+    label: "Prepare research task",
+    description: [
+      "Prepare a new computational research task from a scientific objective and publish it as an immutable Session task version.",
+      RESEARCH_START_TRIGGER,
+      "You supply the complete objective, the candidate artifact contract, the metric and its direction, a Python evaluator script, and one valid plus one domain-violating invalid sample artifact. The deployment runs both samples through the engine's real evaluator backend; nothing is published when a sample does not behave as specified.",
+      "Bind ordinary attached data with input_version_ids so the task contract carries those exact bytes. A generated evaluator is exploratory: say so, and never present its score as an authoritative benchmark.",
+      "Samples only need to satisfy or violate the domain contract; they do not need to be optimal or computed from the data. This tool runs the probe itself, so denied workspace shell execution does not block preparation.",
+      "If a scientific fact, the metric or usable data is missing, ask the user instead of inventing it. Returns a task version id for start_research.",
+    ].join(" "),
+    parameters: prepareTaskParameters,
+    async execute(toolCallId, parameters, signal) {
+      signal?.throwIfAborted();
+      try {
+        // Preparing a task runs evaluator code, so it uses the same governed
+        // code-execution permission as starting one. Preparation is not a bypass.
+        await requirePrivilege({
+          resource: service.permissionResource,
+          summary: "Prepare and probe a research task evaluator",
+          toolCallId,
+          ...(signal ? { signal } : {}),
+        });
+        signal?.throwIfAborted();
+        const published = await service.prepareTask({
+          artifactKind: parameters.artifact_kind,
+          artifactPath: parameters.artifact_path,
+          evaluatorSource: parameters.evaluator_source,
+          invalidSample: parameters.invalid_sample,
+          ...(parameters.input_version_ids === undefined
+            ? {}
+            : { inputs: parameters.input_version_ids.map((input) => ({
+                ...(input.file_name ? { fileName: input.file_name } : {}),
+                versionId: input.version_id,
+              })) }),
+          metricDirection: parameters.metric_direction,
+          metricJsonPath: parameters.metric_json_path,
+          metricName: parameters.metric_name,
+          objective: parameters.objective,
+          projectId,
+          runId,
+          sessionId,
+          ...(parameters.slug ? { slug: parameters.slug } : {}),
+          title: parameters.title,
+          validSample: parameters.valid_sample,
+          ...(signal ? { signal } : {}),
+        });
+        return result({
+          task: published,
+          instruction: "The task contract is frozen and its evaluator passed the probe. Publish or reuse a research plan, then call start_research with this contract's taskVersionId as task_version_id.",
+        });
+      } catch (error) {
+        return refused(error);
+      }
+    },
+  };
+
   const publishPlan: AgentTool<typeof publishPlanParameters> = {
     name: PUBLISH_RESEARCH_PLAN_TOOL,
     label: "Publish research plan",
     description: [
+      RESEARCH_START_TRIGGER,
       "Publish the plan text you authored as an ordinary Session Artifact version, and return its stable version id for start_research.",
       "The content is the plan itself (Markdown): the question, the concrete method change, the starting solution, the budget and the acceptance rule. It is stored through the same Artifact, version and content-store path as any other declared artifact, with this Agent run recorded as its origin.",
       "To revise a plan, pass artifact_id and base_version_id together; a stale base is refused instead of overwriting a newer plan. Re-publishing identical bytes returns the version that already holds them. At most 64 KiB.",
@@ -348,7 +568,9 @@ export function createLocalResearchTools(input: LocalResearchToolInput): AgentTo
     },
   };
 
-  return service.inputMode === "dynamic" ? [publishPlan, start, get, stop] : [start, get, stop];
+  return service.taskMode === "task-dynamic"
+    ? [listTasks, prepareTask, publishPlan, start, get, stop]
+    : service.inputMode === "dynamic" ? [publishPlan, start, get, stop] : [start, get, stop];
 }
 
 /** The service view is already public; keep one explicit mapping point. */

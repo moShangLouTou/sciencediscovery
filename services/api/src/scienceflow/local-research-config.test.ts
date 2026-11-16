@@ -252,6 +252,16 @@ test("dynamic input mode names staging destinations and requires a usable templa
     /distinct names/,
   );
   await assert.rejects(load(target, dynamic({ dynamicInputs: {} })), /must be a non-empty relative file name/);
+  const optional = await load(target, dynamic({
+    dynamicInputs: { plan: "experiment_plan.md", incumbent: "start_solution.json", incumbentOptional: true },
+  }));
+  assert.equal(optional?.dynamicInputs?.incumbentOptional, true);
+  await assert.rejects(load(target, dynamic({
+    dynamicInputs: { plan: "experiment_plan.md", incumbentOptional: true },
+  })), /requires an incumbent staging name/);
+  await assert.rejects(load(target, dynamic({
+    dynamicInputs: { plan: "experiment_plan.md", incumbent: "start_solution.json", incumbentOptional: "true" },
+  })), /must be a boolean/);
   await assert.rejects(load(target, dynamic({ seedDir: join(target.root, "missing") })), /supporting-asset directory/);
 });
 
@@ -278,5 +288,51 @@ test("a dynamic task template must fill the placeholders it uses", async (contex
   await assert.rejects(
     dynamic("Read {{plan_file}} for {{research_intent}} from {{incumbent_file}} via {{unknown_token}}.\n"),
     /unsupported placeholder/,
+  );
+});
+
+test("task-dynamic mode replaces the fixed task instead of keeping it as a default", async (context) => {
+  const target = await fixture(context);
+  const preparation = join(target.root, "preparation.py");
+  await writeFile(preparation, "print('{}')\n", "utf8");
+  const dynamic = (overrides: Record<string, unknown> = {}) => load(target, configValue(target, {
+    research: {
+      ...(configValue(target).research as Record<string, unknown>),
+      dynamicInputs: { incumbent: "start_solution.json", incumbentOptional: true, plan: "experiment_plan.md" },
+      inputs: undefined,
+      inputMode: "dynamic",
+      preparationScriptPath: preparation,
+      task: undefined,
+      taskDescriptionPath: undefined,
+      taskMode: "task-dynamic",
+      ...overrides,
+    },
+  }));
+  const settings = await dynamic();
+  assert.equal(settings?.taskMode, "task-dynamic");
+  assert.equal(settings?.task, undefined);
+  assert.equal(settings?.preparationScriptPath, preparation);
+  assert.equal(settings?.evaluatorProbeTimeoutSec, 60);
+  assert.equal(settings?.dynamicInputs?.incumbentOptional, true);
+  // A leftover fixed task or fixed task text would silently shape the wrong run.
+  await assert.rejects(dynamic({ task: "circle-packing" }), /must be omitted in task-dynamic mode/);
+  await assert.rejects(dynamic({ taskDescriptionPath: join(target.root, "task.txt") }), /not valid in task-dynamic mode/);
+  await assert.rejects(
+    dynamic({ preparationScriptPath: undefined, taskMode: "task-dynamic" }),
+    /preparationScriptPath must name a readable file/,
+  );
+  // Task choice still needs a plan/incumbent policy from dynamic inputs.
+  await assert.rejects(
+    load(target, configValue(target, {
+      research: {
+        ...(configValue(target).research as Record<string, unknown>),
+        inputMode: "fixed",
+        preparationScriptPath: preparation,
+        task: undefined,
+        taskDescriptionPath: undefined,
+        taskMode: "task-dynamic",
+      },
+    })),
+    /requires research.inputMode "dynamic"/,
   );
 });

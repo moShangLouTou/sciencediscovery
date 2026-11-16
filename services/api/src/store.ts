@@ -42,6 +42,7 @@ import { ConfigurationRepository } from "./configuration/repository.js";
 import { ConfigurationCredentialBridge } from "./configuration/credential-bridge.js";
 import { ScienceFlowRegistrationRepository } from "./scienceflow/registration-repository.js";
 import { ScienceFlowLocalResearchRepository } from "./scienceflow/local-research-repository.js";
+import { PreparedTaskValidationRepository } from "./scienceflow/local-research-task-repository.js";
 import { ScienceFlowExecutionPlanRepository } from "./scienceflow/execution-plan-repository.js";
 import { ScienceFlowRuntimeCheckRepository } from "./scienceflow/runtime-check-repository.js";
 import { ScienceFlowPreparedInputsRepository } from "./scienceflow/prepared-inputs-repository.js";
@@ -643,6 +644,7 @@ export class SessionStore {
   private scienceFlowRuntimeCheckStore?: ScienceFlowRuntimeCheckRepository;
   private scienceFlowPreparedInputsStore?: ScienceFlowPreparedInputsRepository;
   private scienceFlowLocalResearchStore?: ScienceFlowLocalResearchRepository;
+  private scienceFlowPreparedTaskValidationStore?: PreparedTaskValidationRepository;
   private loaded = false;
   private saveQueue = Promise.resolve();
   /** Physical reclamation outlives the request that asked for it; deletes queue
@@ -729,6 +731,14 @@ export class SessionStore {
   get scienceFlowResearchOperations(): ScienceFlowLocalResearchRepository {
     if (!this.scienceFlowLocalResearchStore) throw new Error("ScienceFlow local research storage is not initialized");
     return this.scienceFlowLocalResearchStore;
+  }
+
+  /** The probes a prepared task version actually passed. */
+  get scienceFlowPreparedTaskValidations(): PreparedTaskValidationRepository {
+    if (!this.scienceFlowPreparedTaskValidationStore) {
+      throw new Error("ScienceFlow prepared task validation storage is not initialized");
+    }
+    return this.scienceFlowPreparedTaskValidationStore;
   }
 
   get transfers(): WorkspaceTransfers {
@@ -893,6 +903,7 @@ export class SessionStore {
     this.scienceFlowRuntimeCheckStore = new ScienceFlowRuntimeCheckRepository(this.database);
     this.scienceFlowPreparedInputsStore = new ScienceFlowPreparedInputsRepository(this.database);
     this.scienceFlowLocalResearchStore = new ScienceFlowLocalResearchRepository(this.database);
+    this.scienceFlowPreparedTaskValidationStore = new PreparedTaskValidationRepository(this.database);
     this.secretKey = await this.loadOrCreateSecretKey();
     this.migrateRemoteHostTokens();
     const modelIdsWithSecrets = new Set((this.database.prepare("SELECT model_id FROM model_secrets").all() as Array<{ model_id: string }>).map((row) => row.model_id));
@@ -1620,6 +1631,9 @@ export class SessionStore {
     if (exists("science_flow_runtime_checks")) this.scienceFlowRuntimeCheckStore?.deleteSession(sessionId);
     if (exists("science_flow_prepared_inputs")) this.scienceFlowPreparedInputsStore?.deleteSession(sessionId);
     if (exists("science_flow_local_research_operations")) this.scienceFlowLocalResearchStore?.deleteSession(sessionId);
+    if (exists("science_flow_prepared_task_validations")) {
+      this.scienceFlowPreparedTaskValidationStore?.deleteSession(sessionId);
+    }
   }
 
 
@@ -6240,6 +6254,7 @@ export class SessionStore {
     this.scienceFlowRuntimeCheckStore?.deleteProject(projectId);
     this.scienceFlowPreparedInputsStore?.deleteProject(projectId);
     this.scienceFlowLocalResearchStore?.deleteProject(projectId);
+    this.scienceFlowPreparedTaskValidationStore?.deleteProject(projectId);
     for (const session of sessions) {
       this.database?.prepare("DELETE FROM specialist_runtime_secrets WHERE session_id IN (?, ?, ?)").run(session.id, `claude-code:${session.id}`, `acp:${session.id}`);
       this.database?.prepare("DELETE FROM connector_configuration_requests WHERE session_id = ?").run(session.id);

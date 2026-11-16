@@ -62,6 +62,17 @@ export const SCIENCE_FLOW_LOCAL_RESEARCH_INPUT_NAME_MAX_LENGTH = 200;
  */
 export type ScienceFlowLocalResearchInputMode = "fixed" | "dynamic";
 
+/**
+ * How the engine task is chosen for a run.
+ *
+ * `fixed` is the pre-round-26 behaviour: one task package named by the profile.
+ * `task-dynamic` keeps the engine, interpreter and operational defaults under
+ * the administrator but lets the conversation select a registered task package
+ * or prepare a new task contract for this Session. It never falls back to the
+ * profile's old task: a start must name the task it runs.
+ */
+export type ScienceFlowLocalResearchTaskMode = "fixed" | "task-dynamic";
+
 /** Operational defaults for one research run. */
 export interface ScienceFlowLocalResearchDefaults {
   readonly researchBudgetSec: number;
@@ -83,8 +94,17 @@ export interface ScienceFlowLocalResearchSettings {
   readonly engineCheckout: string;
   readonly pythonExecutable: string;
   readonly readerScriptPath: string;
-  /** The single engine task package this mode can run. */
-  readonly task: string;
+  /** The single engine task package this mode can run. Absent only in task-dynamic mode. */
+  readonly task?: string;
+  /** `fixed` unless the administrator lets the conversation choose or prepare the task. */
+  readonly taskMode?: ScienceFlowLocalResearchTaskMode;
+  /**
+   * The narrow engine adapter used to list task packages and to run evaluator
+   * probes through the engine's own backend. Present in task-dynamic mode.
+   */
+  readonly preparationScriptPath?: string;
+  /** Absolute bound for one evaluator probe, matching the engine's own default. */
+  readonly evaluatorProbeTimeoutSec?: number;
   /** Fixed seed directory the administrator staged for the task. In dynamic mode
    *  it is the read-only root of supporting assets, never the plan or incumbent. */
   readonly seedDir: string;
@@ -131,6 +151,8 @@ export interface ScienceFlowLocalResearchInputs {
 export interface ScienceFlowLocalResearchDynamicInputs {
   readonly plan: string;
   readonly incumbent?: string;
+  /** Allow a first run without a candidate, and stage one on continuation. */
+  readonly incumbentOptional?: boolean;
 }
 
 const DEFAULT_DEFAULTS: ScienceFlowLocalResearchDefaults = {
@@ -196,10 +218,13 @@ export function loadScienceFlowLocalResearchConfig(
     throw configError("is not valid JSON");
   }
 
-  return parseConfig(value);
+  return parseConfig(value, repositoryRoot);
 }
 
-function parseConfig(value: unknown): ScienceFlowLocalResearchSettings | undefined {
+function parseConfig(
+  value: unknown,
+  repositoryRoot: string,
+): ScienceFlowLocalResearchSettings | undefined {
   if (!isRecord(value)) throw configError("must be a JSON object");
   rejectUnknownKeys(value, ["schemaVersion", "enabled", "research", "defaults"], "");
   if (value.schemaVersion !== SCIENCE_FLOW_LOCAL_RESEARCH_CONFIG_SCHEMA_VERSION) {
@@ -212,12 +237,13 @@ function parseConfig(value: unknown): ScienceFlowLocalResearchSettings | undefin
   // read: a disabled deployment holds no profile to validate.
   if (value.enabled !== true) return undefined;
   const defaults = parseDefaults(value.defaults);
-  return parseResearch(value.research, defaults);
+  return parseResearch(value.research, defaults, repositoryRoot);
 }
 
 function parseResearch(
   value: unknown,
   defaults: ScienceFlowLocalResearchDefaults,
+  repositoryRoot: string,
 ): ScienceFlowLocalResearchSettings {
   if (!isRecord(value)) throw configError("research must be an object");
   rejectUnknownKeys(
@@ -228,6 +254,9 @@ function parseResearch(
       "pythonExecutable",
       "readerScriptPath",
       "task",
+      "taskMode",
+      "preparationScriptPath",
+      "evaluatorProbeTimeoutSec",
       "seedDir",
       "inputMode",
       "inputs",
@@ -243,13 +272,19 @@ function parseResearch(
   const engineCheckout = requireAbsolutePath(value.engineCheckout, "research.engineCheckout");
   const pythonExecutable = requireAbsolutePath(value.pythonExecutable, "research.pythonExecutable");
   const readerScriptPath = requireAbsolutePath(value.readerScriptPath, "research.readerScriptPath");
-  const task = requireTaskId(value.task, "research.task");
+  const taskMode = parseTaskMode(value.taskMode);
+  const task = taskMode === "task-dynamic"
+    ? requireAbsentTask(value.task)
+    : requireTaskId(value.task, "research.task");
   const seedDir = requireAbsolutePath(value.seedDir, "research.seedDir");
   const inputMode = parseInputMode(value.inputMode);
   const inputs = inputMode === "fixed" ? parseInputs(value.inputs, seedDir) : undefined;
   const dynamicInputs = inputMode === "dynamic"
     ? parseDynamicInputs(value.dynamicInputs, value.inputs, seedDir)
     : undefined;
+  if (taskMode === "task-dynamic" && dynamicInputs === undefined) {
+    throw configError('task-dynamic mode requires research.inputMode "dynamic" with research.dynamicInputs');
+  }
   const workRoot = requireAbsolutePath(value.workRoot, "research.workRoot");
   const privateRoot = requireAbsolutePath(value.privateRoot, "research.privateRoot");
   // Generated credentials live under privateRoot and the engine writes under
@@ -266,6 +301,11 @@ function parseResearch(
     : readTaskDescription(
         requireAbsolutePath(value.taskDescriptionPath, "research.taskDescriptionPath"),
       );
+  if (taskMode === "task-dynamic" && rawTaskText !== undefined) {
+    throw configError(
+      "research.taskDescriptionPath is fixed-task configuration and is not valid in task-dynamic mode",
+    );
+  }
   // Fixed mode pins the text as-is. Dynamic mode treats the same file as a
   // template whose placeholders name the staged inputs of one operation; a
   // placeholder this loader does not fill is a configuration error, so nothing
@@ -273,10 +313,24 @@ function parseResearch(
   const taskTemplate = rawTaskText !== undefined && dynamicInputs !== undefined
     ? requireTaskTemplate(rawTaskText, dynamicInputs)
     : undefined;
-  if (inputMode === "dynamic" && taskTemplate === undefined) {
+  if (taskMode === "fixed" && inputMode === "dynamic" && taskTemplate === undefined) {
     throw configError("research.taskDescriptionPath is required in dynamic input mode");
   }
   const taskDescription = inputMode === "dynamic" ? undefined : rawTaskText;
+  const preparationScriptPath = taskMode === "task-dynamic"
+    ? requirePreparationScript(
+        value.preparationScriptPath === undefined
+          ? resolve(repositoryRoot, "services", "scienceflow-preparation", "preparation.py")
+          : requireAbsolutePath(value.preparationScriptPath, "research.preparationScriptPath"),
+      )
+    : value.preparationScriptPath === undefined
+      ? undefined
+      : requirePreparationScript(
+          requireAbsolutePath(value.preparationScriptPath, "research.preparationScriptPath"),
+        );
+  const evaluatorProbeTimeoutSec = value.evaluatorProbeTimeoutSec === undefined
+    ? 60
+    : requireInteger(value.evaluatorProbeTimeoutSec, "research.evaluatorProbeTimeoutSec", 5, 600);
   const refusePackageInstall = value.refusePackageInstall === undefined
     ? true
     : requireBoolean(value.refusePackageInstall, "research.refusePackageInstall");
@@ -285,7 +339,10 @@ function parseResearch(
     engineCheckout,
     pythonExecutable,
     readerScriptPath,
-    task,
+    ...(task === undefined ? {} : { task }),
+    taskMode,
+    ...(preparationScriptPath === undefined ? {} : { preparationScriptPath }),
+    evaluatorProbeTimeoutSec,
     seedDir,
     inputMode,
     ...(inputs === undefined ? {} : { inputs }),
@@ -297,6 +354,39 @@ function parseResearch(
     refusePackageInstall,
     defaults,
   });
+}
+
+function parseTaskMode(value: unknown): ScienceFlowLocalResearchTaskMode {
+  if (value === undefined) return "fixed";
+  if (value !== "fixed" && value !== "task-dynamic") {
+    throw configError('research.taskMode must be "fixed" or "task-dynamic"');
+  }
+  return value;
+}
+
+/**
+ * In task-dynamic mode the profile must not name a task: a start that runs the
+ * profile's old task after the conversation chose another objective would be a
+ * silent scientific substitution.
+ */
+function requireAbsentTask(value: unknown): undefined {
+  if (value !== undefined) {
+    throw configError("research.task is fixed-task configuration and must be omitted in task-dynamic mode");
+  }
+  return undefined;
+}
+
+function requirePreparationScript(path: string): string {
+  let stats: ReturnType<typeof statSync>;
+  try {
+    stats = statSync(path);
+  } catch {
+    throw configError("research.preparationScriptPath must name a readable file");
+  }
+  if (!stats.isFile()) {
+    throw configError("research.preparationScriptPath must name a regular file");
+  }
+  return path;
 }
 
 function parseInputMode(value: unknown): ScienceFlowLocalResearchInputMode {
@@ -322,7 +412,7 @@ function parseDynamicInputs(
     throw configError("research.inputs is only valid in fixed input mode");
   }
   if (!isRecord(value)) throw configError("research.dynamicInputs must be an object in dynamic input mode");
-  rejectUnknownKeys(value, ["plan", "incumbent"], "research.dynamicInputs");
+  rejectUnknownKeys(value, ["plan", "incumbent", "incumbentOptional"], "research.dynamicInputs");
   let seedStats: ReturnType<typeof statSync>;
   try {
     seedStats = statSync(seedDir);
@@ -336,10 +426,20 @@ function parseDynamicInputs(
   const incumbent = value.incumbent === undefined
     ? undefined
     : requireStagedName(value.incumbent, "research.dynamicInputs.incumbent");
+  const incumbentOptional = value.incumbentOptional === undefined
+    ? undefined
+    : requireBoolean(value.incumbentOptional, "research.dynamicInputs.incumbentOptional");
+  if (incumbentOptional === true && incumbent === undefined) {
+    throw configError("research.dynamicInputs.incumbentOptional requires an incumbent staging name");
+  }
   if (incumbent !== undefined && incumbent === plan) {
     throw configError("research.dynamicInputs must give the plan and the incumbent distinct names");
   }
-  return Object.freeze({ plan, ...(incumbent === undefined ? {} : { incumbent }) });
+  return Object.freeze({
+    plan,
+    ...(incumbent === undefined ? {} : { incumbent }),
+    ...(incumbentOptional === undefined ? {} : { incumbentOptional }),
+  });
 }
 
 /**

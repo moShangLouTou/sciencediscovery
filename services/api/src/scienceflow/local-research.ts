@@ -43,6 +43,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { CasStore } from "@sciencediscovery/cas";
+import type { ArtifactOrigin, ArtifactOriginMeta, ScientificArtifact, ScientificArtifactVersion } from "@sciencediscovery/schema";
 import type {
   ReadScienceFlowRunSnapshotOptions,
   ScienceFlowSnapshotReadResult,
@@ -63,8 +64,32 @@ import {
   InputPreparationRefusal,
   sha256,
   stageResearchOperationInputs,
+  type StagedDataSelection,
   type StagedInputSelection,
 } from "./local-research-inputs.js";
+import {
+  TaskPreparationRefusal,
+  composeTaskInstruction,
+  describeCatalogTask,
+  isUsableTaskId,
+  listCatalogTasks,
+  probePreparedEvaluator,
+  taskSummary,
+  type PreparedTaskInputBinding,
+  type ScienceFlowCatalogTask,
+  type ScienceFlowCatalogTaskDescription,
+  type ScienceFlowTaskBinding,
+  type TaskPreparationSettings,
+} from "./local-research-task.js";
+import {
+  materializePreparedTaskAssets,
+  prepareResearchTask,
+  preparedTaskBinding,
+  readPreparedTaskVersion,
+  type PrepareTaskInput,
+  type PreparedTaskPublication,
+} from "./local-research-task-service.js";
+import type { PreparedTaskValidationStore } from "./local-research-task-repository.js";
 import {
   publishResearchPlan,
   ResearchPlanRefusal,
@@ -137,7 +162,9 @@ export type LocalResearchRefusalReason =
   | "plan-text-invalid"
   | "plan-not-found"
   | "plan-version-mismatch"
-  | "plan-publication-failed";
+  | "plan-publication-failed"
+  | "continuation-task-mismatch"
+  | "continuation-provenance-unknown";
 
 /** A refusal with a stable reason; messages never carry a credential or path. */
 export class LocalResearchRefusal extends Error {
@@ -152,6 +179,8 @@ export class LocalResearchRefusal extends Error {
 /** The store surface this service uses. `SessionStore` satisfies it. */
 export interface LocalResearchServiceStore extends ResearchPilotReadbackStore {
   readonly scienceFlowResearchOperations: ScienceFlowLocalResearchStore;
+  /** The trusted preflight record a prepared task version must match. */
+  readonly scienceFlowPreparedTaskValidations: PreparedTaskValidationStore;
   readonly dataDir: string;
   /** The owning conversation run's status, used to refuse a late launch. */
   readonly getSessionRun?: (
@@ -162,6 +191,7 @@ export interface LocalResearchServiceStore extends ResearchPilotReadbackStore {
     readonly artifactId: string;
     readonly content: { readonly hash: string; readonly size: number };
     readonly id: string;
+    readonly sessionId?: string;
     readonly version: number;
   } | undefined;
   readonly getProjectArtifact: (projectId: string, artifactId: string) => {
@@ -170,12 +200,31 @@ export interface LocalResearchServiceStore extends ResearchPilotReadbackStore {
     readonly deletedAt?: string;
     readonly id: string;
     readonly kind: string;
+    readonly logicalName?: string;
+    readonly name?: string;
     readonly origin?: string;
+    readonly originMeta?: ArtifactOriginMeta;
   } | undefined;
   /** The plan-publication surface: the same catalog the artifact tools write. */
   readonly getArtifactByName: ResearchPlanStore["getArtifactByName"];
   readonly listProjectArtifactVersions: ResearchPlanStore["listProjectArtifactVersions"];
-  readonly createArtifactVersion: ResearchPlanStore["createArtifactVersion"];
+  readonly createArtifactVersion: (input: {
+    readonly artifactId?: string;
+    readonly baseVersionId?: string;
+    readonly content: { readonly hash: string; readonly size: number };
+    readonly description?: string;
+    readonly forceNewArtifact?: boolean;
+    readonly kind: "json" | "markdown" | "other";
+    readonly logicalName: string;
+    readonly mediaType: string;
+    readonly origin?: ArtifactOrigin;
+    readonly originMeta?: ArtifactOriginMeta;
+    readonly sessionId: string;
+    readonly title?: string;
+  }) => Promise<{
+    readonly artifact: ScientificArtifact;
+    readonly version: ScientificArtifactVersion;
+  }>;
 }
 
 export interface LocalResearchStartInput {
@@ -186,9 +235,18 @@ export interface LocalResearchStartInput {
   readonly intent: string;
   readonly planVersionId?: string;
   readonly incumbentVersionId?: string;
+  /** Task-dynamic mode: a registered engine task package to run. */
+  readonly taskPackageId?: string;
+  /** Task-dynamic mode: a Session-prepared task contract version to run. */
+  readonly taskVersionId?: string;
+  /** Task-dynamic + catalog: ordinary Session data versions bound as input. */
+  readonly inputVersionIds?: readonly string[];
   /** The tool's abort signal: a cancelled conversation must not reach a launch. */
   readonly signal?: AbortSignal;
 }
+
+/** A task-contract preparation request authored by the Agent. */
+export type LocalResearchTaskPrepareInput = PrepareTaskInput;
 
 export interface LocalResearchPlanInput {
   readonly projectId: string;
@@ -224,6 +282,24 @@ export interface ScienceFlowLocalResearchView {
   readonly updatedAt: string;
   readonly planVersionId: string | null;
   readonly incumbentVersionId: string | null;
+  /** The task identity this operation actually ran, when one was selected. */
+  readonly taskIdentity?: {
+    readonly source: "catalog" | "prepared";
+    readonly taskId: string;
+    readonly title: string;
+    readonly taskVersionId: string | null;
+    readonly metricName: string;
+    readonly metricType: string;
+    /** Dotted stdout path of the metric; null for a package evaluator. */
+    readonly metricJsonPath: string | null;
+    readonly lowerIsBetter: boolean | null;
+    readonly authoritative: boolean;
+    readonly artifactPath: string;
+    readonly artifactKind: string;
+    readonly evaluatorKind: "task-package" | "generated-command";
+    readonly evaluatorSha256: string | null;
+    readonly summary: string;
+  };
   readonly inputMode: "fixed" | "dynamic";
   /** The fixed input bytes this run used, including the verified version id. */
   readonly inputs: readonly ScienceFlowLocalResearchInput[];
@@ -275,6 +351,12 @@ export interface LocalResearchServiceDependencies {
   readonly now?: () => string;
   readonly newOperationId?: () => string;
   readonly sleep?: (ms: number) => Promise<void>;
+  /** The real task-catalog adapter; tests substitute a stub. */
+  readonly listTasks?: typeof listCatalogTasks;
+  /** The real task-description adapter; tests substitute a stub. */
+  readonly describeTask?: typeof describeCatalogTask;
+  /** The real evaluator probe; tests substitute a stub. */
+  readonly probeTask?: typeof probePreparedEvaluator;
 }
 
 export interface LocalResearchService {
@@ -283,8 +365,15 @@ export interface LocalResearchService {
   readonly permissionResource: string;
   /** `fixed` unless the administrator enabled Session-supplied inputs. */
   readonly inputMode: "fixed" | "dynamic";
+  readonly incumbentMode: "none" | "optional" | "required";
+  /** `fixed` unless the administrator enabled conversation-chosen tasks. */
+  readonly taskMode: "fixed" | "task-dynamic";
   /** Upper bound for one bounded observation wait a tool may request. */
   readonly observeMaxWaitMs: number;
+  /** The engine's registered task packages. Task-dynamic mode only. */
+  listTasks(input: { readonly projectId: string; readonly sessionId: string }): Promise<readonly ScienceFlowCatalogTask[]>;
+  /** Prepare a new task contract version from a scientific objective. */
+  prepareTask(input: LocalResearchTaskPrepareInput): Promise<PreparedTaskPublication>;
   start(input: LocalResearchStartInput): Promise<LocalResearchStartOutcome>;
   get(
     input: LocalResearchOperationInput,
@@ -381,6 +470,19 @@ export function createLocalResearchService(input: {
     // reads the administrator's seed, exactly as before.
     seedDir: record.stagedInputs?.dataDir ?? record.launch.seedDir,
     task: record.task,
+    ...(record.taskBinding?.source === "prepared" && record.taskBinding.assetDir !== undefined
+      && record.taskBinding.lowerIsBetter !== null
+      ? { evaluator: {
+          artifactKind: record.taskBinding.artifactKind,
+          artifactPath: record.taskBinding.artifactPath,
+          commandPath: join(record.taskBinding.assetDir, "evaluator.py"),
+          lowerIsBetter: record.taskBinding.lowerIsBetter,
+          metricJsonPath: record.taskBinding.metricJsonPath ?? "metric",
+          metricName: record.taskBinding.metricName,
+          pythonExecutable: record.launch.pythonExecutable,
+          timeoutSec: 120,
+        } }
+      : {}),
     ...(record.launch.taskDescription !== undefined
       ? { taskDescription: record.launch.taskDescription }
       : settings.taskDescription
@@ -613,6 +715,15 @@ export function createLocalResearchService(input: {
         pythonExecutable: record.launch.pythonExecutable,
         readerScriptPath: record.launch.readerScriptPath,
         task: record.task,
+        ...(record.taskBinding
+          ? {
+              evaluatorAuthority: record.taskBinding.source === "prepared" ? "generated-command" as const : "task-package" as const,
+              taskSummary: record.taskBinding.summary,
+              ...(record.taskBinding.source === "prepared" && record.taskBinding.evaluator.kind === "generated-command"
+                ? { evaluatorSha256: record.taskBinding.evaluator.sha256 }
+                : {}),
+            }
+          : {}),
         ...(record.planVersionId ? { planVersionId: record.planVersionId } : {}),
         ...(record.incumbentVersionId ? { incumbentVersionId: record.incumbentVersionId } : {}),
         includeAttempts: true,
@@ -665,10 +776,19 @@ export function createLocalResearchService(input: {
             versionId: input.versionId,
           }]
         : []);
+    // A selected or prepared task may bind ordinary Session data files; they are
+    // staged beside the plan and incumbent so the engine's dataset holds exactly
+    // the bytes this operation froze.
+    const data: StagedDataSelection[] = (record.taskBinding?.inputs ?? []).map((binding) => ({
+      logicalName: binding.logicalName,
+      sha256: binding.sha256,
+      size: binding.size,
+      versionId: binding.versionId,
+    }));
     const destination = join(record.workDir, "input");
     const manifestPath = join(record.workDir, "input-manifest.json");
     try {
-      if (roles.length === 0) {
+      if (roles.length === 0 && data.length === 0) {
         throw new InputPreparationRefusal("staging-failed", "This operation has no accepted input to stage");
       }
       // The operation's own work dir may not exist yet; the input directory
@@ -680,6 +800,7 @@ export function createLocalResearchService(input: {
         destination,
         readBytes: readArtifactBytes,
         roles,
+        ...(data.length ? { data } : {}),
         signal,
       }, now);
       await writeFile(manifestPath, staged.manifestJson, "utf8");
@@ -726,6 +847,52 @@ export function createLocalResearchService(input: {
                 : errorMessage(error),
             },
           });
+      return undefined;
+    }
+  };
+
+  /**
+   * Freeze a prepared task's evaluator and contract into this operation's own
+   * directory. The contract body is re-read and its digest must equal the one
+   * frozen at start, so a task version edited after acceptance cannot change
+   * what this run executes.
+   */
+  const stageTaskAssets = async (
+    record: ScienceFlowLocalResearchOperation,
+  ): Promise<ScienceFlowLocalResearchOperation | undefined> => {
+    const binding = record.taskBinding;
+    if (!binding || binding.source !== "prepared") return record;
+    if (binding.assetDir !== undefined) return record;
+    if (binding.taskVersionId === undefined || binding.contractHash === undefined) {
+      mutate(record.operationId, (current) => ({
+        ...current,
+        state: "failed",
+        error: { step: "task", message: "The prepared task version is incomplete" },
+      }));
+      return undefined;
+    }
+    try {
+      const assets = await materializePreparedTaskAssets(store, { readBytes: readArtifactBytes }, {
+        contractHash: binding.contractHash,
+        projectId: record.identity.projectId,
+        sessionId: record.identity.sessionId,
+        targetDir: join(record.workDir, "task"),
+        taskVersionId: binding.taskVersionId,
+      });
+      return mutate(record.operationId, (current) => ({
+        ...current,
+        taskBinding: {
+          ...binding,
+          assetDir: join(record.workDir, "task"),
+          assetManifestSha256: assets.manifestSha256,
+        },
+      }));
+    } catch (error) {
+      mutate(record.operationId, (current) => ({
+        ...current,
+        state: "failed",
+        error: { step: "task", message: errorMessage(error) },
+      }));
       return undefined;
     }
   };
@@ -807,6 +974,9 @@ export function createLocalResearchService(input: {
           }));
           return;
         }
+        const withAssets = await stageTaskAssets(current);
+        if (!withAssets) return;
+        current = withAssets;
       }
       mutate(operationId, (record) => ({ ...record, state: "running" }));
       const receipt = await runResearchPilot(store, pilotRequest(current), {
@@ -867,6 +1037,26 @@ export function createLocalResearchService(input: {
     updatedAt: record.updatedAt,
     planVersionId: record.planVersionId ?? null,
     incumbentVersionId: record.incumbentVersionId ?? null,
+    ...(record.taskBinding
+      ? { taskIdentity: {
+          artifactKind: record.taskBinding.artifactKind,
+          artifactPath: record.taskBinding.artifactPath,
+          authoritative: record.taskBinding.authoritative,
+          evaluatorKind: record.taskBinding.evaluator.kind,
+          evaluatorSha256: record.taskBinding.evaluator.kind === "generated-command"
+            ? record.taskBinding.evaluator.sha256
+            : null,
+          lowerIsBetter: record.taskBinding.lowerIsBetter,
+          metricJsonPath: record.taskBinding.metricJsonPath ?? null,
+          metricName: record.taskBinding.metricName,
+          metricType: record.taskBinding.metricType,
+          source: record.taskBinding.source,
+          summary: record.taskBinding.summary,
+          taskId: record.taskBinding.taskId,
+          taskVersionId: record.taskBinding.taskVersionId ?? null,
+          title: record.taskBinding.title,
+        } }
+      : {}),
     inputMode: record.launch.inputMode ?? "fixed",
     inputs: record.inputs ?? [],
     model: record.launch.model,
@@ -885,11 +1075,14 @@ export function createLocalResearchService(input: {
   const idempotencyKey = (request: LocalResearchStartInput): string => createHash("sha256")
     .update(JSON.stringify({
       incumbentVersionId: request.incumbentVersionId ?? null,
+      inputVersionIds: request.inputVersionIds ?? [],
       intent: request.intent,
       ownerRunId: request.ownerRunId,
       planVersionId: request.planVersionId ?? null,
       projectId: request.projectId,
       sessionId: request.sessionId,
+      taskPackageId: request.taskPackageId ?? null,
+      taskVersionId: request.taskVersionId ?? null,
     }))
     .digest("hex");
 
@@ -968,8 +1161,10 @@ export function createLocalResearchService(input: {
    * and the version's content is byte-identical to the configured seed file; a
    * start never runs the old seed while linking a different version to it.
    *
-   * Dynamic mode requires a live same-Session version for every staged role and
-   * freezes its verified digest and staging name: the bytes are then staged into
+   * Dynamic mode requires a live same-Session version for each supplied role
+   * (and always for the plan). An optional incumbent may be omitted on a first
+   * run. Every supplied version still passes the same ownership and CAS checks,
+   * freezing its verified digest and staging name: the bytes are then staged into
    * this operation's own directory, so a later version, profile edit or rebuild
    * cannot change what runs.
    */
@@ -998,6 +1193,7 @@ export function createLocalResearchService(input: {
         }
         const versionId = named[role];
         if (!versionId) {
+          if (role === "incumbent" && dynamic.incumbentOptional === true) continue;
           throw new LocalResearchRefusal(
             "link-version-missing",
             `This research profile runs ${role === "plan" ? "a plan" : "an incumbent"} you select; pass its version id`,
@@ -1045,12 +1241,263 @@ export function createLocalResearchService(input: {
     return status === "cancelled" || status === "interrupted";
   };
 
+  /** The engine adapter settings; present only when the profile enables task choice. */
+  const preparation: TaskPreparationSettings | undefined = settings.taskMode === "task-dynamic"
+    ? {
+        engineCheckout: settings.engineCheckout,
+        preparationScriptPath: settings.preparationScriptPath!,
+        probeTimeoutSec: settings.evaluatorProbeTimeoutSec ?? 60,
+        pythonExecutable: settings.pythonExecutable,
+      }
+    : undefined;
+
+  const requireTaskDynamic = (): TaskPreparationSettings => {
+    if (!preparation) {
+      throw new LocalResearchRefusal(
+        "invalid-option",
+        "This research profile runs one fixed administrator task; it does not accept a task choice",
+      );
+    }
+    return preparation;
+  };
+
+  /** Both task-intake reads prove the caller's identity before any engine call. */
+  const assertSessionIdentity = (projectId: string, sessionId: string): void => {
+    if (!store.getProject(projectId)) {
+      throw new LocalResearchRefusal("project-not-found", "The Project does not exist");
+    }
+    const session = store.getSession(sessionId);
+    if (!session || session.projectId !== projectId) {
+      throw new LocalResearchRefusal("session-not-found", "The Session does not exist in this Project");
+    }
+  };
+
+  /**
+   * Bind ordinary Session artifact versions as task input data. Every version is
+   * checked to belong to this Session and its bytes are re-hashed, so the input
+   * the task contract records is the input the run later stages.
+   */
+  const resolveDataInputs = async (
+    projectId: string,
+    sessionId: string,
+    versionIds: readonly string[] | undefined,
+  ): Promise<readonly PreparedTaskInputBinding[]> => {
+    const bindings: PreparedTaskInputBinding[] = [];
+    for (const versionId of versionIds ?? []) {
+      if (bindings.length >= 16) {
+        throw new LocalResearchRefusal("invalid-option", "Too many task input versions");
+      }
+      const version = store.getProjectArtifactVersion(projectId, versionId);
+      const artifact = version ? store.getProjectArtifact(projectId, version.artifactId) : undefined;
+      // An upload in this Session may append a version to an artifact first
+      // created by an earlier Session in the same Project. The data is still this
+      // Session's bytes, so either the artifact or the version may establish
+      // ownership; a version created elsewhere is refused.
+      const ownsArtifact = artifact !== undefined && artifact.deletedAt === undefined
+        && artifact.createdInSessionId === sessionId;
+      const ownsVersion = version !== undefined && version.sessionId === sessionId;
+      if (!version || !artifact || artifact.deletedAt || (!ownsArtifact && !ownsVersion)) {
+        throw new LocalResearchRefusal(
+          "link-version-not-found",
+          "A task input is not a live artifact version of this Session",
+        );
+      }
+      const logicalName = (artifact?.logicalName ?? "").split("/").at(-1) ?? "";
+      if (!logicalName || bindings.some((binding) => binding.logicalName === logicalName)) {
+        throw new LocalResearchRefusal("invalid-option", "Two task inputs would be staged under the same name");
+      }
+      const bytes = await readArtifactBytes(version.content.hash).catch(() => undefined);
+      if (!bytes) {
+        throw new LocalResearchRefusal("link-version-unreadable", "A task input version is unreadable");
+      }
+      if (sha256(bytes) !== version.content.hash || bytes.length !== version.content.size) {
+        throw new LocalResearchRefusal("link-version-unreadable", "A task input version no longer matches its digest");
+      }
+      bindings.push({ logicalName, sha256: version.content.hash, size: bytes.length, versionId: version.id });
+    }
+    return bindings;
+  };
+
+  interface TaskSelection {
+    readonly binding: ScienceFlowTaskBinding;
+    readonly objective: string;
+    readonly prepared: boolean;
+    readonly taskId: string;
+  }
+
+  /**
+   * Resolve the task this operation runs. Fixed profiles keep their configured
+   * task; task-dynamic profiles must name exactly one source and never fall back
+   * to another task.
+   */
+  const resolveTaskSelection = async (
+    request: LocalResearchStartInput,
+  ): Promise<TaskSelection | undefined> => {
+    const namedPackage = request.taskPackageId?.trim();
+    const namedVersion = request.taskVersionId?.trim();
+    if (!preparation) {
+      if (namedPackage || namedVersion || (request.inputVersionIds?.length ?? 0) > 0) {
+        throw new LocalResearchRefusal(
+          "invalid-option",
+          "This research profile runs one fixed administrator task; it does not accept task or input choices",
+        );
+      }
+      return undefined;
+    }
+    if (!!namedPackage === !!namedVersion) {
+      throw new LocalResearchRefusal(
+        "invalid-option",
+        "Name exactly one task: task_package_id for a registered task or task_version_id for a task prepared in this Session",
+      );
+    }
+    if (namedPackage) {
+      if (!isUsableTaskId(namedPackage)) {
+        throw new LocalResearchRefusal("invalid-option", "The task package id is not a usable engine task name");
+      }
+      let described: ScienceFlowCatalogTaskDescription;
+      try {
+        described = await (dependencies.describeTask ?? describeCatalogTask)(preparation, namedPackage, request.signal);
+      } catch (error) {
+        throw new LocalResearchRefusal(
+          "invalid-option",
+          error instanceof TaskPreparationRefusal ? error.message : errorMessage(error),
+        );
+      }
+      // A task whose evaluator cannot import its dependencies would launch a
+      // long research run that can never score a candidate. Refuse at selection,
+      // naming the missing modules, instead of failing after the paid run.
+      if (described.missingModules.length > 0) {
+        throw new LocalResearchRefusal(
+          "invalid-option",
+          `The task package '${described.id}' needs Python modules this deployment does not have: `
+            + `${described.missingModules.join(", ")}. Install them in the engine environment before starting this task.`,
+        );
+      }
+      const inputs = await resolveDataInputs(request.projectId, request.sessionId, request.inputVersionIds);
+      const title = titleFromDescription(described.description, described.id);
+      const binding: ScienceFlowTaskBinding = {
+        artifactKind: described.artifactKind,
+        artifactPath: described.artifactPath,
+        authoritative: described.authoritative,
+        evaluator: { entrypoint: described.evaluatorEntrypoint, kind: "task-package" },
+        inputs,
+        lowerIsBetter: described.lowerIsBetter,
+        metricName: described.metricName,
+        metricType: described.metricType,
+        source: "catalog",
+        summary: taskSummary(title, described.metricName, described.lowerIsBetter, false),
+        taskId: described.id,
+        title,
+      };
+      return { binding, objective: described.description, prepared: false, taskId: described.id };
+    }
+    if ((request.inputVersionIds?.length ?? 0) > 0) {
+      throw new LocalResearchRefusal(
+        "invalid-option",
+        "A prepared task carries its own bound inputs; do not pass input_version_ids",
+      );
+    }
+    const versionId = namedVersion!;
+    assertLinkVersion(request.sessionId, request.projectId, versionId, "task");
+    let read;
+    try {
+      read = await readPreparedTaskVersion(store, { readBytes: readArtifactBytes }, {
+        projectId: request.projectId,
+        sessionId: request.sessionId,
+        versionId,
+      });
+    } catch (error) {
+      throw new LocalResearchRefusal(
+        "invalid-option",
+        error instanceof TaskPreparationRefusal ? error.message : errorMessage(error),
+      );
+    }
+    return {
+      binding: preparedTaskBinding(read.contract, versionId, read.contractHash),
+      objective: read.contract.objective,
+      prepared: true,
+      taskId: read.contract.taskId,
+    };
+  };
+
+  /**
+   * A candidate this deployment delivered belongs to the operation (and the
+   * frozen task contract) that produced it. Continuing a different task from
+   * that candidate would carry an old score and an incompatible artifact format
+   * into a new scientific contract, so it is refused. A version with no
+   * delivery provenance is an explicit initial seed and stays supported.
+   */
+  const assertContinuationCompatible = (
+    request: LocalResearchStartInput,
+    selection: TaskSelection | undefined,
+  ): void => {
+    const versionId = request.incumbentVersionId;
+    if (!selection || !versionId) return;
+    const version = store.getProjectArtifactVersion(request.projectId, versionId);
+    if (!version) return;
+    const artifact = store.getProjectArtifact(request.projectId, version.artifactId);
+    const operationsInSession = operations().listForSession(request.projectId, request.sessionId);
+    const references = (operation: ScienceFlowLocalResearchOperation): boolean => {
+      const refs = [operation.delivery.solution, ...(operation.delivery.staged ?? [])];
+      return refs.some((ref) => ref !== undefined && ref.versionId === version.id);
+    };
+    let source = operationsInSession.find(references);
+    if (!source) {
+      const meta = artifact?.originMeta;
+      if (meta?.deliveredBy !== "scienceflow-result-delivery" || meta.externalEngine !== "scienceflow"
+        || typeof meta.sourceRunId !== "string") {
+        // No delivery provenance: an ordinary uploaded or authored candidate.
+        return;
+      }
+      const sourceRunId = meta.sourceRunId;
+      source = operationsInSession.find((operation) => operation.engineRunId === sourceRunId);
+      if (!source) {
+        throw new LocalResearchRefusal(
+          "continuation-provenance-unknown",
+          "The starting candidate carries delivery metadata for a run this Session has no record of",
+        );
+      }
+    }
+    const sourceBinding = source.taskBinding;
+    const compatible = sourceBinding === undefined
+      ? source.task === selection.binding.taskId
+      : compatibleTaskContracts(sourceBinding, selection.binding);
+    if (!compatible) {
+      throw new LocalResearchRefusal(
+        "continuation-task-mismatch",
+        "The starting candidate was delivered by a different task contract. Start a new experiment without it, "
+          + "or import it deliberately as a new baseline; it cannot continue this task's run.",
+      );
+    }
+  };
+
   return {
     enabled: true,
     profileId: settings.profileId,
     permissionResource: LOCAL_RESEARCH_PERMISSION_RESOURCE,
     inputMode: settings.inputMode ?? "fixed",
+    incumbentMode: settings.dynamicInputs?.incumbent !== undefined
+      ? settings.dynamicInputs.incumbentOptional === true ? "optional" : "required"
+      : settings.inputs?.incumbent !== undefined ? "required" : "none",
+    taskMode: settings.taskMode ?? "fixed",
     observeMaxWaitMs: settings.defaults.observeMaxWaitMs,
+
+    async listTasks(input): Promise<readonly ScienceFlowCatalogTask[]> {
+      const adapter = requireTaskDynamic();
+      assertSessionIdentity(input.projectId, input.sessionId);
+      return await (dependencies.listTasks ?? listCatalogTasks)(adapter);
+    },
+
+    async prepareTask(input: LocalResearchTaskPrepareInput): Promise<PreparedTaskPublication> {
+      const adapter = requireTaskDynamic();
+      return await prepareResearchTask(store, input, {
+        now,
+        readBytes: readArtifactBytes,
+        settings: adapter,
+        tasksRoot: join(settings.workRoot, "tasks"),
+        ...(dependencies.probeTask ? { probe: dependencies.probeTask } : {}),
+      });
+    },
 
     async start(request: LocalResearchStartInput): Promise<LocalResearchStartOutcome> {
       request.signal?.throwIfAborted();
@@ -1107,36 +1554,64 @@ export function createLocalResearchService(input: {
         );
       }
       request.signal?.throwIfAborted();
+      // Resolve the task before the input binding: a task-dynamic profile must
+      // run the task the conversation named, never its old default package, and
+      // a named task this profile does not allow is refused before any read.
+      const selection = await resolveTaskSelection(request);
+      request.signal?.throwIfAborted();
       // Freeze the fixed input bytes this run will actually use, and prove a
       // named version is exactly that input before any record or launch exists.
       const inputs = await resolveInputs(request);
+      assertContinuationCompatible(request, selection);
+      const taskId = selection?.taskId ?? settings.task!;
       request.signal?.throwIfAborted();
 
       const operationId = newOperationId();
       const createdAt = now();
       const workDir = join(settings.workRoot, "operations", operationId);
-      // Dynamic mode resolves the researcher's instruction now, from the input
-      // versions and the Session's intent, so the meaning of this operation is
-      // fixed before any background work starts. A template problem refuses the
-      // start instead of launching a run with an unfilled instruction.
-      const taskDescription = settings.inputMode === "dynamic"
-        ? composeDynamicTaskText(settings.taskTemplate ?? "", {
+      const planRole = inputs.find((input) => input.role === "plan");
+      const incumbentRole = inputs.find((input) => input.role === "incumbent");
+      // The researcher's instruction is composed from frozen facts: a selected
+      // package's own description or a prepared contract's objective, plus the
+      // plan and intent. A template problem refuses the start instead of
+      // launching a run with an unfilled instruction.
+      const taskDescription = selection
+        ? composeTaskInstruction({
+            artifactKind: selection.binding.artifactKind,
+            artifactPath: selection.binding.artifactPath,
+            authoritative: selection.binding.authoritative,
+            ...(incumbentRole?.stagedName && incumbentRole.versionId
+              ? { incumbentFile: incumbentRole.stagedName, incumbentVersionId: incumbentRole.versionId }
+              : {}),
+            inputFiles: selection.binding.inputs.map((binding) => binding.logicalName),
             intent,
+            lowerIsBetter: selection.binding.lowerIsBetter,
+            metricName: selection.binding.metricName,
+            objective: selection.objective,
             operationId,
-            roles: inputs.flatMap((input) =>
-              input.stagedName === undefined || input.versionId === null
-                ? []
-                : [{
-                    role: input.role,
-                    sha256: input.sha256,
-                    size: input.size,
-                    stagedName: input.stagedName,
-                    versionId: input.versionId,
-                  }]),
+            planFile: settings.dynamicInputs?.plan ?? "experiment_plan.md",
+            planVersionId: planRole?.versionId ?? request.planVersionId ?? "",
+            prepared: selection.prepared,
+            title: selection.binding.title,
           })
-        : settings.taskDescription;
+        : settings.inputMode === "dynamic"
+          ? composeDynamicTaskText(settings.taskTemplate ?? "", {
+              intent,
+              operationId,
+              roles: inputs.flatMap((input) =>
+                input.stagedName === undefined || input.versionId === null
+                  ? []
+                  : [{
+                      role: input.role,
+                      sha256: input.sha256,
+                      size: input.size,
+                      stagedName: input.stagedName,
+                      versionId: input.versionId,
+                    }]),
+            })
+          : settings.taskDescription;
       const grant: ScienceFlowLocalResearchGrant = {
-        task: settings.task,
+        task: taskId,
         researchBudgetSec: settings.defaults.researchBudgetSec,
         reportBudgetSec: settings.defaults.reportBudgetSec,
         totalAllowanceSec: settings.defaults.totalAllowanceSec,
@@ -1159,11 +1634,12 @@ export function createLocalResearchService(input: {
         ...(request.planVersionId ? { planVersionId: request.planVersionId } : {}),
         ...(request.incumbentVersionId ? { incumbentVersionId: request.incumbentVersionId } : {}),
         ...(inputs.length ? { inputs } : {}),
+        ...(selection ? { taskBinding: selection.binding } : {}),
         createdAt,
         updatedAt: createdAt,
         state: "accepted",
         engineRunId: `sd-research-${operationId.slice(0, 12)}`,
-        task: settings.task,
+        task: taskId,
         workDir,
         receiptPath: join(workDir, "receipt.json"),
         deliveryRecordPath: join(workDir, "delivery.json"),
@@ -1367,8 +1843,42 @@ export function createLocalResearchService(input: {
   };
 }
 
-function artifactRef(
-  artifact: {
+/** A package description's first heading is a usable title; otherwise its id is. */
+function titleFromDescription(description: string, taskId: string): string {
+  const heading = description.split("\n", 20)
+    .map((line) => line.trim())
+    .find((line) => /^#\s+\S/u.test(line));
+  if (!heading) return taskId;
+  return heading.replace(/^#\s+/u, "").slice(0, 200) || taskId;
+}
+
+/**
+ * Two operations run the same scientific contract only when the task, artifact
+ * contract, metric, evaluator identity and bound input bytes all agree. A
+ * re-prepared task (new contract version or digest) is a new experiment even
+ * when its title or slug matches.
+ */
+function compatibleTaskContracts(source: ScienceFlowTaskBinding, target: ScienceFlowTaskBinding): boolean {
+  if (source.source !== target.source || source.taskId !== target.taskId) return false;
+  if (source.artifactPath !== target.artifactPath || source.artifactKind !== target.artifactKind) return false;
+  if (source.metricName !== target.metricName || source.lowerIsBetter !== target.lowerIsBetter) return false;
+  if (source.source === "prepared" && source.contractHash !== target.contractHash) return false;
+  const left = source.evaluator;
+  const right = target.evaluator;
+  if (left.kind !== right.kind) return false;
+  if (left.kind === "generated-command" && right.kind === "generated-command" && left.sha256 !== right.sha256) {
+    return false;
+  }
+  if (left.kind === "task-package" && right.kind === "task-package" && left.entrypoint !== right.entrypoint) {
+    return false;
+  }
+  return source.inputs.length === target.inputs.length && source.inputs.every((binding, index) => {
+    const other = target.inputs[index];
+    return other !== undefined && binding.logicalName === other.logicalName && binding.sha256 === other.sha256;
+  });
+}
+
+function artifactRef(  artifact: {
     readonly artifactId: string;
     readonly logicalName: string;
     readonly version: number;

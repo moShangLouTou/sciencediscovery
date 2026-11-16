@@ -134,6 +134,15 @@ export interface ScienceFlowLocalResearchStop {
 export type ScienceFlowLocalResearchInputRole = "plan" | "incumbent";
 
 /**
+ * The selected or prepared task this operation runs. It is control-plane state:
+ * it names the engine task and the frozen evaluator identity, not a host path.
+ * Absent on operations written before task selection existed, which ran the
+ * profile's one fixed task.
+ */
+export type { ScienceFlowTaskBinding } from "./local-research-task.js";
+import type { ScienceFlowTaskBinding } from "./local-research-task.js";
+
+/**
  * The bytes this operation's launch actually used for one fixed input role.
  * `versionId` is the Session version the start named after its content was
  * proven equal to the profile's configured input file; `null` means the start
@@ -195,6 +204,8 @@ export interface ScienceFlowLocalResearchOperation {
   readonly state: ScienceFlowLocalResearchState;
   readonly engineRunId: string;
   readonly task: string;
+  /** The task contract this operation froze, when the profile allows task choice. */
+  readonly taskBinding?: ScienceFlowTaskBinding;
   /** Control-plane paths, needed to observe this run again after a rebuild. */
   readonly workDir: string;
   readonly receiptPath: string;

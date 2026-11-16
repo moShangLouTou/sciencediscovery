@@ -57,6 +57,7 @@ function view(operationId: string, overrides: Partial<ScienceFlowLocalResearchVi
 
 function fakeService(overrides: Partial<LocalResearchService> = {}): LocalResearchService {
   return {
+    incumbentMode: "required",
     enabled: true,
     inputMode: "dynamic",
     observeMaxWaitMs: 120_000,

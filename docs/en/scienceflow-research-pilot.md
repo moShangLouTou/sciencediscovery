@@ -1,5 +1,10 @@
 # ScienceFlow research pilot: one evaluated circle-packing loop
 
+> Round 26 adds conversation-defined research tasks: a Session can select a
+> registered non-circle-packing package or prepare its own task contract and
+> evaluator. See [Conversation-defined research tasks](scienceflow-task-intake.md).
+> The record below documents the earlier operator-driven circle-packing pilots.
+
 Status: operator-run research pilot (rounds 19–22). Round 19 executed five
 bounded managed runs on the engine's own `circle-packing` task. Runs 1–3
 established the task, evaluator and process evidence; runs 4–5 closed the loop:
@@ -1166,8 +1171,8 @@ section records what the UI actually does.
 
 ### 13.1 What the conversation shows
 
-A compact **Experimental local research** card sits above the composer in every
-Session. When the deployment has not enabled the mode the card is absent: no
+The collapsible **ScienceFlow** group sits in the right-hand
+Workspace for each Session. When the deployment has not enabled the mode the card is absent: no
 label, no action. When it is enabled the card lists this Session's operations,
 newest first, and shows for each one:
 

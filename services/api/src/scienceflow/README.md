@@ -32,6 +32,13 @@ Session-scoped control-plane record that the run was registered here; it can be
 listed, read, and re-projected through the same snapshot route. Registrations
 persist in `catalog.sqlite`, so they survive an API rebuild.
 
+The experimental local research mode additionally accepts a conversation-defined
+task: `local-research-task.ts` holds the contract/adapter model,
+`local-research-task-service.ts` publishes and materializes prepared task
+versions, and `services/scienceflow-preparation/preparation.py` lists packages
+and probes evaluators through the engine's own backend. The design and scope are
+documented in [`docs/en/scienceflow-task-intake.md`](../../../../docs/en/scienceflow-task-intake.md).
+
 Files:
 
 | File | Role |

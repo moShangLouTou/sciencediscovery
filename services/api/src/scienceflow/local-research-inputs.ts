@@ -57,6 +57,14 @@ export interface StagedInputSelection {
   readonly versionId: string;
 }
 
+/** One ordinary Session artifact version bound as task input data. */
+export interface StagedDataSelection {
+  readonly logicalName: string;
+  readonly sha256: string;
+  readonly size: number;
+  readonly versionId: string;
+}
+
 /** A preparation failure with a stable reason; messages carry no host path. */
 export class InputPreparationRefusal extends Error {
   readonly reason:
@@ -93,6 +101,8 @@ export interface StagedInputManifest {
     readonly sha256: string;
     readonly size: number;
   }[];
+  /** Ordinary data files bound to the task, staged beside the role files. */
+  readonly data?: readonly StagedDataSelection[];
 }
 
 /**
@@ -110,18 +120,36 @@ export async function stageResearchOperationInputs(
     readonly destination: string;
     readonly readBytes: (hash: string) => Promise<Buffer>;
     readonly roles: readonly StagedInputSelection[];
+    /** Ordinary input data bound to the task; staged as plain files. */
+    readonly data?: readonly StagedDataSelection[];
     readonly signal?: AbortSignal;
   },
   now: () => string,
 ): Promise<{ readonly manifest: StagedInputManifest; readonly manifestSha256: string; readonly manifestJson: string }> {
-  // A staged role must not share a name with an administrator asset: the two
+  // A staged file must not share a name with an administrator asset: the two
   // origins would be indistinguishable in the engine's dataset. This is checked
   // before anything is created, so a refused staging leaves no partial directory.
-  for (const role of input.roles) {
-    if (await exists(join(input.assetsDir, ...role.stagedName.split("/")))) {
+  const stagedFiles = [
+    ...input.roles.map((role) => ({
+      name: role.stagedName,
+      label: role.role as string,
+      sha256: role.sha256,
+      size: role.size,
+      versionId: role.versionId,
+    })),
+    ...(input.data ?? []).map((data) => ({
+      name: data.logicalName,
+      label: data.logicalName,
+      sha256: data.sha256,
+      size: data.size,
+      versionId: data.versionId,
+    })),
+  ];
+  for (const file of stagedFiles) {
+    if (await exists(join(input.assetsDir, ...file.name.split("/")))) {
       throw new InputPreparationRefusal(
         "staging-conflict",
-        `The ${role.role} input name is also a supporting asset name`,
+        `The ${file.label} input name is also a supporting asset name`,
       );
     }
   }
@@ -142,29 +170,29 @@ export async function stageResearchOperationInputs(
     }
     files.push(copied);
   });
-  for (const role of input.roles) {
+  for (const stagedFile of stagedFiles) {
     input.signal?.throwIfAborted();
-    const target = join(input.destination, ...role.stagedName.split("/"));
-    if (files.some((file) => file.path === role.stagedName)) {
-      // A staged role must not silently replace an administrator asset of the
+    const target = join(input.destination, ...stagedFile.name.split("/"));
+    if (files.some((file) => file.path === stagedFile.name)) {
+      // A staged file must not silently replace an administrator asset of the
       // same name: the two origins would be indistinguishable in the dataset.
       throw new InputPreparationRefusal(
         "staging-conflict",
-        `The ${role.role} input name is also a supporting asset name`,
+        `The ${stagedFile.label} input name is also a supporting asset name`,
       );
     }
     let bytes: Buffer;
     try {
-      bytes = await input.readBytes(role.sha256);
+      bytes = await input.readBytes(stagedFile.sha256);
     } catch {
-      throw new InputPreparationRefusal("staging-failed", `The ${role.role} input could not be read from the content store`);
+      throw new InputPreparationRefusal("staging-failed", `The ${stagedFile.label} input could not be read from the content store`);
     }
     input.signal?.throwIfAborted();
     const digest = sha256(bytes);
-    if (digest !== role.sha256 || bytes.length !== role.size) {
+    if (digest !== stagedFile.sha256 || bytes.length !== stagedFile.size) {
       throw new InputPreparationRefusal(
         "staging-bytes-mismatch",
-        `The ${role.role} input's content no longer matches the accepted digest`,
+        `The ${stagedFile.label} input's content no longer matches the accepted digest`,
       );
     }
     totalBytes += bytes.length;
@@ -175,7 +203,7 @@ export async function stageResearchOperationInputs(
       await mkdir(dirname(target), { recursive: true, mode: 0o755 });
       await writeFile(target, bytes, { flag: "wx", mode: 0o644 });
     } catch {
-      throw new InputPreparationRefusal("staging-failed", `The ${role.role} input could not be staged`);
+      throw new InputPreparationRefusal("staging-failed", `The ${stagedFile.label} input could not be staged`);
     }
     // Read the copy back: the researcher must receive exactly the accepted bytes,
     // not what a partial write or a full disk left behind.
@@ -183,15 +211,15 @@ export async function stageResearchOperationInputs(
     try {
       staged = await readFile(target);
     } catch {
-      throw new InputPreparationRefusal("staging-failed", `The ${role.role} input could not be read back`);
+      throw new InputPreparationRefusal("staging-failed", `The ${stagedFile.label} input could not be read back`);
     }
-    if (sha256(staged) !== role.sha256 || staged.length !== role.size) {
+    if (sha256(staged) !== stagedFile.sha256 || staged.length !== stagedFile.size) {
       throw new InputPreparationRefusal(
         "staging-bytes-mismatch",
-        `The staged ${role.role} copy does not match the accepted bytes`,
+        `The staged ${stagedFile.label} copy does not match the accepted bytes`,
       );
     }
-    files.push({ path: role.stagedName, sha256: role.sha256, size: role.size });
+    files.push({ path: stagedFile.name, sha256: stagedFile.sha256, size: stagedFile.size });
   }
   const manifest: StagedInputManifest = {
     schemaVersion: 1,
@@ -205,6 +233,7 @@ export async function stageResearchOperationInputs(
       versionId: role.versionId,
     })),
     files: files.toSorted((left, right) => left.path.localeCompare(right.path)),
+    ...(input.data === undefined || input.data.length === 0 ? {} : { data: input.data }),
   };
   const manifestJson = `${JSON.stringify(manifest, null, 2)}\n`;
   return { manifest, manifestJson, manifestSha256: sha256(Buffer.from(manifestJson, "utf8")) };

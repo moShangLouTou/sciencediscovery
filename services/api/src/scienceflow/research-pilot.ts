@@ -267,6 +267,27 @@ export function resolveResearchPilotModel(
   };
 }
 
+/**
+ * One prepared command evaluator. The command is built here from an absolute
+ * interpreter and the operation's own frozen script path; no caller supplies a
+ * shell line.
+ */
+export interface ResearchPilotEvaluator {
+  readonly artifactPath: string;
+  readonly artifactKind: string;
+  readonly commandPath: string;
+  readonly lowerIsBetter: boolean;
+  /**
+   * Dotted path into the evaluator's stdout JSON that holds the metric. The
+   * prepared contract's `metric.jsonPath` is carried here unchanged: preflight
+   * and execution must read the same field.
+   */
+  readonly metricJsonPath: string;
+  readonly metricName: string;
+  readonly pythonExecutable: string;
+  readonly timeoutSec: number;
+}
+
 /** Options an operator supplies. Provider endpoint, credential and model name
  *  always come from SD resolution, never from here. */
 export interface ResearchPilotOptions {
@@ -279,6 +300,13 @@ export interface ResearchPilotOptions {
   readonly readerScriptPath: string;
   readonly seedDir: string;
   readonly task?: string;
+  /**
+   * A prepared command evaluator for this run. Absent means the engine resolves
+   * a registered task package's own evaluator from `task`. When present, the
+   * evaluator bytes are the operation's frozen copy and the engine's
+   * `artifact_command` backend runs exactly that script.
+   */
+  readonly evaluator?: ResearchPilotEvaluator;
   /**
    * Run-specific task text. When present it becomes the engine manifest's inline
    * `task`, which the engine pins as the researcher's first user message instead
@@ -304,6 +332,8 @@ export interface ResearchPilotGrant {
   readonly task: string;
   /** Present only when the operator supplied run-specific task text. */
   readonly taskDescription?: string;
+  /** Present only when this run uses a prepared command evaluator. */
+  readonly evaluator?: ResearchPilotEvaluator;
   readonly researchBudgetSec: number;
   readonly reportBudgetSec: number;
   readonly maxSteps: number;
@@ -518,8 +548,14 @@ export function researchPilotPlan(options: ResearchPilotOptions): {
   if (taskDescription !== undefined && Buffer.byteLength(taskDescription, "utf8") > 32_768) {
     throw new ResearchPilotRefusal("invalid-option", "The task description must be at most 32 KiB");
   }
+  // A prepared evaluator is optional; when present it is the only evaluator this
+  // run may use, so every field must be a trusted, self-consistent identity.
+  const evaluator = options.evaluator === undefined
+    ? undefined
+    : validatePreparedEvaluator(options.evaluator, workDir, options.engineCheckout);
   const grant: ResearchPilotGrant = {
     task,
+    ...(evaluator === undefined ? {} : { evaluator }),
     ...(taskDescription ? { taskDescription } : {}),
     researchBudgetSec: boundedInt(options.researchBudgetSec, RESEARCH_PILOT_DEFAULTS.researchBudgetSec, 30, 840),
     reportBudgetSec: boundedInt(options.reportBudgetSec, RESEARCH_PILOT_DEFAULTS.reportBudgetSec, 10, 600),
@@ -666,6 +702,26 @@ export function researchPilotManifest(input: {
           ...grant.taskDescription.replace(/\r\n?/gu, "\n").split("\n").map((line) => `      ${line}`),
         ]
       : []),
+    ...(grant.evaluator === undefined
+      ? []
+      : [
+          "    evaluator:",
+          "      enabled: true",
+          "      backend: artifact_command",
+          "      task_profile: artifact_command",
+          "      candidate:",
+          `        artifact: ${yamlString(grant.evaluator.artifactPath)}`,
+          `        artifact_kind: ${yamlString(grant.evaluator.artifactKind)}`,
+          "      metric:",
+          `        name: ${yamlString(grant.evaluator.metricName)}`,
+          `        lower_is_better: ${grant.evaluator.lowerIsBetter ? "true" : "false"}`,
+          "        type: exploratory",
+          `        json_path: ${yamlString(grant.evaluator.metricJsonPath)}`,
+          "      command:",
+          `        evaluator_command: ${yamlString(`${yamlString(grant.evaluator.pythonExecutable)} ${yamlString(grant.evaluator.commandPath)} {artifact_abs_path}`)}`,
+          `        python_executable: ${yamlString(grant.evaluator.pythonExecutable)}`,
+          `        timeout_sec: ${grant.evaluator.timeoutSec}`,
+        ]),
     "lnr:",
     "  num_workers: 1",
     "  merge_enabled: false",
@@ -1777,6 +1833,65 @@ function boundedInt(
 function isInside(candidate: string, parent: string): boolean {
   const path = relative(parent, candidate);
   return path === "" || (!path.startsWith("..") && !isAbsolute(path));
+}
+
+/**
+ * Validate a prepared evaluator identity. The script must be a regular relative
+ * file of a safe shape, the interpreter absolute, and the metric direction
+ * explicit: the engine refuses to select a candidate without one.
+ */
+function validatePreparedEvaluator(
+  value: ResearchPilotEvaluator,
+  workDir: string,
+  engineCheckout: string,
+): ResearchPilotEvaluator {
+  const artifactPath = value.artifactPath.replace(/\\/gu, "/").trim();
+  const segments = artifactPath.split("/");
+  if (!artifactPath || artifactPath.startsWith("/") || artifactPath.includes("\0")
+    || artifactPath.length > 200
+    || segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")) {
+    throw new ResearchPilotRefusal("invalid-option", "The prepared evaluator artifact path is not a safe relative path");
+  }
+  if (!isAbsolute(value.commandPath) || !isInside(value.commandPath, workDir) || !isUsableString(value.commandPath)) {
+    throw new ResearchPilotRefusal("invalid-option", "The prepared evaluator script must be this operation's own file");
+  }
+  if (!isAbsolute(value.pythonExecutable) || !isUsableString(value.pythonExecutable)) {
+    throw new ResearchPilotRefusal("invalid-option", "The prepared evaluator interpreter must be an absolute path");
+  }
+  if (!isAbsolute(engineCheckout)) {
+    throw new ResearchPilotRefusal("invalid-option", "The engine checkout must be an absolute path");
+  }
+  const metricName = value.metricName.trim();
+  if (!metricName || metricName.length > 100 || metricName.includes("\0")) {
+    throw new ResearchPilotRefusal("invalid-option", "The prepared evaluator metric name is not usable");
+  }
+  const metricJsonPath = value.metricJsonPath.trim();
+  // The engine splits the path on "." and indexes lists with numeric segments;
+  // anything outside that grammar would silently select nothing.
+  if (!metricJsonPath || metricJsonPath.length > 100 || metricJsonPath.includes("\0")
+    || !/^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/u.test(metricJsonPath)) {
+    throw new ResearchPilotRefusal("invalid-option", "The prepared evaluator metric path is not usable");
+  }
+  if (typeof value.lowerIsBetter !== "boolean") {
+    throw new ResearchPilotRefusal("invalid-option", "The prepared evaluator metric needs a direction");
+  }
+  if (!Number.isSafeInteger(value.timeoutSec) || value.timeoutSec < 5 || value.timeoutSec > 600) {
+    throw new ResearchPilotRefusal("invalid-option", "The prepared evaluator timeout must be 5-600 seconds");
+  }
+  const artifactKind = value.artifactKind.trim();
+  if (!artifactKind || artifactKind.length > 60 || artifactKind.includes("\0")) {
+    throw new ResearchPilotRefusal("invalid-option", "The prepared evaluator artifact kind is not usable");
+  }
+  return {
+    artifactKind,
+    artifactPath,
+    commandPath: resolve(value.commandPath),
+    lowerIsBetter: value.lowerIsBetter,
+    metricJsonPath,
+    metricName,
+    pythonExecutable: resolve(value.pythonExecutable),
+    timeoutSec: value.timeoutSec,
+  };
 }
 
 function yamlString(value: string): string {

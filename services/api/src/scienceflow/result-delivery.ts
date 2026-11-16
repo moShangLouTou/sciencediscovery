@@ -94,6 +94,17 @@ export interface ScienceFlowResultDeliveryRequest {
   readonly readerScriptPath: string;
   readonly task?: string;
   /**
+   * How the run's scores were produced. `task-package` (the default) is the
+   * engine's registered package evaluator; `generated-command` is a task
+   * prepared in this Session, which is exploratory rather than an external
+   * benchmark. The note must not blur the two.
+   */
+  readonly evaluatorAuthority?: "task-package" | "generated-command";
+  /** The prepared evaluator's digest, recorded in the delivered note when set. */
+  readonly evaluatorSha256?: string;
+  /** A short task identity for the note; a task id alone is never guessed at. */
+  readonly taskSummary?: string;
+  /**
    * The Agent-authored plan version this run tested, if one exists. It is
    * linked to the delivered note and must already be a live artifact of this
    * Session; delivery never authors or rewrites a plan.
@@ -299,6 +310,9 @@ interface DeliveryTarget {
   readonly stageLedgerPath: string;
   readonly launchReceiptPath: string;
   readonly recordPath: string;
+  readonly evaluatorAuthority: "task-package" | "generated-command";
+  readonly evaluatorSha256?: string;
+  readonly taskSummary?: string;
 }
 
 /**
@@ -564,7 +578,13 @@ export function resolveDeliveryTarget(
   }
   const workDir = resolve(request.workDir);
   const stateHome = join(workDir, "state");
+  if (request.evaluatorSha256 !== undefined && !/^[a-f0-9]{64}$/u.test(request.evaluatorSha256)) {
+    throw new DeliveryRefusal("invalid-option", "The evaluator digest is not a sha256");
+  }
   return {
+    evaluatorAuthority: request.evaluatorAuthority ?? "task-package",
+    ...(request.evaluatorSha256 === undefined ? {} : { evaluatorSha256: request.evaluatorSha256 }),
+    ...(request.taskSummary === undefined ? {} : { taskSummary: request.taskSummary.slice(0, 500) }),
     launchReceiptPath: request.launchReceiptPath
       ? resolve(request.launchReceiptPath)
       : join(workDir, "receipt.json"),
@@ -1159,7 +1179,7 @@ function buildResultNote(input: {
       ? [
         "This Session holds the delivered output of one **ScienceFlow managed run started by this",
         "ScienceDiscovery deployment's experimental local research mode**. The Agent started it from",
-        "this conversation with this Session's model; the engine's own task-package evaluator produced",
+        "this conversation with this Session's model; the engine's own evaluator produced",
         "the scores below. This is experimental local execution, not a formal Runner sandbox, and this",
         "note is a factual delivery record, not a model interpretation of the experiment.",
         "",
@@ -1172,7 +1192,7 @@ function buildResultNote(input: {
       ]),
     "## Task and identity",
     "",
-    `- Engine task: \`${target.task}\`${taskDescription(target.task)}.`,
+    `- Engine task: \`${target.task}\`${taskDescriptionFor(target)}.`,
     `- Metric: \`${codeText(selected.metricName)}\`, ${direction}.`,
     `- SD Project / Session: \`${identity.projectId}\` / \`${identity.sessionId}\`.`,
     `- ScienceFlow run: \`${target.runId}\`; SD registration \`${registration.registrationId}\`.`,
@@ -1180,7 +1200,9 @@ function buildResultNote(input: {
       ? `- Model that produced the candidates: \`${receipt.model.providerModel}\` (SD profile "${receipt.model.profileName}", source layer \`${receipt.model.selectionSource}\`), as recorded in the run's operator launch receipt.`
       : "- Model that produced the candidates: not recorded in an operator receipt.",
     `- Run state: status \`${runState.status}\`, phase \`${runState.phase}\`.${lifecycleSentence(receipt)}`,
-    "- The engine's task-package evaluator is the only authoritative score source for these stages.",
+    target.evaluatorAuthority === "generated-command"
+      ? `- The evaluator was prepared in this Session as an exploratory scoring contract${target.evaluatorSha256 ? ` (sha256 \`${target.evaluatorSha256}\`)` : ""}. It is fixed for the run, and its score is not an authoritative external benchmark.`
+      : "- The engine's task-package evaluator is the only authoritative score source for these stages.",
     "",
   );
 
@@ -1355,8 +1377,9 @@ function buildResultNote(input: {
   return `${lines.join("\n")}`;
 }
 
-function taskDescription(task: string): string {
-  const description = TASK_DESCRIPTIONS[task];
+function taskDescriptionFor(target: DeliveryTarget): string {
+  if (target.taskSummary) return ` — ${target.taskSummary}`;
+  const description = TASK_DESCRIPTIONS[target.task];
   return description ? ` — ${description}` : "";
 }
 

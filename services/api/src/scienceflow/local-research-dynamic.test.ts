@@ -208,7 +208,7 @@ interface LaunchRecord {
   taskText?: string;
 }
 
-function recordingLaunch(record: LaunchRecord): ResearchPilotLauncher {
+function recordingLaunch(record: LaunchRecord, incumbentExpected = true): ResearchPilotLauncher {
   return async (input): Promise<ResearchPilotLaunchOutcome> => {
     record.count += 1;
     const manifest = await readFile(input.manifestPath, "utf8");
@@ -217,7 +217,11 @@ function recordingLaunch(record: LaunchRecord): ResearchPilotLauncher {
     const dir = JSON.parse(line.split("input_data_dir:")[1]!.trim()) as string;
     record.inputDataDir = dir;
     record.stagedPlan = await readFile(join(dir, "experiment_plan.md"), "utf8");
-    record.stagedIncumbent = await readFile(join(dir, "start_solution.json"), "utf8");
+    if (incumbentExpected) {
+      record.stagedIncumbent = await readFile(join(dir, "start_solution.json"), "utf8");
+    } else {
+      await assert.rejects(readFile(join(dir, "start_solution.json")), { code: "ENOENT" });
+    }
     record.assets = await readdir(join(dir, "kernel"));
     record.taskText = manifest
       .split("\n")
@@ -352,6 +356,48 @@ function startInput(target: Fixture, overrides: Record<string, unknown> = {}) {
     ...overrides,
   } as Parameters<ReturnType<typeof createLocalResearchService>["start"]>[0];
 }
+
+test("a fresh Session starts without a candidate, then continues from its delivered candidate", async (context) => {
+  const base = await fixture(context);
+  const session = await base.store.createSession(base.projectId, "From scratch");
+  const target = { ...base, sessionId: session.id, settings: {
+    ...base.settings,
+    dynamicInputs: { plan: "experiment_plan.md", incumbent: "start_solution.json", incumbentOptional: true },
+  } };
+  const plan = await publish(target.store, target.projectId, session.id, "scratch-plan.md", PLAN_TEXT, "Scratch plan");
+  const record: LaunchRecord = { assets: [], count: 0 };
+  let first = true;
+  const service = ready(target, { launch: async (request) => {
+    const expectIncumbent = !first;
+    first = false;
+    return recordingLaunch(record, expectIncumbent)(request);
+  } });
+  assert.equal(service.incumbentMode, "optional");
+  const request = startInput(target, { planVersionId: plan.versionId, incumbentVersionId: undefined });
+  await assert.rejects(service.start({ ...request, planVersionId: undefined }),
+    (error: unknown) => error instanceof LocalResearchRefusal && error.reason === "link-version-missing");
+  await assert.rejects(service.start({ ...request, incumbentVersionId: base.incumbents.versionId }),
+    (error: unknown) => error instanceof LocalResearchRefusal && error.reason === "link-version-not-found");
+  assert.equal(record.count, 0);
+  const outcome = await service.start(request);
+  const identity = { projectId: target.projectId, sessionId: session.id, operationId: outcome.operation.operationId };
+  const view = await waitTerminal(service, identity);
+  assert.equal(view.state, "completed");
+  assert.equal(view.incumbentVersionId, null);
+  assert.deepEqual(view.inputs.map(input => input.role), ["plan"]);
+  assert.equal(record.stagedIncumbent, undefined);
+  assert.equal(view.delivery.state, "delivered");
+  const solution = view.delivery.solution;
+  assert.ok(solution);
+  const revised = await publish(target.store, target.projectId, session.id, "revised-plan.md", PLAN_TEXT_V2, "Revised plan");
+  const second = await service.start({ ...request, ownerRunId: "conversation-run-2",
+    planVersionId: revised.versionId, incumbentVersionId: solution.versionId });
+  const continued = await waitTerminal(service, { ...identity, operationId: second.operation.operationId });
+  assert.equal(continued.state, "completed");
+  assert.equal(continued.incumbentVersionId, solution.versionId);
+  assert.equal(record.stagedIncumbent, NEW_TEXT);
+  assert.equal(record.count, 2);
+});
 
 test("a dynamic start stages exactly the selected plan and incumbent", async (context) => {
   const target = await fixture(context);
