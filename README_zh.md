@@ -21,6 +21,8 @@
 
 </div>
 
+融合分支试用：[ScienceFlow 中文测试指南](docs/zh/scienceflow-pilot-testing.md)（拉取代码、启用科研、反馈迭代与当前边界）。
+
 ## 为什么选择 ScienceDiscovery
 
 ScienceDiscovery 本地完成：智能体阅读文献、编写并运行代码、交付报告、表格与图表，工作区可以查看结果和支撑结果的证据。
