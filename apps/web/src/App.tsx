@@ -22,6 +22,7 @@ import { ResearchContinuationContext, ResearchContinuationStatus, useResearchCon
 import { markResearchCopyCreated, ResearchCopyNotice } from "./research-package/ResearchCopyNotice.js";
 import { RuntimeConfigClient } from "./CodexConfigCard.js";
 import { Fragment, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { useMcpReadiness } from "./composer/useMcpReadiness.js";
 import { ExecutionBlockCards } from "./ExecutionReadiness.js";
 import { ComputeNotice, ComputeStatus, useComputeReadiness } from "./ComputeReadiness.js";
@@ -1302,6 +1303,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
   const [scopedSettingsErrors, setScopedSettingsErrors] = useState<string[]>([]);
   const [dragActive, setDragActive] = useState(false);
   const [isFollowingOutput, setIsFollowingOutput] = useState(true);
+  const [researchPanelTarget, setResearchPanelTarget] = useState<HTMLDivElement | null>(null);
   const [workspaceCollapsed, setWorkspaceCollapsed] = useState(() => initialView.workspaceOpen !== undefined
     ? !initialView.workspaceOpen
     : readRenamedStorageItem(localStorage, WORKSPACE_COLLAPSED_STORAGE_KEY) === "1");
@@ -5297,6 +5299,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
                   onOpenArtifact={openResearchArtifact}
                   onPrefill={prefillResearchRequest}
                   readOnly={sessionReadOnly}
+                  renderPanel={(panel) => researchPanelTarget ? createPortal(panel, researchPanelTarget) : null}
                   sessionId={session.id}
                 />
                 <form className={isRunning ? "composer composer-compact" : "composer"} onSubmit={(event) => void submitMessage(event)}>
@@ -5447,6 +5450,8 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
                 <button aria-label={t("app.hideWorkspace")} className="icon-button workspace-collapse-button" onClick={() => setWorkspaceCollapsed(true)} title={t("app.hideWorkspace")} type="button"><PanelRightIcon size={15} /></button>
               </div>
             </div>
+            {/* Keep observation mounted in the conversation even when this rail is hidden. */}
+            <div ref={setResearchPanelTarget} />
 <WorkspaceFolder key={`files:${activeSessionId}`} name="files" label={t("record.files")}>
             {activeSessionId && !sessionReadOnly ? (
               <label className={dragActive ? "drop-zone active" : "drop-zone"} onDragEnter={() => setDragActive(true)} onDragLeave={() => setDragActive(false)} onDragOver={(event) => event.preventDefault()} onDrop={(event) => {

@@ -14,13 +14,14 @@
  * limitations under the License.
  */
 
-/* The compact research status/control strip above the composer. */
+/* Research uses the scrollable workspace rail, alongside SD artifacts/tasks. */
 .research-operation-panel {
   border: 1px solid var(--border);
   border-radius: var(--radius-m);
   background: var(--surface-subtle);
-  margin: 0 auto 8px;
-  max-width: var(--conversation-max-width, 980px);
+  box-sizing: border-box;
+  min-width: 0;
+  margin: 0;
   padding: 8px 10px;
   width: 100%;
 }
@@ -31,11 +32,6 @@
   flex-wrap: wrap;
   gap: 4px 10px;
   justify-content: space-between;
-}
-
-.research-operation-panel > header strong {
-  color: var(--text-strong);
-  font-size: 12px;
 }
 
 .research-operation-panel > header > span {
@@ -114,6 +110,15 @@
 }
 
 .research-operation-meta span { font-family: var(--font-mono); }
+
+.research-operation-meta,
+.research-operation-execution,
+.research-operation-outputs,
+.research-operation-delivery { min-width: 0; overflow-wrap: anywhere; }
+
+/* A resizable rail can be narrow even on a desktop viewport. */
+.research-operation-head { flex-wrap: wrap; }
+.research-operation-actions .compact-button { white-space: normal; }
 
 .research-operation-delivery-label {
   color: var(--text-secondary);

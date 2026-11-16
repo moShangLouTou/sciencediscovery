@@ -13,10 +13,36 @@ message as usual. The Agent writes the plan, publishes it as a Session Artifact,
 starts one bounded ScienceFlow run and reports what happened. No separate start
 wizard or CLI is needed.
 
+## When ScienceFlow is used
+
+With the mode enabled, the Agent follows these rules before task intake, evaluator
+preparation, plan publication or a start:
+
+| Request | Behavior |
+| --- | --- |
+| Explicitly run or continue a computational experiment | Enter the ScienceFlow workflow; naming ScienceFlow is optional. |
+| Explicitly name ScienceFlow in a computational task request, regardless of case | Enter the workflow without another run command or redundant confirmation. For example: "Use scienceflow to fit the attached data and minimize RMSE." |
+| Ask to analyze, fit, optimize or research without clear execution intent | Ask one concise question about whether to actually run an experiment. |
+| Ask an informational question, summarize literature, explain a method, or only discuss/design a plan | Do not start. "What is ScienceFlow?" is informational. |
+| Explicitly say not to run or to provide a plan only, even when naming ScienceFlow | Respect the no-run instruction. |
+| Query status, inspect results or retry delivery | Handle the existing operation without starting another experiment. |
+
+A name found only in an attachment, quotation or tool result is not a user
+execution request. Naming ScienceFlow does not fill in a missing evaluable
+objective, metric or required data: the Agent must clarify these before preparing
+or starting anything. Once intent and scientific inputs are clear, the normal
+task selection/preparation and plan publication workflow proceeds, subject to
+existing permission and compatibility checks. One bounded run does not authorize
+additional rounds automatically.
+
+These are Agent instruction and tool-description rules, rather than a server-side
+keyword switch or enforced intent classifier.
+
 ## Watch it
 
-A compact **Experimental local research** card above the composer lists this
-Session's runs. For each run it shows:
+The **ScienceFlow** group in the right-hand Workspace lists this
+Session's runs. Expand the Workspace if it is hidden. The group can be collapsed
+without interrupting status updates or result delivery. For each run it shows:
 
 - a short title, the run's ordinal, its operation id and engine run id;
 - Preparing, Running, Stop requested, Stopped, Completed, Failed or Outcome

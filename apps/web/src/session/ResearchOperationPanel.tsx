@@ -13,7 +13,7 @@
 // limitations under the License.
 
 /**
- * A compact, Session-scoped card for the experimental local research mode.
+ * A Session-scoped workspace card for the experimental local research mode.
  *
  * It reads the durable operation identity from the service, not from whichever
  * tool result happens to be in the transcript: a refresh, a reopened Session or
@@ -28,6 +28,8 @@ import {
   useState,
   type ReactNode,
 } from "react";
+
+import { WorkspaceFolder } from "../ProcessRecord.js";
 
 import type {
   ResearchArtifactRef,
@@ -67,6 +69,8 @@ export interface ResearchOperationPanelProps {
   /** Called once per operation whose delivery this card observes. */
   readonly onDelivered?: () => void;
   readonly readOnly?: boolean;
+  /** Place the view in the workspace; returning null keeps observation active. */
+  readonly renderPanel?: (panel: ReactNode) => ReactNode;
   readonly sessionId: string;
 }
 
@@ -89,6 +93,7 @@ export function ResearchOperationPanel({
   onOpenArtifact,
   onPrefill,
   readOnly = false,
+  renderPanel,
   sessionId,
 }: ResearchOperationPanelProps): ReactNode {
   const { t } = useLocale();
@@ -240,23 +245,25 @@ export function ResearchOperationPanel({
   const numbered = response.operations.map((operation, index) => ({ operation, ordinal: index + 1 }));
   const visible = (showAll ? numbered : numbered.slice(-3)).slice().reverse();
 
-  return <section aria-label={t("localResearch.aria")} className="research-operation-panel">
-    <header>
-      <span>
-        <strong>{t("localResearch.title")}</strong>
-        <small>{t("localResearch.scope")}</small>
-      </span>
-      {error ? <span className="research-operation-error" role="status">{t("localResearch.unavailable")}</span> : null}
-    </header>
-    {response.operations.length === 0
-      ? <p className="research-operation-empty">{t("localResearch.none")}</p>
-      : <ul>{visible.map(({ operation, ordinal }) => renderOperation(operation, ordinal))}</ul>}
-    {numbered.length > 3
-      ? <footer><button className="link-button" onClick={() => setShowAll((current) => !current)} type="button">
-        {showAll ? t("localResearch.showLatest") : t("localResearch.showAll", { count: numbered.length })}
-      </button></footer>
-      : null}
-  </section>;
+  const panel = <WorkspaceFolder key={sessionId} name="research" label={t("localResearch.title")}>
+    <section aria-label={t("localResearch.aria")} className="research-operation-panel">
+      <header>
+        <span>
+          <small>{t("localResearch.scope")}</small>
+        </span>
+        {error ? <span className="research-operation-error" role="status">{t("localResearch.unavailable")}</span> : null}
+      </header>
+      {response.operations.length === 0
+        ? <p className="research-operation-empty">{t("localResearch.none")}</p>
+        : <ul>{visible.map(({ operation, ordinal }) => renderOperation(operation, ordinal))}</ul>}
+      {numbered.length > 3
+        ? <footer><button className="link-button" onClick={() => setShowAll((current) => !current)} type="button">
+          {showAll ? t("localResearch.showLatest") : t("localResearch.showAll", { count: numbered.length })}
+        </button></footer>
+        : null}
+    </section>
+  </WorkspaceFolder>;
+  return renderPanel ? renderPanel(panel) : panel;
 
   function renderOperation(operation: ResearchOperation, ordinal: number): ReactNode {
     const status = researchStatus(operation);

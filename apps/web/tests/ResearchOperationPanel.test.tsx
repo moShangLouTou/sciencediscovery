@@ -15,7 +15,7 @@
 import { createTest } from "../../../test/support/tagged/compat.mjs";
 const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:linux", "arch:amd64", "arch:arm64"] });
 import assert from "node:assert/strict";
-import { createElement } from "react";
+import { createElement, type ReactNode } from "react";
 import { act, create, type ReactTestRenderer } from "react-test-renderer";
 
 import { LocaleProvider } from "../src/i18n/index.js";
@@ -118,6 +118,7 @@ async function render(port: ResearchOperationsPort, callbacks: {
   onDelivered?: () => void;
   onOpenArtifact?: (ref: import("../src/api/research-operations.js").ResearchArtifactRef) => void;
   onPrefill?: (text: string) => void;
+  renderPanel?: (panel: ReactNode) => ReactNode;
 } = {}): Promise<ReactTestRenderer> {
   let renderer: ReactTestRenderer | undefined;
   await act(async () => {
@@ -127,6 +128,7 @@ async function render(port: ResearchOperationsPort, callbacks: {
       onDelivered: callbacks.onDelivered,
       onOpenArtifact: callbacks.onOpenArtifact ?? (() => undefined),
       onPrefill: callbacks.onPrefill ?? (() => undefined),
+      renderPanel: callbacks.renderPanel,
       sessionId: "session-1",
     })));
   });
@@ -151,7 +153,7 @@ test("renders live status, stage score, separate delivery and a stop action", as
   const renderer = await render(port);
   try {
     const markup = text(renderer);
-    assert.ok(markup.includes("Experimental local research"));
+    assert.ok(markup.includes("ScienceFlow"));
     assert.ok(markup.includes("Running"));
     assert.ok(markup.includes("2.62400316149487"));
     assert.ok(markup.includes("not delivered yet"));
@@ -258,6 +260,54 @@ test("disabled mode renders no panel or actions", async (t) => {
   });
   try {
     assert.equal(renderer.toJSON(), null);
+  } finally {
+    await act(async () => renderer.unmount());
+  }
+});
+
+
+test("a hidden workspace keeps polling and refreshes delivered artifacts before reopening", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let visible = false;
+  let deliveredCalls = 0;
+  let reads = 0;
+  let current = operation();
+  const renderer = await render({
+    getResearchOperation: async () => current,
+    listResearchOperations: async () => {
+      reads += 1;
+      return { enabled: true, inputMode: "dynamic", operations: [current], profileId: "round25" };
+    },
+    retryResearchDelivery: async () => current,
+    stopResearchOperation: async () => ({ confirmed: true, operation: current, requested: true }),
+  }, {
+    onDelivered: () => { deliveredCalls += 1; },
+    renderPanel: (panel) => visible ? panel : null,
+  });
+  try {
+    assert.equal(renderer.toJSON(), null);
+    assert.equal(reads, 1);
+    current = operation({
+      state: "completed",
+      delivery: { attempts: 1, state: "delivered", updatedAt: "2026-11-16T00:03:00Z" },
+    });
+    await act(async () => { t.mock.timers.tick(5_000); });
+    assert.equal(reads, 2);
+    assert.equal(deliveredCalls, 1);
+    assert.equal(renderer.toJSON(), null);
+
+    visible = true;
+    await act(async () => { t.mock.timers.tick(10_000); });
+    assert.ok(text(renderer).includes("Completed"));
+    assert.equal(deliveredCalls, 1);
+    const folder = renderer.root.findByProps({ "data-folder": "research" });
+    assert.equal(folder.props.open, true);
+    const closed = { open: false };
+    await act(async () => { folder.props.onToggle({ target: closed, currentTarget: closed }); });
+    await act(async () => { t.mock.timers.tick(10_000); });
+    assert.equal(renderer.root.findByProps({ "data-folder": "research" }).props.open, false);
+    assert.equal(reads, 4);
+    assert.equal(deliveredCalls, 1);
   } finally {
     await act(async () => renderer.unmount());
   }
