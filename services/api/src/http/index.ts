@@ -348,6 +348,7 @@ import { handleScienceFlowRegistrationRequest } from "../scienceflow/registratio
 import { handleScienceFlowExecutionPlanRequest } from "../scienceflow/execution-plan-http.js";
 import { handleScienceFlowRuntimeCheckRequest } from "../scienceflow/runtime-check-http.js";
 import { handleScienceFlowPreparedInputsRequest } from "../scienceflow/prepared-inputs-http.js";
+import { handleScienceFlowLocalResearchRequest } from "../scienceflow/local-research-http.js";
 import {
   createPlatformServices,
   initializePlatformServices,
@@ -445,6 +446,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
     remoteCompute,
     runnerClient,
     scienceFlowExecutionPlans,
+    scienceFlowLocalResearch,
     scienceFlowPreparedInputs,
     scienceFlowRegistrations,
     scienceFlowRunSnapshot,
@@ -1129,6 +1131,9 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       // Explicit runtime identity check: one plan, one administrator binding,
       // one Runner probe. Never starts ScienceFlow and never a start gate.
       if (await handleScienceFlowRuntimeCheckRequest(request, response, url, scienceFlowRuntimeChecks)) return;
+      // Session-scoped research status/stop for the conversation UI. It reads
+      // the same service the Agent tools use and never starts a run.
+      if (await handleScienceFlowLocalResearchRequest(request, response, url, scienceFlowLocalResearch, store)) return;
       if (request.method === "GET" && url.pathname === "/api/error-diagnostics") {
         const ids = diagnosticIds(url.searchParams);
         if (!ids) { sendError(response, 400, "Invalid diagnostic correlation id"); return; }

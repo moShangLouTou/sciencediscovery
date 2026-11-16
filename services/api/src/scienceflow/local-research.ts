@@ -297,6 +297,8 @@ export interface LocalResearchService {
   /** Conversation cancellation: request stop for the run's owned experiments. */
   requestStopForConversationRun(sessionId: string, runId: string): Promise<void>;
   latest(projectId: string, sessionId: string): ScienceFlowLocalResearchOperation | undefined;
+  /** The Session's operations as public views, oldest first. */
+  list(projectId: string, sessionId: string): readonly ScienceFlowLocalResearchView[];
 }
 
 /**
@@ -1350,6 +1352,17 @@ export function createLocalResearchService(input: {
     latest(projectId: string, sessionId: string): ScienceFlowLocalResearchOperation | undefined {
       const rows = operations().listForSession(projectId, sessionId);
       return [...rows].reverse().find((candidate) => !isTerminalResearchState(candidate.state)) ?? rows.at(-1);
+    },
+
+    list(projectId: string, sessionId: string): readonly ScienceFlowLocalResearchView[] {
+      if (!store.getProject(projectId)) {
+        throw new LocalResearchRefusal("project-not-found", "The Project does not exist");
+      }
+      const session = store.getSession(sessionId);
+      if (!session || session.projectId !== projectId) {
+        throw new LocalResearchRefusal("session-not-found", "This Session is not in the given Project");
+      }
+      return operations().listForSession(projectId, sessionId).map(view);
     },
   };
 }

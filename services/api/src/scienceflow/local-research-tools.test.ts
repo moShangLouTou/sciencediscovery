@@ -80,6 +80,7 @@ function fakeService(overrides: Partial<LocalResearchService> = {}): LocalResear
     get: async () => baseView(),
     inputMode: "fixed",
     latest: () => undefined,
+    list: () => [],
     observeMaxWaitMs: 3_000,
     permissionResource: LOCAL_RESEARCH_PERMISSION_RESOURCE,
     profileId: "round23-local",

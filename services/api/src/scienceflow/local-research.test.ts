@@ -359,6 +359,16 @@ test("one accepted start becomes one run, an evaluated stage and delivered artif
     assert.ok(!serialized.includes(forbidden), `the view must not expose ${forbidden}`);
   }
 
+  // The Session's list projection is the same path-free view the card reads.
+  const listed = service.list(target.projectId, target.sessionId);
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0]!.operationId, view.operationId);
+  assert.ok(!JSON.stringify(listed).includes(target.root));
+  assert.throws(
+    () => service.list("not-a-project", target.sessionId),
+    (error: unknown) => error instanceof LocalResearchRefusal && error.reason === "project-not-found",
+  );
+
   // The delivered solution really is the evaluated candidate's bytes.
   const solution = target.store.listProjectArtifactVersions(target.projectId, view.delivery.solution!.artifactId)
     .find((version) => version.id === view.delivery.solution!.versionId);
