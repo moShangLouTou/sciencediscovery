@@ -25,6 +25,7 @@ import {
   type ResearchOperationsPort,
 } from "../src/session/ResearchOperationPanel.js";
 import {
+  bestResearchContinuationText,
   deliveryLabelKey,
   researchContinuationText,
   researchStages,
@@ -308,6 +309,97 @@ test("a hidden workspace keeps polling and refreshes delivered artifacts before 
     assert.equal(renderer.root.findByProps({ "data-folder": "research" }).props.open, false);
     assert.equal(reads, 4);
     assert.equal(deliveredCalls, 1);
+  } finally {
+    await act(async () => renderer.unmount());
+  }
+});
+
+
+test("a worse latest run keeps the best valid result reachable and prefills from it", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let prefilled = "";
+  const worse = operation({
+    delivery: {
+      attempts: 1,
+      solution: { artifactId: "worse-artifact", logicalName: "best-solution.json", role: "solution", version: 4, versionId: "worse-version-4" },
+      state: "delivered",
+      updatedAt: "2026-11-16T00:04:00Z",
+    },
+    parent: {
+      activeChild: null,
+      createdAt: "2026-11-16T00:00:00.000Z",
+      deadlinePassed: false,
+      enforcement: { runCount: true, tokenCap: false, wallClock: true },
+      groupId: "sfc-1",
+      limits: { deadlineAt: "2026-11-16T01:00:00.000Z", maxChildRuns: 3, totalAllowanceSec: 900 },
+      lowerIsBetter: true,
+      metricName: "rmse",
+      parentId: "sf-parent-1",
+      runs: { active: 0, settled: 1, started: 2 },
+      stop: {},
+      taskId: "sd-fit",
+      title: "Fit",
+      updatedAt: "2026-11-16T00:04:00.000Z",
+      usage: {
+        tokens: {
+          calls: 2,
+          hardCap: null,
+          inputTokens: 100,
+          note: "recorded only",
+          outputTokens: 20,
+          status: "known",
+          unknownUsageCalls: 0,
+        },
+        wallClock: {
+          chargedSeconds: 300,
+          knownSeconds: 120,
+          notLaunched: 0,
+          remainingSeconds: 600,
+          reservedSeconds: 0,
+          unknownSettlements: 1,
+        },
+      },
+    },
+    resultRelation: {
+      bestValid: {
+        metric: { lowerIsBetter: true, name: "rmse", value: 0.03 },
+        operationId: "operation-best",
+        solution: { artifactId: "best-artifact", logicalName: "best-solution.json", version: 2, versionId: "best-version-2" },
+      },
+      comparable: true,
+      comparisonNote: "This run is worse than the best valid result by 0.01.",
+      contractTaskId: "sd-fit",
+      contractTitle: "Fit",
+      groupId: "sfc-1",
+      isBestValid: false,
+      isLatest: true,
+      isSelectedForNext: false,
+      rankable: true,
+      selectedForNext: null,
+      validity: "valid",
+      validityReasons: [],
+    },
+    state: "completed",
+  });
+  const renderer = await render({
+    getResearchOperation: async () => worse,
+    listResearchOperations: async () => ({ enabled: true, inputMode: "dynamic", operations: [worse], profileId: "round26" }),
+    retryResearchDelivery: async () => worse,
+    stopResearchOperation: async () => ({ confirmed: true, operation: worse, requested: true }),
+  }, { onPrefill: (value) => { prefilled = value; } });
+  try {
+    const markup = text(renderer);
+    assert.ok(markup.includes("latest"));
+    assert.ok(markup.includes("best valid: rmse 0.03"));
+    assert.ok(markup.includes("Continue from best valid"));
+    assert.ok(markup.includes("research line: 2/3 runs"));
+    assert.ok(markup.includes("line wall clock left: 600s"));
+    assert.ok(markup.includes("charged at the reserved allowance"));
+    const request = bestResearchContinuationText(worse);
+    assert.ok(request?.includes("best-version-2"));
+    await act(async () => { button(renderer, "Continue from best valid")!.props.onClick(); });
+    assert.ok(prefilled.includes("best-version-2"));
+    assert.equal(bestResearchContinuationText(operation()), undefined);
   } finally {
     await act(async () => renderer.unmount());
   }

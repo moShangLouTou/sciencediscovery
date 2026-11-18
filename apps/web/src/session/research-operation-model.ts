@@ -128,6 +128,35 @@ export function deliveryDetail(operation: ResearchOperation): string | undefined
   return undefined;
 }
 
+/**
+ * Prefill for "Continue from the best valid result". The relation is computed by
+ * the server from the same frozen contract, so a worse later run never hides
+ * the best evidence. No-op when this run already is the best or nothing valid
+ * was delivered.
+ */
+export function bestResearchContinuationText(operation: ResearchOperation): string | undefined {
+  const relation = operation.resultRelation;
+  const best = relation?.bestValid;
+  if (!relation || relation.isBestValid || !best?.solution) return undefined;
+  return [
+    `Continue from research operation ${best.operationId}, the best valid result of this scientific contract (${best.metric.name} ${formatMetric(best.metric.value)}).`,
+    `Use the delivered solution artifact version ${best.solution.versionId} (${best.solution.logicalName}, version ${best.solution.version}) as the exact starting solution.`,
+    "Read the result note and the researcher's records, interpret what that run established, then publish a revised plan and start the next bounded experiment.",
+  ].join(" ");
+}
+
+/** The compact relation labels this run's card shows. */
+export function researchRelationLabels(operation: ResearchOperation): Array<"best" | "latest" | "selected" | "invalid"> {
+  const relation = operation.resultRelation;
+  if (!relation) return [];
+  return [
+    ...(relation.isBestValid ? ["best" as const] : []),
+    ...(relation.isLatest ? ["latest" as const] : []),
+    ...(relation.isSelectedForNext ? ["selected" as const] : []),
+    ...(relation.validity === "invalid" ? ["invalid" as const] : []),
+  ];
+}
+
 export function formatMetric(value: number): string {
   // `String` gives the shortest round-trip form; do not round an engine score
   // for display.

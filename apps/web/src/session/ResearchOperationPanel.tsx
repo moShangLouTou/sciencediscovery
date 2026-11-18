@@ -40,12 +40,14 @@ import type {
 import { useLocale } from "../i18n/index.js";
 import type { MessageKey } from "../i18n/index.js";
 import {
+  bestResearchContinuationText,
   deliveryDetail,
   deliveryLabelKey,
   deliveredResults,
   formatMetric,
   isActiveResearch,
   researchContinuationText,
+  researchRelationLabels,
   researchStages,
   researchStatus,
   researchTitle,
@@ -280,6 +282,9 @@ export function ResearchOperationPanel({
     const stopBusy = busy?.action === "stop" && busy.operationId === operation.operationId;
     const retryBusy = busy?.action === "retry" && busy.operationId === operation.operationId;
     const active = operation.state === "accepted" || operation.state === "running";
+    const relation = operation.resultRelation;
+    const relationLabels = researchRelationLabels(operation);
+    const bestText = bestResearchContinuationText(operation);
     return <li className={`research-operation ${status.tone}`} key={operation.operationId}>
       <div className="research-operation-head">
         <span className="research-operation-title" title={operation.intent}>
@@ -311,6 +316,15 @@ export function ResearchOperationPanel({
         <span>{t(`localResearch.delivery.${deliveryKey}` as "localResearch.delivery.pending")}</span>
         {deliveryDetail(operation) ? <span className="research-operation-delivery-detail">{deliveryDetail(operation)}</span> : null}
       </div>
+      {relationLabels.length
+        ? <div aria-label={t("localResearch.relationAria")} className="research-operation-relations">
+          {relationLabels.map((label) => <span
+            className={`research-relation ${label}`}
+            key={label}
+            title={relation?.comparisonNote}
+          >{t(`localResearch.relation.${label}` as "localResearch.relation.best")}</span>)}
+        </div>
+        : null}
       {results.solution || results.note || operation.delivery.staged?.length || operation.delivery.researcher?.length
         ? <div className="research-operation-outputs">
           {results.solution ? <button className="link-button" onClick={() => onOpenArtifact(solutionRef(operation)!)} type="button">
@@ -324,6 +338,31 @@ export function ResearchOperationPanel({
             : null}
           {operation.delivery.researcher?.length
             ? <span>{t("localResearch.researcherRecords", { count: operation.delivery.researcher.length })}</span>
+            : null}
+        </div>
+        : null}
+      {relation?.bestValid && !relation.isBestValid
+        ? <p className="research-operation-best">{t("localResearch.bestMetric", {
+          name: relation.bestValid.metric.name,
+          value: formatMetric(relation.bestValid.metric.value),
+        })}</p>
+        : null}
+      {operation.parent
+        ? <div className="research-operation-budget">
+          {operation.parent.limits
+            ? <span>{t("localResearch.budget.runs", {
+              max: operation.parent.limits.maxChildRuns,
+              started: operation.parent.runs.started,
+            })}</span>
+            : <span>{t("localResearch.budget.runsOpen", { started: operation.parent.runs.started })}</span>}
+          {operation.parent.usage.wallClock.remainingSeconds !== null
+            ? <span>{t("localResearch.budget.remaining", { seconds: operation.parent.usage.wallClock.remainingSeconds })}</span>
+            : null}
+          {operation.parent.usage.wallClock.unknownSettlements
+            ? <span>{t("localResearch.budget.unknown", { count: operation.parent.usage.wallClock.unknownSettlements })}</span>
+            : null}
+          {operation.parent.stop.requestedAt
+            ? <span>{t("localResearch.budget.stopped")}</span>
             : null}
         </div>
         : null}
@@ -347,6 +386,11 @@ export function ResearchOperationPanel({
         {operation.delivery.state === "failed" && !active
           ? <button className="secondary-button compact-button" disabled={readOnly || retryBusy} onClick={() => void retry(operation)} type="button">
             {retryBusy ? t("localResearch.retryingDelivery") : t("localResearch.retryDelivery")}
+          </button>
+          : null}
+        {bestText
+          ? <button className="secondary-button compact-button" disabled={readOnly} onClick={() => onPrefill(bestText)} title={t("localResearch.bestHint")} type="button">
+            {t("localResearch.continueBest")}
           </button>
           : null}
         {continuation

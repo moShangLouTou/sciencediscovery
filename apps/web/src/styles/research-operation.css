@@ -130,6 +130,43 @@
 
 .research-operation-delivery-detail { overflow-wrap: anywhere; }
 
+.research-operation-relations {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.research-relation {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 0 6px;
+  white-space: nowrap;
+}
+
+.research-relation.best { border-color: var(--success); color: var(--success); }
+.research-relation.latest { border-color: var(--accent); color: var(--accent-ink); }
+.research-relation.selected { border-color: var(--warning); color: var(--warning); }
+.research-relation.invalid { border-color: var(--danger); color: var(--danger); }
+
+.research-operation-best {
+  color: var(--muted);
+  font-size: 11px;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.research-operation-budget {
+  color: var(--muted);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 11px;
+  gap: 2px 10px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .research-operation-outputs .link-button,
 .research-operation-panel .link-button {
   background: none;

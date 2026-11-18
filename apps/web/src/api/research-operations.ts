@@ -89,6 +89,10 @@ export interface ResearchOperation {
   model: { profileName: string; providerModel: string; selectionSource: string } | null;
   operationId: string;
   planVersionId: string | null;
+  /** This run's relation to its contract's latest/best/explicitly selected result. */
+  resultRelation?: ResearchResultRelation;
+  /** The research line's total-budget projection for this contract. */
+  parent?: ResearchParentSummary;
   stages: ResearchStage[];
   state: ResearchOperationState;
   stop: {
@@ -109,6 +113,112 @@ export interface ResearchOperation {
     outputTokens: number;
     unknownUsageCalls: number;
   } | null;
+}
+
+export interface ResearchResultSolutionRef {
+  artifactId: string;
+  logicalName: string;
+  version: number;
+  versionId: string;
+}
+
+export interface ResearchResultSelection {
+  isBestValid: boolean;
+  metric: { lowerIsBetter: boolean; name: string; value: number };
+  operationId: string;
+  reason: string;
+  selectedAt: string;
+  selectedBy: "tool" | "web";
+  solution: ResearchResultSolutionRef;
+  /** False when the chosen result is no longer a valid comparable result. */
+  valid: boolean;
+  wasBestValid: boolean;
+}
+
+export interface ResearchResultRelation {
+  bestValid: {
+    metric: { lowerIsBetter: boolean; name: string; value: number };
+    operationId: string;
+    solution: ResearchResultSolutionRef | null;
+  } | null;
+  comparable: boolean;
+  comparisonNote: string;
+  contractTaskId: string;
+  contractTitle: string;
+  groupId: string;
+  isBestValid: boolean;
+  isLatest: boolean;
+  isSelectedForNext: boolean;
+  rankable: boolean;
+  selectedForNext: ResearchResultSelection | null;
+  validity: "valid" | "invalid";
+  validityReasons: string[];
+}
+
+export interface ResearchParentSummary {
+  activeChild: { operationId: string; reservedSec: number; state: ResearchOperationState } | null;
+  createdAt: string;
+  deadlinePassed: boolean;
+  enforcement: { runCount: boolean; tokenCap: false; wallClock: boolean };
+  groupId: string;
+  limits: { deadlineAt: string; maxChildRuns: number; totalAllowanceSec: number } | null;
+  lowerIsBetter: boolean | null;
+  metricName: string | null;
+  parentId: string;
+  runs: { active: number; settled: number; started: number };
+  stop: {
+    confirmedAt?: string;
+    operationId?: string;
+    ownerRunId?: string;
+    requestedAt?: string;
+    requestedBy?: "tool" | "conversation-cancel";
+  };
+  taskId: string;
+  title: string;
+  updatedAt: string;
+  usage: {
+    wallClock: {
+      chargedSeconds: number;
+      knownSeconds: number;
+      notLaunched: number;
+      preparationSeconds?: number;
+      remainingSeconds: number | null;
+      reservedSeconds: number;
+      unknownPreparations?: number;
+      unknownSettlements: number;
+    };
+    tokens: {
+      agentDecision?: {
+        calls: number;
+        inputTokens: number;
+        outputTokens: number;
+        status: "known" | "partially-known" | "unknown" | "not-recorded";
+        unknownUsageCalls: number;
+      };
+      calls: number;
+      coverage?: string;
+      hardCap: null;
+      inputTokens: number;
+      note: string;
+      outputTokens: number;
+      status: "known" | "partially-known" | "unknown" | "not-launched";
+      unknownUsageCalls: number;
+    };
+  };
+  overhead?: {
+    preparations: {
+      attempts: number;
+      failed: number;
+      knownSeconds: number;
+      probeEvaluations: number;
+      succeeded: number;
+      tokens: "not-applicable";
+      unknown: number;
+      unknownProbes: number;
+    };
+    ideaTree: { executed: false; reason: string };
+    evolve: { executed: false; reason: string };
+  };
 }
 
 export interface ResearchOperationsResponse {
