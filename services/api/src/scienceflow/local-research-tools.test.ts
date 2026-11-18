@@ -20,9 +20,12 @@ import assert from "node:assert/strict";
 
 import {
   createLocalResearchTools,
+  GET_RESEARCH_RESULTS_TOOL,
   GET_RESEARCH_TOOL,
   localResearchInstructions,
   PUBLISH_RESEARCH_PLAN_TOOL,
+  SELECT_RESEARCH_RESULT_TOOL,
+  CHECK_EVOLVE_PILOT_TOOL,
   START_RESEARCH_TOOL,
   LIST_RESEARCH_TASKS_TOOL,
   PREPARE_RESEARCH_TASK_TOOL,
@@ -84,13 +87,46 @@ function fakeService(overrides: Partial<LocalResearchService> = {}): LocalResear
     inputMode: "fixed",
     latest: () => undefined,
     list: () => [],
+    checkEvolvePilot: async (input) => ({
+      adapter: null,
+      adapterLimits: [],
+      adapterShapeSupported: false,
+      contractTaskId: null,
+      executionSupported: false,
+      executionUnsupportedReasons: ["fixture execution is unsupported"],
+      gaps: ["fixture has no prepared task"],
+      groupId: null,
+      operationId: input.operationId,
+      plan: null,
+    }),
     listTasks: async () => [],
     observeMaxWaitMs: 3_000,
+    overhead: () => ({
+      evolve: { executed: false, reason: "not executed" },
+      ideaTree: { executed: false, reason: "not executed" },
+      preparations: {
+        attempts: 0,
+        failed: 0,
+        knownSeconds: 0,
+        probeEvaluations: 0,
+        succeeded: 0,
+        tokens: "not-applicable",
+        unattributedAttempts: 0,
+        unknown: 0,
+        unknownProbes: 0,
+      },
+      tokens: { coverage: "recorded-per-operation", hardCap: null, note: "recorded only" },
+    }),
+    parentBudget: null,
     permissionResource: LOCAL_RESEARCH_PERMISSION_RESOURCE,
     prepareTask: async () => {
       throw new Error("The fixed fixture profile cannot prepare a task");
     },
     profileId: "round23-local",
+    results: () => [],
+    selectForNext: () => {
+      throw new Error("The fixed fixture profile has no comparison group");
+    },
     taskMode: "fixed",
     publishPlan: async () => ({
       artifactId: "plan-artifact-1",
@@ -146,13 +182,18 @@ function byName(tools: ReturnType<typeof createLocalResearchTools>, name: string
 
 test("exposes the three research tools and states the experimental boundary", () => {
   const { tools } = toolsFor(fakeService());
-  assert.deepEqual(tools.map((tool) => tool.name), [START_RESEARCH_TOOL, GET_RESEARCH_TOOL, STOP_RESEARCH_TOOL]);
+  assert.deepEqual(tools.map((tool) => tool.name), [START_RESEARCH_TOOL, GET_RESEARCH_TOOL, GET_RESEARCH_RESULTS_TOOL, SELECT_RESEARCH_RESULT_TOOL, STOP_RESEARCH_TOOL]);
   const instructions = localResearchInstructions(fakeService());
   assert.match(instructions, /experimental local execution, not the formal Runner sandbox/);
   assert.match(instructions, /wait_seconds/);
   assert.match(instructions, /retry_delivery/);
   // The tool must state that a named version has to match the configured input.
   assert.match(instructions, /byte-identical/);
+  // Comparison, explicit selection and the honest budget boundary are stated.
+  assert.match(instructions, /best_valid/);
+  assert.match(instructions, /selected_for_next/);
+  assert.match(instructions, /one child at a time/);
+  assert.match(instructions, /no total token hard cap/);
 });
 
 test("start asks for the governed privilege and returns only the public operation view", async () => {
@@ -302,7 +343,7 @@ test("a dynamic profile exposes plan publication and says the Agent authors the 
   const { tools } = toolsFor(fakeService({ inputMode: "dynamic" }));
   assert.deepEqual(
     tools.map((tool) => tool.name),
-    [PUBLISH_RESEARCH_PLAN_TOOL, START_RESEARCH_TOOL, GET_RESEARCH_TOOL, STOP_RESEARCH_TOOL],
+    [PUBLISH_RESEARCH_PLAN_TOOL, START_RESEARCH_TOOL, GET_RESEARCH_TOOL, GET_RESEARCH_RESULTS_TOOL, SELECT_RESEARCH_RESULT_TOOL, STOP_RESEARCH_TOOL],
   );
   const instructions = localResearchInstructions(fakeService({ inputMode: "dynamic" }));
   assert.match(instructions, /publish_research_plan/);
@@ -428,7 +469,8 @@ test("task-dynamic mode exposes intake tools and forwards the selected task iden
   }));
   assert.deepEqual(tools.map((tool) => tool.name), [
     LIST_RESEARCH_TASKS_TOOL, PREPARE_RESEARCH_TASK_TOOL, PUBLISH_RESEARCH_PLAN_TOOL,
-    START_RESEARCH_TOOL, GET_RESEARCH_TOOL, STOP_RESEARCH_TOOL,
+    START_RESEARCH_TOOL, GET_RESEARCH_TOOL, GET_RESEARCH_RESULTS_TOOL, SELECT_RESEARCH_RESULT_TOOL,
+    CHECK_EVOLVE_PILOT_TOOL, STOP_RESEARCH_TOOL,
   ]);
   const listed = text(await byName(tools, LIST_RESEARCH_TASKS_TOOL).execute("call-list", {}, undefined));
   assert.equal((listed.tasks as Array<Record<string, unknown>>)[0]!.id, "ratio-minimization");
@@ -500,4 +542,89 @@ test("task preparation and plan publication descriptions share the execution tri
     assert.ok(description.includes("explicitly names ScienceFlow (case-insensitive)"));
     assert.ok(description.includes("Apply the no-run, plan-only and missing-input rules"));
   }
+});
+
+test("get_research_results exposes contract groups and select_research_result forwards an explicit choice", async () => {
+  const selections: Array<Record<string, unknown>> = [];
+  const group = {
+    bestValidOperationId: "operation-2",
+    comparable: true,
+    comparison: { latestVsBest: null, note: "descriptive", selectionRule: "metric then earliest" },
+    contract: { lowerIsBetter: true, metricName: "rmse", source: "prepared", taskId: "sd-fit", title: "Fit" },
+    contractFingerprint: "f".repeat(64),
+    evaluationBasis: "engine-recorded-captured-stage",
+    groupId: "sfc-contract-1",
+    independentFinalEvaluation: null,
+    latestOperationId: "operation-3",
+    rankable: true,
+    replicatePolicy: { declared: false, note: "none" },
+    results: [],
+    selection: null,
+    selectionState: "none",
+  } as unknown as import("./local-research-results.js").ScienceFlowResearchResultGroupView;
+  const service = fakeService({
+    results: () => [group],
+    selectForNext: (input) => {
+      selections.push(input as unknown as Record<string, unknown>);
+      return { ...group, selectionState: "non-optimal" };
+    },
+  });
+  const { tools } = toolsFor(service);
+  const listed = text(await byName(tools, GET_RESEARCH_RESULTS_TOOL).execute("call-results", {}, undefined));
+  assert.equal((listed.groups as Array<Record<string, unknown>>).length, 1);
+  assert.equal((listed.groups as Array<Record<string, unknown>>)[0]!.groupId, "sfc-contract-1");
+  assert.equal(((listed.overhead as Record<string, unknown>).preparations as Record<string, unknown>).attempts, 0);
+  const selected = text(await byName(tools, SELECT_RESEARCH_RESULT_TOOL).execute("call-select", {
+    operation_id: "operation-3",
+    reason: "A different basin is worth one more run.",
+  }, undefined));
+  assert.equal(selections.length, 1);
+  assert.equal(selections[0]!.operationId, "operation-3");
+  assert.equal(selections[0]!.selectedBy, "tool");
+  assert.equal((selected.group as Record<string, unknown>).selectionState, "non-optimal");
+  assert.match(String(selected.instruction), /best valid result remains reported separately/);
+});
+
+
+test("check_evolve_pilot reports either the frozen adapter or the exact gaps and never claims a search", async () => {
+  const calls: Array<Record<string, unknown>> = [];
+  const service = fakeService({
+    taskMode: "task-dynamic",
+    checkEvolvePilot: async (input) => {
+      calls.push(input as unknown as Record<string, unknown>);
+      return {
+        adapter: {
+          candidateFormat: "json-artifact-function",
+          dataset: { name: "fit.csv", rows: 20, sha256: "d".repeat(64) },
+          evaluatorSourceSha256: "a".repeat(64),
+          seedSourceSha256: "b".repeat(64),
+          shardCount: 16,
+          split: { gateShards: 8, rolloutShards: 4, seed: 0, shardRows: 1, testShards: 4, trainRows: null },
+        },
+        adapterLimits: ["analysis only"],
+        adapterShapeSupported: true,
+        contractTaskId: "sd-fit",
+        executionSupported: false,
+        executionUnsupportedReasons: ["no winner re-evaluation path"],
+        gaps: [],
+        groupId: "sfc-1",
+        operationId: input.operationId,
+        plan: { expansions: input.expansions ?? 8, statement: input.statement ?? "Improve", workers: input.workers ?? 1 },
+      };
+    },
+  });
+  const { tools } = toolsFor(service);
+  const checked = text(await byName(tools, CHECK_EVOLVE_PILOT_TOOL).execute("call-check", {
+    expansions: 12,
+    operation_id: "operation-1",
+    statement: "Improve the fit.",
+    workers: 1,
+  }, undefined));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.operationId, "operation-1");
+  assert.equal(checked.adapterShapeSupported, true);
+  assert.equal(checked.executionSupported, false);
+  assert.equal((checked.adapter as Record<string, unknown>).candidateFormat, "json-artifact-function");
+  assert.equal((checked.plan as Record<string, unknown>).expansions, 12);
+  assert.deepEqual(Array.from(checked.executionUnsupportedReasons as string[]), ["no winner re-evaluation path"]);
 });

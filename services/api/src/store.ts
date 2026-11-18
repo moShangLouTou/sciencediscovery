@@ -43,6 +43,11 @@ import { ConfigurationCredentialBridge } from "./configuration/credential-bridge
 import { ScienceFlowRegistrationRepository } from "./scienceflow/registration-repository.js";
 import { ScienceFlowLocalResearchRepository } from "./scienceflow/local-research-repository.js";
 import { PreparedTaskValidationRepository } from "./scienceflow/local-research-task-repository.js";
+import {
+  ResearchParentRepository,
+  ResearchResultSelectionRepository,
+} from "./scienceflow/local-research-results-repository.js";
+import { ResearchPreparationRepository } from "./scienceflow/local-research-overhead-repository.js";
 import { ScienceFlowExecutionPlanRepository } from "./scienceflow/execution-plan-repository.js";
 import { ScienceFlowRuntimeCheckRepository } from "./scienceflow/runtime-check-repository.js";
 import { ScienceFlowPreparedInputsRepository } from "./scienceflow/prepared-inputs-repository.js";
@@ -645,6 +650,9 @@ export class SessionStore {
   private scienceFlowPreparedInputsStore?: ScienceFlowPreparedInputsRepository;
   private scienceFlowLocalResearchStore?: ScienceFlowLocalResearchRepository;
   private scienceFlowPreparedTaskValidationStore?: PreparedTaskValidationRepository;
+  private scienceFlowResearchResultSelectionStore?: ResearchResultSelectionRepository;
+  private scienceFlowResearchParentStore?: ResearchParentRepository;
+  private scienceFlowResearchPreparationStore?: ResearchPreparationRepository;
   private loaded = false;
   private saveQueue = Promise.resolve();
   /** Physical reclamation outlives the request that asked for it; deletes queue
@@ -739,6 +747,30 @@ export class SessionStore {
       throw new Error("ScienceFlow prepared task validation storage is not initialized");
     }
     return this.scienceFlowPreparedTaskValidationStore;
+  }
+
+  /** Explicit `selected_for_next` decisions; survives a service rebuild. */
+  get scienceFlowResearchResultSelections(): ResearchResultSelectionRepository {
+    if (!this.scienceFlowResearchResultSelectionStore) {
+      throw new Error("ScienceFlow research result selection storage is not initialized");
+    }
+    return this.scienceFlowResearchResultSelectionStore;
+  }
+
+  /** Per-contract research-line budgets, reservations and decision history. */
+  get scienceFlowResearchParents(): ResearchParentRepository {
+    if (!this.scienceFlowResearchParentStore) {
+      throw new Error("ScienceFlow research parent storage is not initialized");
+    }
+    return this.scienceFlowResearchParentStore;
+  }
+
+  /** Preparation and evaluator-probe overhead, attributable to a contract or the Session. */
+  get scienceFlowResearchPreparations(): ResearchPreparationRepository {
+    if (!this.scienceFlowResearchPreparationStore) {
+      throw new Error("ScienceFlow research preparation storage is not initialized");
+    }
+    return this.scienceFlowResearchPreparationStore;
   }
 
   get transfers(): WorkspaceTransfers {
@@ -904,6 +936,9 @@ export class SessionStore {
     this.scienceFlowPreparedInputsStore = new ScienceFlowPreparedInputsRepository(this.database);
     this.scienceFlowLocalResearchStore = new ScienceFlowLocalResearchRepository(this.database);
     this.scienceFlowPreparedTaskValidationStore = new PreparedTaskValidationRepository(this.database);
+    this.scienceFlowResearchResultSelectionStore = new ResearchResultSelectionRepository(this.database);
+    this.scienceFlowResearchParentStore = new ResearchParentRepository(this.database);
+    this.scienceFlowResearchPreparationStore = new ResearchPreparationRepository(this.database);
     this.secretKey = await this.loadOrCreateSecretKey();
     this.migrateRemoteHostTokens();
     const modelIdsWithSecrets = new Set((this.database.prepare("SELECT model_id FROM model_secrets").all() as Array<{ model_id: string }>).map((row) => row.model_id));
@@ -1634,6 +1669,11 @@ export class SessionStore {
     if (exists("science_flow_prepared_task_validations")) {
       this.scienceFlowPreparedTaskValidationStore?.deleteSession(sessionId);
     }
+    if (exists("science_flow_research_result_selections")) {
+      this.scienceFlowResearchResultSelectionStore?.deleteSession(sessionId);
+    }
+    if (exists("science_flow_research_parents")) this.scienceFlowResearchParentStore?.deleteSession(sessionId);
+    if (exists("science_flow_research_preparations")) this.scienceFlowResearchPreparationStore?.deleteSession(sessionId);
   }
 
 
@@ -6255,6 +6295,9 @@ export class SessionStore {
     this.scienceFlowPreparedInputsStore?.deleteProject(projectId);
     this.scienceFlowLocalResearchStore?.deleteProject(projectId);
     this.scienceFlowPreparedTaskValidationStore?.deleteProject(projectId);
+    this.scienceFlowResearchResultSelectionStore?.deleteProject(projectId);
+    this.scienceFlowResearchParentStore?.deleteProject(projectId);
+    this.scienceFlowResearchPreparationStore?.deleteProject(projectId);
     for (const session of sessions) {
       this.database?.prepare("DELETE FROM specialist_runtime_secrets WHERE session_id IN (?, ?, ?)").run(session.id, `claude-code:${session.id}`, `acp:${session.id}`);
       this.database?.prepare("DELETE FROM connector_configuration_requests WHERE session_id = ?").run(session.id);

@@ -178,11 +178,13 @@ async function startAccepted(
     readonly inputVersionIds?: readonly string[];
     readonly taskPackageId?: string;
     readonly taskVersionId?: string;
+    readonly ownerRunId?: string;
+    readonly proposal?: import("./local-research-proposal.js").ExperimentProposalInput;
   },
 ) {
   const started = await service.start({
     intent: "Fit the requested numerical model and report the evaluated metric.",
-    ownerRunId: "conversation-run-1",
+    ownerRunId: extra.ownerRunId ?? "conversation-run-1",
     planVersionId,
     projectId: target.projectId,
     sessionId: target.sessionId,
@@ -225,6 +227,7 @@ test("a catalog task is bound by id and the manifest keeps the package evaluator
         category: "opt_solver",
         description: "# Ratio minimization\n\nPlace 16 points.",
         descriptionAvailable: true,
+        entrypointSha256: "1".repeat(64),
         evaluatorEntrypoint: "evaluator.py:evaluate",
         id: "ratio-minimization",
         inputsRequired: null,
@@ -232,6 +235,7 @@ test("a catalog task is bound by id and the manifest keeps the package evaluator
         metricName: "inv_ratio_squared",
         metricType: "benchmark",
         missingModules: [],
+        packageSha256: "2".repeat(64),
         profile: "opt_solver",
         provider: "",
       };
@@ -508,6 +512,13 @@ test("a non-default metric JSON path is carried from preparation into the run ma
     metricJsonPath: "result.loss",
   }));
   assert.deepEqual(prepared.metric, { jsonPath: "result.loss", lowerIsBetter: true, name: "rmse" });
+  const preparations = target.store.scienceFlowResearchPreparations.listForSession(target.projectId, target.sessionId);
+  assert.equal(preparations.length, 1);
+  assert.equal(preparations[0]!.outcome, "succeeded");
+  assert.equal(preparations[0]!.taskVersionId, prepared.taskVersionId);
+  assert.equal(preparations[0]!.probe.evaluations, 2);
+  assert.equal(preparations[0]!.probe.status, "known");
+  assert.equal(preparations[0]!.tokens.status, "not-applicable");
   // The probe receives the same path the contract carries.
   const view = await startAccepted(service, target, plan.versionId, { taskVersionId: prepared.taskVersionId });
   assert.equal(view.state, "completed");
@@ -730,6 +741,14 @@ test("continuation rejects a candidate delivered under another task contract", a
   // The task that produced the candidate may continue from it.
   const continued = await startAccepted(service, target, plan.versionId, {
     incumbentVersionId: candidate.versionId,
+    proposal: {
+      evaluationMethod: `Same frozen contract ${taskA.taskId} and probe-verified evaluator.`,
+      evidence: [{ fact: "Task A delivered this candidate.", kind: "artifact-version", versionId: candidate.versionId }],
+      expectedObservation: "A lower metric than the delivered candidate.",
+      methodChange: "Adjust the single parameter around the delivered candidate.",
+      researchQuestion: "Can the delivered parameter be improved?",
+      stopCondition: "Stop after the first captured candidate below the delivered metric.",
+    },
     taskVersionId: taskA.taskVersionId,
   });
   assert.equal(continued.state, "completed");
@@ -793,6 +812,7 @@ test("a catalog task with an unresolved evaluator dependency is refused before l
       category: "opt_solver",
       description: "# Ratio minimization\n\nPlace 16 points.",
       descriptionAvailable: true,
+      entrypointSha256: "1".repeat(64),
       evaluatorEntrypoint: "evaluator.py:evaluate",
       id: "ratio-minimization",
       inputsRequired: null,
@@ -800,6 +820,7 @@ test("a catalog task with an unresolved evaluator dependency is refused before l
       metricName: "inv_ratio_squared",
       metricType: "benchmark",
       missingModules: ["numpy", "scipy"],
+      packageSha256: "2".repeat(64),
       profile: "opt_solver",
       provider: "",
     }),
@@ -817,4 +838,85 @@ test("a catalog task with an unresolved evaluator dependency is refused before l
       && /numpy, scipy/u.test(error.message),
   );
   assert.equal(launches.length, 0);
+});
+
+
+test("a continuation round needs a structured proposal and the same experiment is refused unless a randomized repeat is declared", async (context) => {
+  const target = await fixture(context);
+  const plan = await publish(target.store, target.sessionId, "research-plan.md", PLAN_TEXT);
+  const { service } = serviceFor(target, {
+    describeTask: async () => ({
+      artifactKind: "json_solution",
+      artifactPath: "artifacts/best_solution.json",
+      authoritative: false,
+      category: "opt_solver",
+      description: "# Ratio minimization\n\nPlace 16 points.",
+      descriptionAvailable: true,
+      entrypointSha256: "1".repeat(64),
+      evaluatorEntrypoint: "evaluator.py:evaluate",
+      id: "ratio-minimization",
+      inputsRequired: null,
+      lowerIsBetter: false,
+      metricName: "inv_ratio_squared",
+      metricType: "benchmark",
+      missingModules: [],
+      packageSha256: "2".repeat(64),
+      profile: "opt_solver",
+      provider: "",
+    }),
+  });
+  const proposal = {
+    evaluationMethod: "Same frozen ratio task and package evaluator.",
+    evidence: [{ fact: "The plan defines the bounded geometry task.", kind: "artifact-version" as const, versionId: plan.versionId }],
+    expectedObservation: "A captured inverse ratio squared above the previous result.",
+    methodChange: "Perturb the smallest circle and re-evaluate the geometry.",
+    researchQuestion: "Can the smallest circle be moved to improve the ratio?",
+    stopCondition: "Stop after the first captured candidate better than the seed.",
+    subBudgetSeconds: 320,
+  };
+  const first = await startAccepted(service, target, plan.versionId, {
+    proposal,
+    taskPackageId: "ratio-minimization",
+  });
+  assert.equal(first.state, "completed");
+
+  await assert.rejects(
+    () => service.start({
+      intent: "Fit the requested numerical model and report the evaluated metric.",
+      ownerRunId: "conversation-run-2",
+      planVersionId: plan.versionId,
+      projectId: target.projectId,
+      proposal,
+      sessionId: target.sessionId,
+      taskPackageId: "ratio-minimization",
+    }),
+    (error: unknown) => error instanceof LocalResearchRefusal && error.reason === "proposal-not-new",
+  );
+  const countAfterRefusal = target.store.scienceFlowResearchOperations
+    .listForSession(target.projectId, target.sessionId).length;
+  assert.equal(countAfterRefusal, 1, "a refused proposal creates no operation");
+
+  const advanced = await startAccepted(service, target, plan.versionId, {
+    ownerRunId: "conversation-run-3",
+    proposal: { ...proposal, methodChange: "Refit the geometry with a different perturbation order." },
+    taskPackageId: "ratio-minimization",
+  });
+  assert.equal(advanced.state, "completed");
+
+  const repeated = await startAccepted(service, target, plan.versionId, {
+    ownerRunId: "conversation-run-4",
+    proposal: {
+      ...proposal,
+      methodChange: "Refit the geometry with a different perturbation order.",
+      repeat: {
+        kind: "randomized-repeat",
+        purpose: "Estimate how much the perturbation order changes the result.",
+        randomness: "Order derived deterministically from the run id.",
+        repetitions: 3,
+      },
+    },
+    taskPackageId: "ratio-minimization",
+  });
+  assert.equal(repeated.state, "completed");
+  assert.equal(target.store.scienceFlowResearchOperations.listForSession(target.projectId, target.sessionId).length, 3);
 });

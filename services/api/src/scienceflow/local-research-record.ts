@@ -51,6 +51,8 @@ export interface ScienceFlowLocalResearchStage {
   readonly metricValue: number;
   readonly artifactSha256: string | null;
   readonly validationOk: boolean;
+  /** The engine's own eligibility for selection, when the row records it. */
+  readonly selectionEligible?: boolean;
   readonly gateAccepted: boolean;
   readonly evaluatorStatus: string;
   readonly createdAtUtc: string;
@@ -141,6 +143,7 @@ export type ScienceFlowLocalResearchInputRole = "plan" | "incumbent";
  */
 export type { ScienceFlowTaskBinding } from "./local-research-task.js";
 import type { ScienceFlowTaskBinding } from "./local-research-task.js";
+import type { ExperimentProposal } from "./local-research-proposal.js";
 
 /**
  * The bytes this operation's launch actually used for one fixed input role.
@@ -179,6 +182,14 @@ export interface ScienceFlowLocalResearchEngineFacts {
   readonly reportStatus?: string;
   readonly alive?: boolean;
   readonly supervisorPid?: number;
+  /** Wall clock the launcher observed, when it reported one. */
+  readonly elapsedSec?: number;
+  /** The evaluator package the engine actually registered for this run. */
+  readonly evaluator?: {
+    readonly taskId?: string;
+    readonly entrypointSha256?: string;
+    readonly packageSha256?: string;
+  };
   readonly observedAt?: string;
 }
 
@@ -206,6 +217,20 @@ export interface ScienceFlowLocalResearchOperation {
   readonly task: string;
   /** The task contract this operation froze, when the profile allows task choice. */
   readonly taskBinding?: ScienceFlowTaskBinding;
+  /** The structured proposal this round was accepted on, when one was supplied. */
+  readonly proposal?: ExperimentProposal;
+  /**
+   * The explicit `selected_for_next` result this round followed, with the
+   * reason recorded by the user/Agent. Present only when the service actually
+   * used that selection as the starting candidate.
+   */
+  readonly followedSelection?: {
+    readonly operationId: string;
+    readonly versionId: string;
+    readonly reason: string;
+    readonly selectedAt: string;
+    readonly isBestValid: boolean;
+  };
   /** Control-plane paths, needed to observe this run again after a rebuild. */
   readonly workDir: string;
   readonly receiptPath: string;
@@ -223,6 +248,28 @@ export interface ScienceFlowLocalResearchOperation {
     readonly inputMode?: "fixed" | "dynamic";
     /** The exact instruction pinned for this run, when one was composed. */
     readonly taskDescription?: string;
+    /**
+     * The engine checkout's own `HEAD` when this run was accepted. A catalog
+     * task's evaluator identity includes it, so two checkouts that share a task
+     * name but not a revision are not compared. Absent when it could not be
+     * observed; such a catalog run is shown but not ranked.
+     */
+    readonly engineRevision?: string;
+    /** Whether the checkout had tracked or runnable-untracked changes when the
+     *  run was accepted. Part of the catalog execution-environment identity. */
+    readonly engineWorktreeDirty?: boolean;
+    /** Digest of the checkout status bytes, so two dirty states are distinct. */
+    readonly engineStatusDigest?: string;
+    /** The actual host/interpreter environment this run executes in. */
+    readonly executionEnvironment?: {
+      readonly fingerprint: string;
+      readonly platform: string;
+      readonly arch: string;
+      readonly python: string;
+    };
+    /** Set once the worker reaches the launch step; distinguishes "no run" from
+     *  "ran but the elapsed time or usage could not be observed". */
+    readonly launchedAt?: string;
   };
   readonly engine: ScienceFlowLocalResearchEngineFacts;
   /** Present once the operation's own input directory has been staged. */
@@ -231,6 +278,19 @@ export interface ScienceFlowLocalResearchOperation {
     readonly stages: readonly ScienceFlowLocalResearchStage[];
     readonly usage: ScienceFlowLocalResearchUsage | null;
     readonly observedAt?: string;
+  };
+  /**
+   * The Agent's own model usage for the conversation run that owns this
+   * operation, captured from the Session's usage log. A missing record is
+   * `not-recorded`, never a fabricated zero.
+   */
+  readonly agentUsage?: {
+    readonly capturedAt: string;
+    readonly calls: number;
+    readonly inputTokens: number;
+    readonly outputTokens: number;
+    readonly unknownUsageCalls: number;
+    readonly status: "known" | "partially-known" | "unknown" | "not-recorded";
   };
   readonly delivery: ScienceFlowLocalResearchDelivery;
   readonly stop: ScienceFlowLocalResearchStop;

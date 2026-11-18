@@ -93,6 +93,10 @@ export interface ScienceFlowCatalogTask {
 
 export interface ScienceFlowCatalogTaskDescription extends ScienceFlowCatalogTask {
   readonly description: string;
+  /** Digest of the evaluator file this package declares, when observable. */
+  readonly entrypointSha256: string | null;
+  /** Digest of the package source tree the engine would import. */
+  readonly packageSha256: string | null;
   /** Third-party modules the package's evaluator imports but this interpreter lacks. */
   readonly missingModules: readonly string[];
 }
@@ -167,7 +171,14 @@ export interface ScienceFlowTaskBinding {
   readonly artifactKind: string;
   /** The evaluator identity the engine will run. */
   readonly evaluator:
-    | { readonly kind: "task-package"; readonly entrypoint: string }
+    | {
+        readonly kind: "task-package";
+        readonly entrypoint: string;
+        /** Digest of the evaluator file the package declares, when observable. */
+        readonly entrypointSha256?: string;
+        /** Digest of the package source tree the engine would import. */
+        readonly packageSha256?: string;
+      }
     | { readonly kind: "generated-command"; readonly sha256: string; readonly versionId: string };
   /** Where this operation's frozen task files live (control plane only). */
   readonly assetDir?: string;
@@ -341,12 +352,18 @@ export async function describeCatalogTask(
     category: "",
     description: response.description,
     descriptionAvailable: true,
+    entrypointSha256: typeof response.entrypointSha256 === "string" && /^[a-f0-9]{64}$/u.test(response.entrypointSha256)
+      ? response.entrypointSha256
+      : null,
     evaluatorEntrypoint: String(response.evaluatorEntrypoint ?? ""),
     id: String(response.taskId ?? taskId),
     inputsRequired: null,
     lowerIsBetter: typeof response.lowerIsBetter === "boolean" ? response.lowerIsBetter : null,
     metricName: String(response.metricName ?? ""),
     metricType: String(response.metricType ?? ""),
+    packageSha256: typeof response.packageSha256 === "string" && /^[a-f0-9]{64}$/u.test(response.packageSha256)
+      ? response.packageSha256
+      : null,
     missingModules: Array.isArray(response.missingModules)
       ? response.missingModules.flatMap((value) => (typeof value === "string" ? [value] : []))
       : [],

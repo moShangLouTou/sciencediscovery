@@ -336,3 +336,32 @@ test("task-dynamic mode replaces the fixed task instead of keeping it as a defau
     /requires research.inputMode "dynamic"/,
   );
 });
+
+test("a research-line budget must hold at least one child and reject unknown fields", async (context) => {
+  const target = await fixture(context);
+  const defaults = { observeMaxWaitMs: 30_000, researchBudgetSec: 120, reportBudgetSec: 30, totalAllowanceSec: 200 };
+  const research = configValue(target).research as Record<string, unknown>;
+  const accepted = await load(target, {
+    enabled: true,
+    research: { ...research, parentBudget: { maxChildRuns: 3, totalAllowanceSec: 900 } },
+    schemaVersion: 1,
+    defaults,
+  });
+  assert.ok(accepted);
+  assert.deepEqual(accepted.parentBudget, { maxChildRuns: 3, totalAllowanceSec: 900 });
+  for (const parentBudget of [
+    { maxChildRuns: 0, totalAllowanceSec: 900 },
+    { maxChildRuns: 3, totalAllowanceSec: 199 },
+    { maxChildRuns: 3, totalAllowanceSec: 900, unexpected: 1 },
+  ]) {
+    await assert.rejects(
+      () => load(target, {
+        enabled: true,
+        research: { ...research, parentBudget },
+        schemaVersion: 1,
+        defaults,
+      }),
+      /parentBudget|unsupported key|between/,
+    );
+  }
+});

@@ -124,6 +124,14 @@ export interface ScienceFlowLocalResearchSettings {
   readonly dynamicInputs?: ScienceFlowLocalResearchDynamicInputs;
   /** Root for per-operation work dirs, receipts and delivery records. */
   readonly workRoot: string;
+  /**
+   * Optional enforceable total budget for one research line (one frozen task
+   * contract). When absent the line still records usage but enforces only the
+   * serial one-active-child rule; when present a new child is refused before it
+   * is created once the run count, deadline or reserved wall clock would exceed
+   * this allowance. Token use is always recorded, never promised as a hard cap.
+   */
+  readonly parentBudget?: ScienceFlowLocalResearchParentBudget;
   /** Root for per-operation private engine inputs (0700); outside the work root. */
   readonly privateRoot: string;
   /** Fixed task text pinned as the researcher's first message; absent means the
@@ -141,6 +149,19 @@ export interface ScienceFlowLocalResearchSettings {
 export interface ScienceFlowLocalResearchInputs {
   readonly plan?: string;
   readonly incumbent?: string;
+}
+
+/** The enforceable part of a research line's total budget. */
+export interface ScienceFlowLocalResearchParentBudget {
+  /** Maximum number of child operations on one frozen contract. */
+  readonly maxChildRuns: number;
+  /**
+   * Total wall-clock allowance of the line. Each child reserves its own
+   * `defaults.totalAllowanceSec` before launch, and the reservation is settled
+   * from the launcher's observed elapsed time; when that is unobservable the
+   * reservation itself is charged rather than zero.
+   */
+  readonly totalAllowanceSec: number;
 }
 
 /**
@@ -265,6 +286,7 @@ function parseResearch(
       "privateRoot",
       "taskDescriptionPath",
       "refusePackageInstall",
+      "parentBudget",
     ],
     "research",
   );
@@ -334,6 +356,9 @@ function parseResearch(
   const refusePackageInstall = value.refusePackageInstall === undefined
     ? true
     : requireBoolean(value.refusePackageInstall, "research.refusePackageInstall");
+  const parentBudget = value.parentBudget === undefined
+    ? undefined
+    : parseParentBudget(value.parentBudget, defaults);
   return Object.freeze({
     profileId,
     engineCheckout,
@@ -351,9 +376,31 @@ function parseResearch(
     privateRoot,
     ...(taskDescription === undefined ? {} : { taskDescription }),
     ...(taskTemplate === undefined ? {} : { taskTemplate }),
+    ...(parentBudget === undefined ? {} : { parentBudget }),
     refusePackageInstall,
     defaults,
   });
+}
+
+/**
+ * A research line's total budget is enforceable only when it can hold at least
+ * one child: a smaller total would refuse every start after configuration, which
+ * is a mistake in the file rather than a research decision.
+ */
+function parseParentBudget(
+  value: unknown,
+  defaults: ScienceFlowLocalResearchDefaults,
+): ScienceFlowLocalResearchParentBudget {
+  if (!isRecord(value)) throw configError("research.parentBudget must be an object");
+  rejectUnknownKeys(value, ["maxChildRuns", "totalAllowanceSec"], "research.parentBudget");
+  const maxChildRuns = requireInteger(value.maxChildRuns, "research.parentBudget.maxChildRuns", 1, 100);
+  const totalAllowanceSec = requireInteger(
+    value.totalAllowanceSec,
+    "research.parentBudget.totalAllowanceSec",
+    defaults.totalAllowanceSec,
+    86_400,
+  );
+  return Object.freeze({ maxChildRuns, totalAllowanceSec });
 }
 
 function parseTaskMode(value: unknown): ScienceFlowLocalResearchTaskMode {

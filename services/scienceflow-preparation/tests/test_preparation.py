@@ -43,6 +43,31 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "engine_unavailable")
 
 
+class PackageIdentityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import tempfile
+
+        self._directory = tempfile.TemporaryDirectory(prefix="prep-package-")
+        self.root = Path(self._directory.name)
+
+    def tearDown(self) -> None:
+        self._directory.cleanup()
+
+    def test_a_package_digest_changes_with_its_files_and_ignores_pycache(self) -> None:
+        (self.root / "evaluator.py").write_text("VALUE = 1\n", encoding="utf-8")
+        first = preparation._bounded_tree_sha256(self.root)
+        self.assertIsNotNone(first)
+        self.assertEqual(first, preparation._bounded_tree_sha256(self.root))
+        (self.root / "__pycache__").mkdir()
+        (self.root / "__pycache__" / "evaluator.cpython-312.pyc").write_bytes(b"ignored")
+        self.assertEqual(first, preparation._bounded_tree_sha256(self.root))
+        (self.root / "evaluator.py").write_text("VALUE = 2\n", encoding="utf-8")
+        self.assertNotEqual(first, preparation._bounded_tree_sha256(self.root))
+
+    def test_an_unreadable_tree_reports_no_identity(self) -> None:
+        self.assertIsNone(preparation._bounded_tree_sha256(self.root / "absent"))
+
+
 class DependencyGapTests(unittest.TestCase):
     def setUp(self) -> None:
         import tempfile

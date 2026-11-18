@@ -573,17 +573,19 @@ test("a genuinely new user experiment receives a new operation identity", async 
     sessionId: target.sessionId,
   };
   const first = await service.start(request);
+  // The line runs one child at a time: the first bounded experiment must reach
+  // a terminal state before a later user message may reserve the next one.
+  await waitTerminal(service, {
+    operationId: first.operation.operationId,
+    projectId: target.projectId,
+    sessionId: target.sessionId,
+  });
   // A later user message is a different conversation run; the same intent is a
   // new experiment, not a replay of the first one.
   const second = await service.start({ ...request, ownerRunId: "conversation-run-2" });
   assert.equal(first.attached, false);
   assert.equal(second.attached, false);
   assert.notEqual(second.operation.operationId, first.operation.operationId);
-  await waitTerminal(service, {
-    operationId: first.operation.operationId,
-    projectId: target.projectId,
-    sessionId: target.sessionId,
-  });
   await waitTerminal(service, {
     operationId: second.operation.operationId,
     projectId: target.projectId,

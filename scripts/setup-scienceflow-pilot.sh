@@ -388,6 +388,10 @@ if [[ ! -e "$config_path" ]]; then
         workRoot: path.join(root, "runs"),
         privateRoot: path.join(root, "private"),
         refusePackageInstall: true,
+        // Six bounded children or 5,400s of reserved wall clock per frozen
+        // scientific contract. Token use is recorded after the fact; this
+        // deployment cannot enforce a total token hard cap and does not claim to.
+        parentBudget: { maxChildRuns: 6, totalAllowanceSec: 5400 },
       },
       defaults: {
         researchBudgetSec: 840,

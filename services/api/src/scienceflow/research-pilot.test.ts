@@ -403,6 +403,87 @@ test("generated model inputs stay private and outside everything else", async ()
   });
 });
 
+test("the absolute line deadline is enforced after model inputs are written and tightens the manifest grant", async () => {
+  await withTempDir("pilot-deadline-", async (base) => {
+    const { store, projectId, sessionId } = await provisionStore(base);
+    const baseTime = Date.parse("2026-11-16T10:00:00.000Z");
+    let first = true;
+    const now = () => {
+      if (first) {
+        first = false;
+        return new Date(baseTime).toISOString();
+      }
+      return new Date(baseTime + 400_000).toISOString();
+    };
+    const options: ResearchPilotOptions & { projectId: string; sessionId: string } = {
+      projectId,
+      sessionId,
+      runId: "deadline-tighten-run",
+      workDir: join(base, "work"),
+      privateRoot: join(base, "private"),
+      seedDir: join(base, "seed"),
+      engineCheckout: "/opt/engine",
+      pythonExecutable: "/opt/python/bin/python",
+      readerScriptPath: "/opt/reader/snapshot.py",
+      researchBudgetSec: 240,
+      reportBudgetSec: 60,
+      totalAllowanceSec: 900,
+      deadlineAt: new Date(baseTime + 600_000).toISOString(),
+    };
+    let launchInput: { manifestPath: string; totalAllowanceSec: number } | undefined;
+    const receipt = await runResearchPilot(store, options, {
+      launch: async (input) => {
+        launchInput = input;
+        return { outcome: "launch-failed", error: { type: "Stub", message: "capture only" } };
+      },
+      now,
+    });
+    assert.equal(launchInput?.totalAllowanceSec, 200);
+    const manifest = await readFile(launchInput!.manifestPath, "utf8");
+    assert.match(manifest, /wall_clock_budget_sec: 140/u);
+    assert.match(manifest, /report_budget_sec: 60/u);
+    assert.equal(receipt.engine.grant.totalAllowanceSec, 200);
+  });
+});
+
+test("a launch after the absolute line deadline writes a refusal and never calls the launcher", async () => {
+  await withTempDir("pilot-deadline-passed-", async (base) => {
+    const { store, projectId, sessionId } = await provisionStore(base);
+    const baseTime = Date.parse("2026-11-16T10:00:00.000Z");
+    let first = true;
+    const now = () => {
+      if (first) {
+        first = false;
+        return new Date(baseTime).toISOString();
+      }
+      return new Date(baseTime + 700_000).toISOString();
+    };
+    let launches = 0;
+    const receipt = await runResearchPilot(store, {
+      projectId,
+      sessionId,
+      runId: "deadline-refused-run",
+      workDir: join(base, "work"),
+      privateRoot: join(base, "private"),
+      seedDir: join(base, "seed"),
+      engineCheckout: "/opt/engine",
+      pythonExecutable: "/opt/python/bin/python",
+      readerScriptPath: "/opt/reader/snapshot.py",
+      totalAllowanceSec: 900,
+      deadlineAt: new Date(baseTime + 600_000).toISOString(),
+    }, {
+      launch: async () => {
+        launches += 1;
+        return { outcome: "finished", status: "completed" };
+      },
+      now,
+    });
+    assert.equal(launches, 0);
+    assert.equal(receipt.outcome.status, "invalid-option");
+    assert.match(receipt.outcome.message ?? "", /deadline passed before the engine launch/u);
+  });
+});
+
 test("a refused profile never reaches the engine", async () => {
   await withTempDir("pilot-refused-", async (base) => {
     const store = fakeStore({

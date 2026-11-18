@@ -326,6 +326,8 @@ export interface ResearchPilotOptions {
   readonly httpTimeoutSec?: number;
   readonly refusePackageInstall?: boolean;
   readonly receiptPath?: string;
+  /** Absolute parent-line deadline; a launch at or after it is refused. */
+  readonly deadlineAt?: string;
 }
 
 export interface ResearchPilotGrant {
@@ -387,6 +389,8 @@ export type ResearchPilotLauncher = (input: {
   readonly stateHome: string;
   readonly noInstallPathPrefix?: string;
   readonly proxyUrl?: string;
+  /** Absolute parent-line deadline; the supervisor must not run past it. */
+  readonly deadlineAt?: string;
 }) => Promise<ResearchPilotLaunchOutcome>;
 
 export interface ResearchPilotStageRow {
@@ -675,6 +679,37 @@ export async function materializeResearchPilotModelInputs(input: {
   return { alias, useProxy };
 }
 
+/**
+ * Tighten one frozen grant to the absolute line deadline immediately before the
+ * manifest is written. `undefined` means the launch must not happen at all.
+ */
+function tightenGrantForAbsoluteDeadline(
+  grant: ResearchPilotGrant,
+  deadlineAt: string | undefined,
+  now: () => string,
+): ResearchPilotGrant | undefined {
+  if (deadlineAt === undefined) return grant;
+  const deadlineMs = Date.parse(deadlineAt);
+  const nowMs = Date.parse(now());
+  if (!Number.isFinite(deadlineMs) || !Number.isFinite(nowMs)) return undefined;
+  const remainingSec = (deadlineMs - nowMs) / 1_000;
+  if (remainingSec <= 0) return undefined;
+  if (remainingSec >= grant.totalAllowanceSec) return grant;
+  const totalAllowanceSec = Math.floor(remainingSec);
+  if (totalAllowanceSec < 60) return undefined;
+  const reportBudgetSec = Math.min(grant.reportBudgetSec, Math.max(10, totalAllowanceSec - 30));
+  const researchBudgetSec = Math.min(grant.researchBudgetSec, totalAllowanceSec - reportBudgetSec);
+  if (researchBudgetSec < 30) return undefined;
+  return { ...grant, reportBudgetSec, researchBudgetSec, totalAllowanceSec };
+}
+
+/** Epoch milliseconds for the supervisor, or 0 when no absolute deadline exists. */
+function deadlineEpochMs(deadlineAt: string | undefined): number {
+  if (deadlineAt === undefined) return 0;
+  const value = Date.parse(deadlineAt);
+  return Number.isFinite(value) ? value : 0;
+}
+
 /** One engine launch manifest derived from the frozen grant. */
 export function researchPilotManifest(input: {
   readonly grant: ResearchPilotGrant;
@@ -763,7 +798,7 @@ export async function runResearchPilot(
       { preserveExisting: true },
     );
   }
-  const context: ResearchPilotContext = { store, identity, request, ...plan, now };
+  let context: ResearchPilotContext = { store, identity, request, ...plan, now };
 
   // A run id names one engine run. If the engine already owns it, the only
   // valid continuation is `attach`; starting again would be a second paid run.
@@ -819,6 +854,33 @@ export async function runResearchPilot(
     engineCheckout: request.engineCheckout,
     pythonExecutable: request.pythonExecutable,
   });
+  // Model input generation, directory creation and file writes are real
+  // preparation time. Recheck the absolute line deadline here, immediately
+  // before the manifest freezes the grant, instead of trusting the caller's
+  // earlier check.
+  const finalGrant = tightenGrantForAbsoluteDeadline(plan.grant, request.deadlineAt, now);
+  if (finalGrant === undefined) {
+    return writeReceipt(
+      refusalReceipt({
+        identity,
+        startedAt,
+        now,
+        request,
+        error: new ResearchPilotRefusal(
+          "invalid-option",
+          "The research line deadline passed before the engine launch",
+        ),
+        status: "invalid-option",
+        ...plan,
+      }),
+      plan.paths.receiptPath,
+      { preserveExisting: true },
+    );
+  }
+  if (finalGrant !== plan.grant) {
+    plan = { ...plan, grant: finalGrant };
+    context = { ...context, grant: finalGrant };
+  }
   await mkdir(plan.paths.runsRoot, { recursive: true });
   await writeFile(
     plan.paths.manifestPath,
@@ -865,6 +927,7 @@ export async function runResearchPilot(
       stateHome: plan.paths.stateHome,
       ...(noInstallPathPrefix ? { noInstallPathPrefix } : {}),
       ...(resolved.proxyUrl ? { proxyUrl: resolved.proxyUrl } : {}),
+      ...(request.deadlineAt === undefined ? {} : { deadlineAt: request.deadlineAt }),
     });
   } catch (error) {
     // The launcher threw, so whether the engine started is not known from here.
@@ -1583,10 +1646,19 @@ def process_alive(pid):
     return state != "Z"
 
 def main():
-    if len(sys.argv) != 4:
+    if len(sys.argv) not in (4, 5):
         emit({"protocol": PROTOCOL, "outcome": "invalid-arguments"})
         return 2
     manifest, run_id, allowance = sys.argv[1], sys.argv[2], float(sys.argv[3])
+    deadline_ms = float(sys.argv[4]) if len(sys.argv) == 5 else 0.0
+    if deadline_ms:
+        remaining = deadline_ms / 1000.0 - time.time()
+        if remaining <= 0:
+            emit({"protocol": PROTOCOL, "outcome": "launch-failed",
+                  "error": {"type": "DeadlineExceeded",
+                            "message": "the research line deadline passed before the engine launch"}})
+            return 1
+        allowance = min(allowance, remaining)
     from scienceflow.runtime.parallel.control import get_run, start_run, stop_run
     started = time.time()
     try:
@@ -1595,6 +1667,10 @@ def main():
         emit({"protocol": PROTOCOL, "outcome": "launch-failed",
               "error": {"type": type(error).__name__, "message": str(error)[:500]}})
         return 1
+    if deadline_ms:
+        # The engine may take time to start; cap the observation at the absolute
+        # deadline as well, not only at the original relative allowance.
+        allowance = min(allowance, max(0.0, deadline_ms / 1000.0 - time.time()))
     supervisor = int(record.get("pid") or 0)
     failure = None
     stop = None
@@ -1672,7 +1748,11 @@ export const launchManagedRun: ResearchPilotLauncher = async (input) => {
   }
   const child = spawn(
     input.pythonExecutable,
-    ["-P", "-c", RESEARCH_PILOT_LAUNCHER_PROGRAM, input.manifestPath, input.runId, String(input.totalAllowanceSec)],
+    [
+      "-P", "-c", RESEARCH_PILOT_LAUNCHER_PROGRAM,
+      input.manifestPath, input.runId, String(input.totalAllowanceSec),
+      String(deadlineEpochMs(input.deadlineAt)),
+    ],
     { cwd: input.workDir, env, stdio: ["ignore", "pipe", "pipe"] },
   );
   let stdout = "";
@@ -1685,7 +1765,10 @@ export const launchManagedRun: ResearchPilotLauncher = async (input) => {
   child.stderr.on("data", (chunk: string) => {
     stderr = (stderr + chunk).slice(-4_096);
   });
-  const deadline = (input.totalAllowanceSec + 120) * 1_000;
+  const absoluteWaitMs = input.deadlineAt === undefined
+    ? Number.POSITIVE_INFINITY
+    : Math.max(0, Date.parse(input.deadlineAt) - Date.now()) + 120_000;
+  const deadline = Math.min((input.totalAllowanceSec + 120) * 1_000, absoluteWaitMs);
   let spawnError: string | undefined;
   const timedOut = await new Promise<boolean>((done) => {
     let settled = false;

@@ -51,6 +51,9 @@ ACTIONS = ("list-tasks", "describe-task", "probe-evaluator")
 DESCRIPTION_MAX_BYTES = 64 * 1024
 #: An evaluator source is read for its imports only within this bound.
 EVALUATOR_IMPORT_MAX_BYTES = 1024 * 1024
+#: A package identity is bounded so describe-task cannot become an IO sweep.
+PACKAGE_HASH_MAX_FILES = 4096
+PACKAGE_HASH_MAX_BYTES = 64 * 1024 * 1024
 #: A probe writes at most this much of each stream tail.
 _TAIL_CHARS = 2_000
 
@@ -132,9 +135,68 @@ def describe_task(request: dict) -> dict:
         "lowerIsBetter": match.lower_is_better,
         "authoritative": match.metric_authoritative,
         "evaluatorEntrypoint": match.evaluator_entrypoint,
+        "entrypointSha256": _file_sha256(entrypoint_path) if entrypoint_path is not None else None,
+        "packageSha256": _bounded_tree_sha256(_package_source_dir(match)),
         "missingModules": missing_evaluator_modules(entrypoint_path, match.source_dir),
         "description": text,
     }
+
+
+def _package_source_dir(spec) -> Path:
+    """The directory the engine would copy: the package or its shared parent."""
+    parent = spec.source_dir.parent
+    if (parent / "_shared").is_dir():
+        return parent
+    return spec.source_dir
+
+
+def _bounded_tree_sha256(root: Path) -> str | None:
+    """A deterministic digest of the files the engine would import.
+
+    The engine's own ``tree_sha256`` has no bound; this one reports ``None``
+    instead of reading an unbounded tree, so an unusable package identity is
+    visible rather than silently expensive.
+    """
+    if not root.is_dir():
+        return None
+    try:
+        files = sorted(
+            p for p in root.rglob("*")
+            if p.is_file()
+            and "__pycache__" not in p.parts
+            and ".pytest_cache" not in p.parts
+            and p.suffix != ".pyc"
+        )
+    except OSError:
+        return None
+    if len(files) > PACKAGE_HASH_MAX_FILES:
+        return None
+    digest = hashlib.sha256()
+    total = 0
+    for child in files:
+        try:
+            size = child.stat().st_size
+        except OSError:
+            return None
+        total += size
+        if total > PACKAGE_HASH_MAX_BYTES:
+            return None
+        try:
+            content = child.read_bytes()
+        except OSError:
+            return None
+        digest.update(child.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(hashlib.sha256(content).hexdigest().encode("ascii"))
+    return digest.hexdigest()
+
+
+def _file_sha256(path: Path) -> str | None:
+    try:
+        if not path.is_file() or path.stat().st_size > EVALUATOR_IMPORT_MAX_BYTES:
+            return None
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
 
 
 def _entrypoint_path(source_dir: Path, entrypoint: str) -> Path | None:
