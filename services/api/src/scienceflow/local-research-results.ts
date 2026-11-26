@@ -1070,7 +1070,7 @@ export function projectResearchParent(input: {
 }
 
 /** Preparation records attributable to one frozen scientific contract. */
-function attributablePreparations(
+export function attributableResearchPreparations(
   contract: ResearchContractIdentity,
   preparations: readonly ScienceFlowResearchPreparation[],
 ): readonly ScienceFlowResearchPreparation[] {
@@ -1091,7 +1091,7 @@ export function researchParentView(
   preparations: readonly ScienceFlowResearchPreparation[] = [],
   agentUsage: readonly NonNullable<ScienceFlowLocalResearchOperation["agentUsage"]>[] = [],
 ): ResearchParentView {
-  const attributable = attributablePreparations(parent.contract, preparations);
+  const attributable = attributableResearchPreparations(parent.contract, preparations);
   const preparationSeconds = attributable.reduce(
     (total, preparation) => total + (preparation.wallClock.status === "known" ? preparation.wallClock.seconds : 0),
     0,
@@ -1201,7 +1201,7 @@ export function researchLineRefusal(input: {
   readonly preparations?: readonly ScienceFlowResearchPreparation[];
   readonly agentUsage?: readonly NonNullable<ScienceFlowLocalResearchOperation["agentUsage"]>[];
 }): ResearchLineRefusal | undefined {
-  const attributable = attributablePreparations(input.parent.contract, input.preparations ?? []);
+  const attributable = attributableResearchPreparations(input.parent.contract, input.preparations ?? []);
   const preparationSeconds = attributable.reduce(
     (total, preparation) => total + (preparation.wallClock.status === "known" ? preparation.wallClock.seconds : 0),
     0,

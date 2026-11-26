@@ -136,6 +136,7 @@ import {
   researchContractIdentity,
   researchContractIdentityFrom,
   researchGroupId,
+  attributableResearchPreparations,
   researchBudgetChild,
   researchLineRefusal,
   researchParentBudgetLine,
@@ -1332,15 +1333,12 @@ export function createLocalResearchService(input: {
     sessionId: string,
     contract: ResearchContractIdentity,
   ): number => {
-    // Only a prepared task version identifies the contract whose preparation
-    // cost this is; a failed attempt with no version stays in Session overhead.
-    if (contract.source !== "prepared") return 0;
-    return preparationsFor(projectId, sessionId).reduce((total, preparation) => {
-      const attributed = preparation.taskVersionId !== null
-        ? preparation.taskVersionId === contract.taskVersionId
-        : preparation.taskId !== null && preparation.taskId === contract.taskId;
-      return total + (attributed && preparation.wallClock.status === "known" ? preparation.wallClock.seconds : 0);
-    }, 0);
+    return attributableResearchPreparations(contract, preparationsFor(projectId, sessionId))
+      .reduce(
+        (total, preparation) => total
+          + (preparation.wallClock.status === "known" ? preparation.wallClock.seconds : 0),
+        0,
+      );
   };
 
   const lineFactsFor = (
