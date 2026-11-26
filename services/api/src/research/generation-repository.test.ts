@@ -84,3 +84,40 @@ test("SQL names are validated before schema mutation", () => {
     assert.equal(db.prepare("SELECT count(*) AS count FROM sqlite_master").get()?.count, 0);
   } finally { db.close(); }
 });
+
+for (const owner of ["session", "project"] as const) {
+  test(`save holds the allocation lock against ${owner} deletion on another connection`, context => {
+    const base = resolve(".tmp/r"); mkdirSync(base, { recursive: true });
+    const root = mkdtempSync(resolve(base, "generation-lock-"));
+    const db = new DatabaseSync(resolve(root, "catalog.sqlite"));
+    const other = new DatabaseSync(resolve(root, "catalog.sqlite"));
+    try {
+      const writer = repository(db), deleter = repository(other);
+      db.exec("PRAGMA busy_timeout=0"); other.exec("PRAGMA busy_timeout=0");
+      writer.allocate("project", "session", "contract");
+      const remove = () => owner === "session" ? deleter.deleteSession("session") : deleter.deleteProject("project");
+      const prepare = db.prepare.bind(db);
+      let attempted = false;
+      context.mock.method(db, "prepare", (sql: string) => {
+        const statement = prepare(sql);
+        if (sql.includes("SELECT plan_id, project_id, session_id, allocated")) {
+          const get = statement.get.bind(statement);
+          context.mock.method(statement, "get", (...args: Parameters<typeof get>) => {
+            const row = get(...args);
+            if (!attempted) {
+              attempted = true;
+              assert.throws(remove, error => error instanceof Error && "errcode" in error && error.errcode === 5);
+            }
+            return row;
+          });
+        }
+        return statement;
+      });
+      assert.equal(writer.save(draft(1)).saved, true);
+      assert.equal(attempted, true);
+      remove();
+      assert.equal(writer.latest("project", "session", "contract"), undefined);
+      assert.deepEqual(writer.save(draft(1)), { saved: false });
+    } finally { other.close(); db.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+}

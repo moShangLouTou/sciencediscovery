@@ -125,7 +125,7 @@ export class ResearchGenerationRepository<T> {
     });
   }
   private allocation(key: string) {
-    return this.database.prepare(`SELECT * FROM ${this.options.generationsTable} WHERE ${this.keyColumn} = ?`).get(key);
+    return this.database.prepare(`SELECT ${this.keyColumn}, project_id, session_id, allocated FROM ${this.options.generationsTable} WHERE ${this.keyColumn} = ?`).get(key);
   }
   private select(projectId: string, sessionId: string, key: string) {
     return this.database.prepare(`SELECT * FROM ${this.options.table}

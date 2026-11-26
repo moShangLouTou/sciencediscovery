@@ -131,8 +131,11 @@ export function createRuntimeProbeService(deps: RuntimeProbeServiceDeps) {
   };
 }
 
-/** Run one probe phase through the ordinary supervised sandbox path. */
-async function runRuntimeProbe(options: RuntimeProbeProgram & {
+/** Run one phase inside an environment lease already owned by a workload.
+ * The caller must retain an unverified handle behind its environment gate.
+ * Use createRuntimeProbeService when this module should own that lease and fence.
+ */
+export async function runRuntimeProbe(options: RuntimeProbeProgram & {
   readonly config: ExecutorConfig;
   readonly environment: EnvironmentRuntime;
   readonly procRoot?: string;
