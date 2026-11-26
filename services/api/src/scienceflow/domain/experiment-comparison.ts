@@ -1000,4 +1000,3 @@ function sortValue(value: unknown): unknown {
 
 /** Exposed for tests and for the view builder that explains an invalid stage. */
 export type { ScienceFlowLocalResearchStage };
-

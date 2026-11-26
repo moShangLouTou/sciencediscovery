@@ -225,4 +225,3 @@ export function withParentDecision(
 ): ScienceFlowResearchParent {
   return withResearchBudgetDecision(parent, decision);
 }
-

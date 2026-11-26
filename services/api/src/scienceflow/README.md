@@ -199,7 +199,7 @@ This separation does not change the pilot's host process isolation or expand its
 cancellation guarantees. Existing record schema versions, table/column names,
 configuration names and tool/HTTP contracts are retained; no data migration is
 required. Internal engine-only receipts keep the existing optional readback
-fields null until delivery owns that work.
+fields null; result readback is recorded by the separate delivery service.
 
 The delivery payload remains `ScienceFlowLocalResearchDelivery`. The shared
 lifecycle schedules publication and retry; SF services map result content and

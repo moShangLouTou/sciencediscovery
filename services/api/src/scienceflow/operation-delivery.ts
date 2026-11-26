@@ -132,4 +132,3 @@ function artifactRef(
     versionId: artifact.versionId,
   };
 }
-

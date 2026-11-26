@@ -2009,20 +2009,7 @@ function titleFromDescription(description: string, taskId: string): string {
   return heading.replace(/^#\s+/u, "").slice(0, 200) || taskId;
 }
 
-/**
- * Two operations run the same scientific contract only when the task, artifact
- * contract, metric, evaluator identity and bound input bytes all agree. A
- * re-prepared task (new contract version or digest) is a new experiment even
- * when its title or slug matches.
- */
-
-
-/**
- * Append the round's structured proposal and the explicit selection reason to
- * the researcher's instruction. The engine still runs one bounded task; this
- * text is what makes the round's evidence and stopping rule visible to it.
- */
-
+/** Map shared input-binding failures to the product's stable reason codes. */
 function inputRefusal(error: unknown): unknown {
   if (!(error instanceof ResearchInputRefusal)) return error;
   const reason: LocalResearchRefusalReason = error.reason;
