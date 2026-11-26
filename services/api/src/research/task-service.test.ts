@@ -106,6 +106,7 @@ interface EngineRun {
 }
 
 interface ServiceTestOptions {
+  readonly ownerStopped?: () => Promise<boolean>;
   readonly hideEngineRecords?: boolean;
   readonly now?: () => string;
   readonly planBarrier?: () => Promise<void>;
@@ -256,6 +257,7 @@ async function fixture(
       lines,
       observeMaxWaitMs: 100,
       ...(options.now ? { now: options.now } : {}),
+      ...(options.ownerStopped ? { ownerStopped: options.ownerStopped } : {}),
       operations: repository,
       product,
       store,
@@ -859,4 +861,25 @@ test("parallel publishers reuse one version and a failed write releases the queu
   assert.deepEqual(published.map((result) => result.version), Array(8).fill(1));
   const artifact = fx.store.getArtifactByName(fx.sessionId, input.logicalName)!;
   assert.equal(fx.store.listProjectArtifactVersions(fx.projectId, artifact.id).length, 1);
+});
+
+
+test("cancellation during planning refuses admission without a record or reservation", async (context) => {
+  const fx = await fixture(context);
+  const entered = deferred();
+  const release = deferred();
+  let cancelled = false;
+  const service = fx.newService({ ownerStopped: async () => cancelled,
+    planBarrier: async () => { entered.resolve(); await release.promise; },
+  });
+  const start = service.start(request(fx, "owner", "cancel during planning"));
+  const rejected = assert.rejects(start,
+    (error: unknown) => error instanceof FakeRefusal && error.reason === "conversation-cancelled");
+  await entered.promise;
+  cancelled = true;
+  release.resolve();
+  await rejected;
+  assert.equal(fx.counters.launches, 0);
+  assert.equal(fx.repository.listForSession(fx.projectId, fx.sessionId).length, 0);
+  assert.equal(fx.lines.get(fx.projectId, fx.sessionId, LINE_KEY), undefined);
 });
