@@ -37,9 +37,8 @@
  *   same run, but no Agent-visible view carries them;
  * - a run whose state cannot be read is reported `unknown`, never relaunched.
  */
-import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { CasStore } from "@sciencediscovery/cas";
@@ -49,9 +48,14 @@ import type {
   ScienceFlowSnapshotReadResult,
 } from "@sciencediscovery/scienceflow-reader";
 
+import { createResearchOperationLifecycle } from "../research/operation-lifecycle.js";
+import type { ResearchEngineAdapter } from "../research/engine-adapter.js";
+import {
+  createScienceFlowEngineAdapter,
+  type ScienceFlowDeadlineVerdict,
+} from "./engine-adapter.js";
 import {
   deliverScienceFlowResult,
-  writeDeliveryRecord,
   type ScienceFlowResultDeliveryRecord,
   type ScienceFlowResultDeliveryRequest,
 } from "./result-delivery.js";
@@ -61,11 +65,7 @@ import {
 } from "./local-research-config.js";
 import {
   composeDynamicTaskText,
-  InputPreparationRefusal,
   sha256,
-  stageResearchOperationInputs,
-  type StagedDataSelection,
-  type StagedInputSelection,
 } from "./local-research-inputs.js";
 import {
   TaskPreparationRefusal,
@@ -83,7 +83,6 @@ import {
   type TaskPreparationSettings,
 } from "./local-research-task.js";
 import {
-  materializePreparedTaskAssets,
   prepareResearchTask,
   preparedTaskBinding,
   readPreparedTaskVersion,
@@ -100,7 +99,6 @@ import {
 import {
   isTerminalResearchState,
   SCIENCE_FLOW_LOCAL_RESEARCH_OPERATION_VERSION,
-  type ScienceFlowLocalResearchArtifactRef,
   type ScienceFlowLocalResearchDelivery,
   type ScienceFlowLocalResearchEngineFacts,
   type ScienceFlowLocalResearchGrant,
@@ -145,7 +143,6 @@ import {
 } from "./local-research-overhead-repository.js";
 import {
   assertExperimentProposalAdvances,
-  evidenceKey,
   ExperimentProposalRefusal,
   parseExperimentProposal,
   type ExperimentProposal,
@@ -162,28 +159,17 @@ import {
 } from "./evolve-pilot-adapter.js";
 import type { ScienceFlowLocalResearchStore } from "./local-research-repository.js";
 import {
-  readStageRows,
-  readUsage,
   resolveResearchPilotModel,
   ResearchPilotRefusal,
-  runResearchPilot,
   type ResearchPilotLauncher,
   type ResearchPilotReadbackStore,
-  type ResearchPilotReceipt,
 } from "./research-pilot.js";
-
-/** Engine lifecycle states after which a run never continues on its own. */
-const TERMINAL_ENGINE_STATUSES = new Set(["completed", "failed", "stopped", "interrupted"]);
-
-/** A bounded wait polls the engine record at this interval. */
-const OBSERVE_POLL_MS = 2_000;
-/** How long one stop request waits for the engine to record termination. */
-const STOP_CONFIRM_TIMEOUT_MS = 30_000;
-/** The engine's own stop call deadline; the confirmation poll outlasts it. */
-const ENGINE_STOP_TIMEOUT_SEC = 20;
 
 /** The stable permission resource a start request is governed under. */
 export const LOCAL_RESEARCH_PERMISSION_RESOURCE = "scienceflow:local-research";
+
+/** Kept at this module's original surface; the program now lives with the adapter. */
+export { LOCAL_RESEARCH_STOP_PROGRAM } from "./engine-adapter.js";
 
 export type LocalResearchRefusalReason =
   | "mode-disabled"
@@ -473,6 +459,13 @@ export interface ResearchSessionOverheadView {
 }
 
 export interface LocalResearchServiceDependencies {
+  /**
+   * The engine adapter. Defaults to the ScienceFlow adapter built from the rest
+   * of these dependencies; an explicit one substitutes the engine while the
+   * shared operation lifecycle, permissions, version binding, cancellation and
+   * delivery retry stay unchanged.
+   */
+  readonly adapter?: ResearchEngineAdapter<ScienceFlowLocalResearchOperation, ScienceFlowLocalResearchDelivery>;
   /** The real detached-supervisor launcher; tests substitute one. */
   readonly launch?: ResearchPilotLauncher;
   /** The real delivery; tests substitute one. */
@@ -588,12 +581,6 @@ export function createLocalResearchService(input: {
     if (!store.getSessionRun) return undefined;
     return (await store.getSessionRun(sessionId, runId))?.status;
   });
-  /** Operations whose launch/observe/deliver worker is alive in this process. */
-  const activeWorkers = new Set<string>();
-  /** Operations with a delivery attempt in flight in this process. */
-  const deliveryInFlight = new Set<string>();
-  /** Per-operation abort for the preparation window before a launch exists. */
-  const operationAborts = new Map<string, AbortController>();
 
   const operations = (): ScienceFlowLocalResearchStore => store.scienceFlowResearchOperations;
   const selections = (): ResearchResultSelectionStore => store.scienceFlowResearchResultSelections;
@@ -703,10 +690,7 @@ export function createLocalResearchService(input: {
    */
   const lineDeadlineVerdict = (
     record: ScienceFlowLocalResearchOperation,
-  ): { readonly kind: "ok" } | { readonly kind: "refused"; readonly message: string } | {
-    readonly kind: "tighten";
-    readonly grant: ScienceFlowLocalResearchGrant;
-  } => {
+  ): ScienceFlowDeadlineVerdict => {
     const groupId = researchGroupId(record);
     const projected = projectResearchParent({
       contract: researchContractIdentity(record),
@@ -755,30 +739,6 @@ export function createLocalResearchService(input: {
     };
   };
 
-  /**
-   * Reconcile the line's stored children with the engine before a new child is
-   * reserved. This is not a relaunch: it reads the same control files `get`
-   * reads and may publish an already-ended run's artifacts (delivery is a
-   * publication, not a rerun), so a service restart cannot make a finished run
-   * look active forever or lose its result before the next comparison.
-   */
-  const reconcileLine = async (
-    records: readonly ScienceFlowLocalResearchOperation[],
-  ): Promise<ScienceFlowLocalResearchOperation[]> => {
-    for (const record of records) {
-      if (isTerminalResearchState(record.state)) continue;
-      const facts = await readEngineFacts(record);
-      if (!facts.status || !TERMINAL_ENGINE_STATUSES.has(facts.status)) continue;
-      const settled = mutate(record.operationId, (current) => ({
-        ...current,
-        state: stateFromFacts(current, facts),
-        engine: facts,
-      }));
-      if (settled.delivery.state === "pending") await deliverOperation(settled.operationId);
-      settleParentFor(operations().get(settled.operationId) ?? settled);
-    }
-    return records.map((record) => operations().get(record.operationId) ?? record);
-  };
   /**
    * Record a stop on the research line itself, so a later start in the same
    * conversation cannot quietly reserve another child.
@@ -907,654 +867,6 @@ export function createLocalResearchService(input: {
       operations: groupOperations(record.identity.projectId, record.identity.sessionId, groupId),
     });
     return projected.limits?.deadlineAt;
-  };
-
-  const pilotRequest = (record: ScienceFlowLocalResearchOperation) => {
-    const deadlineAt = lineDeadlineFor(record);
-    return {
-    projectId: record.identity.projectId,
-    sessionId: record.identity.sessionId,
-    runId: record.engineRunId,
-    workDir: record.workDir,
-    privateRoot: record.launch.privateRoot,
-    engineCheckout: record.launch.engineCheckout,
-    pythonExecutable: record.launch.pythonExecutable,
-    readerScriptPath: record.launch.readerScriptPath,
-    // A dynamic operation reads the directory it staged itself; a fixed one
-    // reads the administrator's seed, exactly as before.
-    seedDir: record.stagedInputs?.dataDir ?? record.launch.seedDir,
-    task: record.task,
-    ...(record.taskBinding?.source === "prepared" && record.taskBinding.assetDir !== undefined
-      && record.taskBinding.lowerIsBetter !== null
-      ? { evaluator: {
-          artifactKind: record.taskBinding.artifactKind,
-          artifactPath: record.taskBinding.artifactPath,
-          commandPath: join(record.taskBinding.assetDir, "evaluator.py"),
-          lowerIsBetter: record.taskBinding.lowerIsBetter,
-          metricJsonPath: record.taskBinding.metricJsonPath ?? "metric",
-          metricName: record.taskBinding.metricName,
-          pythonExecutable: record.launch.pythonExecutable,
-          timeoutSec: 120,
-        } }
-      : {}),
-    ...(record.launch.taskDescription !== undefined
-      ? { taskDescription: record.launch.taskDescription }
-      : settings.taskDescription
-        ? { taskDescription: settings.taskDescription }
-        : {}),
-    researchBudgetSec: record.launch.grant.researchBudgetSec,
-    reportBudgetSec: record.launch.grant.reportBudgetSec,
-    totalAllowanceSec: record.launch.grant.totalAllowanceSec,
-    maxSteps: record.launch.grant.maxSteps,
-    stageCaptureMax: record.launch.grant.stageCaptureMax,
-    bashTimeoutSec: record.launch.grant.bashTimeoutSec,
-    codeMaxTokens: record.launch.grant.codeMaxTokens,
-    feedbackMaxTokens: record.launch.grant.feedbackMaxTokens,
-    httpTimeoutSec: record.launch.grant.httpTimeoutSec,
-    refusePackageInstall: record.launch.grant.refusePackageInstall,
-    receiptPath: record.receiptPath,
-    ...(deadlineAt === undefined ? {} : { deadlineAt }),
-    };
-  };
-
-  const readEngineFacts = async (record: ScienceFlowLocalResearchOperation): Promise<ScienceFlowLocalResearchEngineFacts> => {
-    const controlPath = join(record.workDir, "state", "scienceflow", "managed_runs", record.engineRunId, "control.json");
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(await readFile(controlPath, "utf8"));
-    } catch {
-      return { observedAt: now() };
-    }
-    if (!isRecord(parsed)) return { observedAt: now() };
-    const evaluator = await readExecutedEvaluatorIdentity(record);
-    return {
-      ...(typeof parsed.status === "string" ? { status: parsed.status } : {}),
-      ...(typeof parsed.phase === "string" ? { phase: parsed.phase } : {}),
-      ...(typeof parsed.research_status === "string" ? { researchStatus: parsed.research_status } : {}),
-      ...(typeof parsed.report_status === "string" ? { reportStatus: parsed.report_status } : {}),
-      ...(typeof parsed.alive === "boolean" ? { alive: parsed.alive } : {}),
-      ...(typeof parsed.pid === "number" ? { supervisorPid: parsed.pid } : {}),
-      ...(evaluator === undefined ? {} : { evaluator }),
-      observedAt: now(),
-    };
-  };
-
-  /**
-   * The evaluator package the engine actually registered for this run, read
-   * from its own task_runtime registry. A dirty checkout can produce a
-   * different package than a previous run; this file proves which bytes ran.
-   */
-  const readExecutedEvaluatorIdentity = async (
-    record: ScienceFlowLocalResearchOperation,
-  ): Promise<ScienceFlowLocalResearchEngineFacts["evaluator"]> => {
-    const path = join(record.workDir, "runs", record.engineRunId, record.task, "task_runtime", "registry.json");
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(await readFile(path, "utf8"));
-    } catch {
-      return undefined;
-    }
-    if (!isRecord(parsed)) return undefined;
-    const entrypointSha256 = typeof parsed.entrypoint_sha256 === "string" ? parsed.entrypoint_sha256 : undefined;
-    const packageSha256 = typeof parsed.package_sha256 === "string" ? parsed.package_sha256 : undefined;
-    const taskId = typeof parsed.task_id === "string" ? parsed.task_id : undefined;
-    if (entrypointSha256 === undefined && packageSha256 === undefined && taskId === undefined) return undefined;
-    return {
-      ...(taskId === undefined ? {} : { taskId }),
-      ...(entrypointSha256 === undefined ? {} : { entrypointSha256 }),
-      ...(packageSha256 === undefined ? {} : { packageSha256 }),
-    };
-  };
-
-  /** The receipt's own outcome status, when a receipt exists. Never a run id. */
-  const readReceiptOutcome = async (record: ScienceFlowLocalResearchOperation): Promise<string | undefined> => {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(await readFile(record.receiptPath, "utf8"));
-    } catch {
-      return undefined;
-    }
-    if (!isRecord(parsed) || !isRecord(parsed.outcome)) return undefined;
-    return typeof parsed.outcome.status === "string" ? parsed.outcome.status : undefined;
-  };
-
-  const readProgress = async (record: ScienceFlowLocalResearchOperation): Promise<{    readonly stages: readonly ScienceFlowLocalResearchStage[];
-    readonly usage: ScienceFlowLocalResearchUsage | null;
-  }> => {
-    const taskRoot = join(record.workDir, "runs", record.engineRunId, record.task);
-    const [rows, usage] = await Promise.all([
-      readStageRows(join(taskRoot, "task_logs", "lhr_stage_performance.csv")),
-      readUsage(join(taskRoot, "workers", "w00", "logs", "agent_runtime_audit", "agent_provider_calls.jsonl")),
-    ]);
-    return {
-      stages: rows.map((row) => ({
-        stageId: row.stageId,
-        parentStageId: row.parentStageId,
-        metricName: row.metricName,
-        metricValue: row.metricValue,
-        artifactSha256: row.artifactSha256,
-        validationOk: row.validationOk,
-        ...(typeof row.selectionEligible === "boolean" ? { selectionEligible: row.selectionEligible } : {}),
-        gateAccepted: row.gateAccepted,
-        evaluatorStatus: row.evaluatorStatus,
-        createdAtUtc: row.createdAtUtc,
-      })),
-      usage,
-    };
-  };
-
-  const stateFromFacts = (
-    record: ScienceFlowLocalResearchOperation,
-    facts: ScienceFlowLocalResearchEngineFacts,
-    outcome?: string,
-    launch?: ResearchPilotReceipt["launch"],
-  ): ScienceFlowLocalResearchState => {
-    if (record.stop.requestedAt && facts.status === "stopped") return "stopped";
-    if (facts.status === "completed") return "completed";
-    if (facts.status === "failed") return "failed";
-    if (facts.status === "stopped") return "stopped";
-    // The engine's launcher reports an interrupted run as an observation
-    // failure; it is a terminal run that did not complete, not a live one.
-    if (facts.status === "interrupted") return "failed";
-    // `launch-unknown` means whether the engine started cannot be told from the
-    // launcher. It stays unknown (and is never relaunched) until an engine
-    // record is observed and reconciles it.
-    if (outcome === "launch-unknown" || outcome === "run-already-exists") return "unknown";
-    if (outcome === "completed") return "completed";
-    if (outcome === "launch-failed" || outcome === "invalid-option" || outcome === "configuration-refused") return "failed";
-    if (outcome === "registration-failed" || outcome === "readback-failed") {
-      // The engine run ended; only the control-plane readback step failed.
-      // Delivery performs its own registration/readback, so keep the research
-      // state truthful and let publication be retried.
-      return "completed";
-    }
-    if (outcome === "observation-failed") {
-      if (launch?.stoppedByAllowance || launch?.status === "stopped") return "stopped";
-      return "failed";
-    }
-    return record.state;
-  };
-
-  const applyReceipt = (
-    record: ScienceFlowLocalResearchOperation,
-    receipt: ResearchPilotReceipt,
-  ): ScienceFlowLocalResearchOperation => {
-    const launch = receipt.launch;
-    const facts: ScienceFlowLocalResearchEngineFacts = {
-      ...(typeof launch?.status === "string" ? { status: launch.status } : {}),
-      ...(typeof launch?.phase === "string" ? { phase: launch.phase } : {}),
-      ...(typeof launch?.researchStatus === "string" ? { researchStatus: launch.researchStatus } : {}),
-      ...(typeof launch?.reportStatus === "string" ? { reportStatus: launch.reportStatus } : {}),
-      ...(typeof launch?.supervisorPid === "number" ? { alive: launch.supervisorAliveAfterFinish, supervisorPid: launch.supervisorPid } : {}),
-      ...(typeof launch?.elapsedSec === "number" && Number.isFinite(launch.elapsedSec)
-        ? { elapsedSec: launch.elapsedSec }
-        : {}),
-      observedAt: now(),
-    };
-    const model = receipt.model
-      ? {
-          profileName: receipt.model.profileName,
-          providerModel: receipt.model.providerModel,
-          selectionSource: receipt.model.selectionSource,
-        }
-      : record.launch.model;
-    const outcome = receipt.outcome;
-    return {
-      ...record,
-      state: stateFromFacts(record, facts, receipt.outcome.status, receipt.launch),
-      engine: facts,
-      launch: {
-        ...record.launch,
-        model,
-        // The pilot may tighten the grant again at its own launch boundary.
-        grant: {
-          ...record.launch.grant,
-          reportBudgetSec: receipt.engine.grant.reportBudgetSec,
-          researchBudgetSec: receipt.engine.grant.researchBudgetSec,
-          totalAllowanceSec: receipt.engine.grant.totalAllowanceSec,
-        },
-      },
-      progress: {
-        stages: (receipt.result?.stages ?? []).map((stage) => ({
-          stageId: stage.stageId,
-          parentStageId: stage.parentStageId,
-          metricName: stage.metricName,
-          metricValue: stage.metricValue,
-          artifactSha256: stage.artifactSha256,
-          validationOk: stage.validationOk,
-          ...(typeof stage.selectionEligible === "boolean" ? { selectionEligible: stage.selectionEligible } : {}),
-          gateAccepted: stage.gateAccepted,
-          evaluatorStatus: stage.evaluatorStatus,
-          createdAtUtc: stage.createdAtUtc,
-        })),
-        usage: receipt.usage,
-        observedAt: now(),
-      },
-      ...(outcome.status === "completed"
-        ? {}
-        : {
-            error: {
-              step: outcome.failedStep ?? "launch",
-              message: outcome.message ?? outcome.reason ?? outcome.status,
-            },
-          }),
-    };
-  };
-
-  const deliveryState = (
-    record: ScienceFlowLocalResearchOperation,
-    delivered: ScienceFlowResultDeliveryRecord,
-  ): ScienceFlowLocalResearchDelivery => {
-    const previous = record.delivery;
-    const attempts = previous.attempts + 1;
-    if (delivered.outcome.status === "delivered" && delivered.selected) {
-      const solution = delivered.artifacts.solution
-        ? artifactRef(delivered.artifacts.solution, "solution")
-        : undefined;
-      const note = delivered.artifacts.note ? artifactRef(delivered.artifacts.note, "note") : undefined;
-      const staged = delivered.attempts.flatMap((attempt) => attempt.artifact
-        ? [{
-            ...artifactRef(attempt.artifact, attempt.role),
-            metricName: attempt.metricName,
-            metricValue: attempt.metricValue,
-          }]
-        : []);
-      const researcher = delivered.researcherRecords.flatMap((entry) => entry.artifact
-        ? [artifactRef(entry.artifact, "researcher_record")]
-        : []);
-      return {
-        state: "delivered",
-        attempts,
-        updatedAt: now(),
-        selectedStageId: delivered.selected.stageId,
-        metricName: delivered.selected.metricName,
-        metricValue: delivered.selected.metricValue,
-        lowerIsBetter: delivered.selected.lowerIsBetter,
-        ...(solution ? { solution } : {}),
-        ...(note ? { note } : {}),
-        ...(staged.length ? { staged } : {}),
-        ...(researcher.length ? { researcher } : {}),
-      };
-    }
-    const failure = delivered.outcome;
-    if (failure.status === "failed" && failure.failedStep === "resolve" && failure.reason === "no-candidate") {
-      return { state: "no-candidate", attempts, updatedAt: now(), reason: failure.reason, message: failure.message };
-    }
-    const failed: ScienceFlowLocalResearchDelivery = failure.status === "failed"
-      ? {
-          state: "failed",
-          attempts,
-          updatedAt: now(),
-          reason: failure.reason,
-          failedStep: failure.failedStep,
-          message: failure.message,
-        }
-      : { state: "failed", attempts, updatedAt: now(), message: "Delivery returned no outcome" };
-    // A retry that fails after a successful publication keeps the delivered
-    // versions visible; the new failure is recorded beside them, not on top.
-    if (previous.state === "delivered") {
-      return { ...previous, attempts, updatedAt: now(), lastError: failed.reason ?? failed.message };
-    }
-    return failed;
-  };
-
-  const deliverOperation = async (operationId: string, force = false): Promise<void> => {
-    if (deliveryInFlight.has(operationId)) return;
-    deliveryInFlight.add(operationId);
-    try {
-      const record = operations().get(operationId);
-      if (!record) return;
-      // A retry may republish (delivery itself is idempotent by content), but an
-      // automatic pass never re-publishes an already delivered result.
-      if (!force && record.delivery.state === "delivered") return;
-      const delivered = await deliver(store, {
-        projectId: record.identity.projectId,
-        sessionId: record.identity.sessionId,
-        runId: record.engineRunId,
-        workDir: record.workDir,
-        pythonExecutable: record.launch.pythonExecutable,
-        readerScriptPath: record.launch.readerScriptPath,
-        task: record.task,
-        ...(record.taskBinding
-          ? {
-              evaluatorAuthority: record.taskBinding.source === "prepared" ? "generated-command" as const : "task-package" as const,
-              taskSummary: record.taskBinding.summary,
-              ...(record.taskBinding.source === "prepared" && record.taskBinding.evaluator.kind === "generated-command"
-                ? { evaluatorSha256: record.taskBinding.evaluator.sha256 }
-                : {}),
-            }
-          : {}),
-        ...(record.planVersionId ? { planVersionId: record.planVersionId } : {}),
-        ...(record.incumbentVersionId ? { incumbentVersionId: record.incumbentVersionId } : {}),
-        includeAttempts: true,
-        includeResearcherRecords: true,
-        recordPath: record.deliveryRecordPath,
-        launchReceiptPath: record.receiptPath,
-        // This deployment started the run; the note must not claim otherwise.
-        runOrigin: "experimental-local",
-      }, { now });
-      // The operation record is authoritative; this file is the same delivery
-      // record the operator command writes, kept for local evidence.
-      await writeDeliveryRecord(record.deliveryRecordPath, delivered).catch(() => undefined);
-      mutate(operationId, (current) => ({ ...current, delivery: deliveryState(current, delivered) }));
-    } catch (error) {
-      mutate(operationId, (current) => ({
-        ...current,
-        delivery: {
-          state: "failed",
-          attempts: current.delivery.attempts + 1,
-          updatedAt: now(),
-          reason: "publication-failed",
-          message: errorMessage(error),
-        },
-      }));
-    } finally {
-      deliveryInFlight.delete(operationId);
-    }
-  };
-
-  /**
-   * Stage this operation's own input directory, if the profile uses dynamic
-   * inputs. The staged bytes are proven equal to the digests frozen at start, and
-   * the manifest is written beside the work dir so the engine's dataset holds
-   * only the assets and the selected plan/incumbent.
-   *
-   * Returns the updated record, or `undefined` when preparation failed or was
-   * abandoned: the caller must not launch in that case.
-   */
-  const stageInputs = async (
-    record: ScienceFlowLocalResearchOperation,
-    signal: AbortSignal,
-  ): Promise<ScienceFlowLocalResearchOperation | undefined> => {
-    const roles: StagedInputSelection[] = (record.inputs ?? []).flatMap((input) =>
-      input.stagedName !== undefined && input.versionId !== null
-        ? [{
-            role: input.role,
-            sha256: input.sha256,
-            size: input.size,
-            stagedName: input.stagedName,
-            versionId: input.versionId,
-          }]
-        : []);
-    // A selected or prepared task may bind ordinary Session data files; they are
-    // staged beside the plan and incumbent so the engine's dataset holds exactly
-    // the bytes this operation froze.
-    const data: StagedDataSelection[] = (record.taskBinding?.inputs ?? []).map((binding) => ({
-      logicalName: binding.logicalName,
-      sha256: binding.sha256,
-      size: binding.size,
-      versionId: binding.versionId,
-    }));
-    const destination = join(record.workDir, "input");
-    const manifestPath = join(record.workDir, "input-manifest.json");
-    try {
-      if (roles.length === 0 && data.length === 0) {
-        throw new InputPreparationRefusal("staging-failed", "This operation has no accepted input to stage");
-      }
-      // The operation's own work dir may not exist yet; the input directory
-      // itself is created non-recursively so a second staging attempt (or
-      // another operation's leftovers) is a conflict, not a silent overwrite.
-      await mkdir(record.workDir, { recursive: true, mode: 0o755 });
-      const staged = await stageResearchOperationInputs({
-        assetsDir: settings.seedDir,
-        destination,
-        readBytes: readArtifactBytes,
-        roles,
-        ...(data.length ? { data } : {}),
-        signal,
-      }, now);
-      await writeFile(manifestPath, staged.manifestJson, "utf8");
-      // Re-read the manifest so the recorded digest is the digest on disk.
-      const written = await readFile(manifestPath);
-      if (sha256(written) !== staged.manifestSha256) {
-        throw new InputPreparationRefusal("staging-failed", "The input manifest did not retain its bytes");
-      }
-      return mutate(record.operationId, (current) => ({
-        ...current,
-        stagedInputs: {
-          dataDir: destination,
-          entries: staged.manifest.assets.entries,
-          manifestPath,
-          manifestSha256: staged.manifestSha256,
-          stagedAt: staged.manifest.stagedAt,
-          totalBytes: staged.manifest.assets.totalBytes,
-        },
-      }));
-    } catch (error) {
-      if (signal.aborted) {
-        // A cancel landed during preparation: record the stop, never launch.
-        mutate(record.operationId, (current) => ({
-          ...current,
-          state: isTerminalResearchState(current.state) ? current.state : "stopped",
-          stop: current.stop.requestedAt
-            ? current.stop
-            : { ...current.stop, requestedAt: now(), requestedBy: "conversation-cancel" },
-        }));
-        return undefined;
-      }
-      // Every reason below is actionable: the record says the operation was
-      // accepted and never launched, and why. A stop that landed during the
-      // failure keeps its stopped state instead of becoming a failure.
-      mutate(record.operationId, (current) => current.stop.requestedAt
-        ? { ...current, state: isTerminalResearchState(current.state) ? current.state : "stopped" }
-        : {
-            ...current,
-            state: "failed",
-            error: {
-              step: "staging",
-              message: error instanceof InputPreparationRefusal
-                ? `${error.reason}: ${error.message}`
-                : errorMessage(error),
-            },
-          });
-      return undefined;
-    }
-  };
-
-  /**
-   * Freeze a prepared task's evaluator and contract into this operation's own
-   * directory. The contract body is re-read and its digest must equal the one
-   * frozen at start, so a task version edited after acceptance cannot change
-   * what this run executes.
-   */
-  const stageTaskAssets = async (
-    record: ScienceFlowLocalResearchOperation,
-  ): Promise<ScienceFlowLocalResearchOperation | undefined> => {
-    const binding = record.taskBinding;
-    if (!binding || binding.source !== "prepared") return record;
-    if (binding.assetDir !== undefined) return record;
-    if (binding.taskVersionId === undefined || binding.contractHash === undefined) {
-      mutate(record.operationId, (current) => ({
-        ...current,
-        state: "failed",
-        error: { step: "task", message: "The prepared task version is incomplete" },
-      }));
-      return undefined;
-    }
-    try {
-      const assets = await materializePreparedTaskAssets(store, { readBytes: readArtifactBytes }, {
-        contractHash: binding.contractHash,
-        projectId: record.identity.projectId,
-        sessionId: record.identity.sessionId,
-        targetDir: join(record.workDir, "task"),
-        taskVersionId: binding.taskVersionId,
-      });
-      return mutate(record.operationId, (current) => ({
-        ...current,
-        taskBinding: {
-          ...binding,
-          assetDir: join(record.workDir, "task"),
-          assetManifestSha256: assets.manifestSha256,
-        },
-      }));
-    } catch (error) {
-      mutate(record.operationId, (current) => ({
-        ...current,
-        state: "failed",
-        error: { step: "task", message: errorMessage(error) },
-      }));
-      return undefined;
-    }
-  };
-
-  /** The model the Session resolves to must still be the one this start froze. */
-  const frozenModelRefusal = (record: ScienceFlowLocalResearchOperation): string | undefined => {
-    const frozen = record.launch.model;
-    if (!frozen) return undefined;
-    let resolved;
-    try {
-      resolved = resolveResearchPilotModel(store, {
-        projectId: record.identity.projectId,
-        sessionId: record.identity.sessionId,
-      });
-    } catch (error) {
-      return error instanceof ResearchPilotRefusal ? error.message : errorMessage(error);
-    }
-    const mismatch = resolved.selection.providerModel !== frozen.providerModel
-      || resolved.selection.selectionSource !== frozen.selectionSource
-      || resolved.selection.profileName !== frozen.profileName;
-    return mismatch
-      ? "The Session's effective model changed after this operation was accepted; it was not launched"
-      : undefined;
-  };
-
-  /** The background worker: prepare, launch-and-observe, then one delivery. */
-  const execute = async (operationId: string): Promise<void> => {
-    activeWorkers.add(operationId);
-    const controller = new AbortController();
-    operationAborts.set(operationId, controller);
-    try {
-      let current = operations().get(operationId);
-      if (!current) return;
-      // A stop requested before the launch began must not be overtaken by one.
-      if (current.stop.requestedAt) {
-        mutate(operationId, (record) => ({ ...record, state: "stopped" }));
-        return;
-      }
-      // Cancellation can land between the tool's post-permission check and this
-      // worker: when the owning run already ended by cancellation there is no
-      // one left to read a result, so record the stop instead of launching.
-      if (await ownerStopped(current.identity.sessionId, current.ownerRunId)) {
-        mutate(operationId, (record) => ({
-          ...record,
-          state: "stopped",
-          stop: record.stop.requestedAt
-            ? record.stop
-            : { ...record.stop, requestedAt: now(), requestedBy: "conversation-cancel" },
-        }));
-        return;
-      }
-      if (settings.inputMode === "dynamic") {
-        const staged = await stageInputs(current, controller.signal);
-        if (!staged) return;
-        current = staged;
-        // Preparation is asynchronous: the session may have been cancelled or
-        // the run stopped while the bytes were staged, with no worker left to
-        // read a result. Re-check both before the launch.
-        if (current.stop.requestedAt) {
-          mutate(operationId, (record) => ({ ...record, state: "stopped" }));
-          return;
-        }
-        if (await ownerStopped(current.identity.sessionId, current.ownerRunId)) {
-          mutate(operationId, (record) => ({
-            ...record,
-            state: "stopped",
-            stop: record.stop.requestedAt
-              ? record.stop
-              : { ...record.stop, requestedAt: now(), requestedBy: "conversation-cancel" },
-          }));
-          return;
-        }
-        const modelRefusal = frozenModelRefusal(current);
-        if (modelRefusal !== undefined) {
-          mutate(operationId, (record) => ({
-            ...record,
-            state: "failed",
-            error: { step: "model-selection", message: modelRefusal },
-          }));
-          return;
-        }
-        const withAssets = await stageTaskAssets(current);
-        if (!withAssets) return;
-        current = withAssets;
-      }
-      // Final pre-launch re-check. Preparation is asynchronous and may have
-      // outlived the conversation or the line's deadline; the engine must not
-      // receive a full grant that crosses the parent deadline.
-      current = operations().get(operationId) ?? current;
-      if (current.stop.requestedAt) {
-        mutate(operationId, (record) => ({ ...record, state: "stopped" }));
-        return;
-      }
-      if (await ownerStopped(current.identity.sessionId, current.ownerRunId)) {
-        mutate(operationId, (record) => ({
-          ...record,
-          state: "stopped",
-          stop: record.stop.requestedAt
-            ? record.stop
-            : { ...record.stop, requestedAt: now(), requestedBy: "conversation-cancel" },
-        }));
-        return;
-      }
-      const deadline = lineDeadlineVerdict(current);
-      if (deadline.kind === "refused") {
-        const refused = mutate(operationId, (record) => ({
-          ...record,
-          state: "failed",
-          error: { step: "budget", message: deadline.message },
-        }));
-        settleParentFor(refused);
-        return;
-      }
-      if (deadline.kind === "tighten") {
-        current = mutate(operationId, (record) => ({
-          ...record,
-          launch: { ...record.launch, grant: deadline.grant },
-        }));
-        persistParent(
-          researchContractIdentity(current),
-          researchGroupId(current),
-          current.identity,
-          groupOperations(current.identity.projectId, current.identity.sessionId, researchGroupId(current)),
-        );
-      }
-      mutate(operationId, (record) => ({
-        ...record,
-        state: "running",
-        launch: { ...record.launch, launchedAt: now() },
-      }));
-      const receipt = await runResearchPilot(store, pilotRequest(current), {
-        ...(dependencies.launch ? { launch: dependencies.launch } : {}),
-        ...(dependencies.readSnapshot ? { readSnapshot: dependencies.readSnapshot } : {}),
-        now,
-      });
-      const observedEngine = await readEngineFacts(current);
-      mutate(operationId, (record) => {
-        const applied = applyReceipt(record, receipt);
-        return {
-          ...applied,
-          engine: {
-            ...applied.engine,
-            ...(observedEngine.evaluator === undefined ? {} : { evaluator: observedEngine.evaluator }),
-          },
-          ...(record.stop.requestedAt && receipt.launch?.status === "stopped"
-            ? { stop: { ...record.stop, confirmedAt: now(), engineStatus: "stopped" } }
-            : {}),
-        };
-      });
-      // Only a launch that produced an engine run leaves something to read
-      // back. A confirmed non-start is reported as a failure without delivery.
-      if (receipt.outcome.engineRunId !== null) await deliverOperation(operationId);
-    } catch (error) {
-      mutate(operationId, (record) => ({
-        ...record,
-        state: "failed",
-        error: { step: "launch", message: errorMessage(error) },
-      }));
-    } finally {
-      operationAborts.delete(operationId);
-      activeWorkers.delete(operationId);
-    }
   };
 
   const nextInstruction = (record: ScienceFlowLocalResearchOperation): string => {
@@ -1835,6 +1147,46 @@ export function createLocalResearchService(input: {
     const status = await ownerRunStatus(sessionId, runId);
     return status === "cancelled" || status === "interrupted";
   };
+
+  // ScienceFlow is one concrete engine behind the shared operation lifecycle.
+  // The adapter owns every engine call; this service owns acceptance, task
+  // contracts, result comparison and research-line budgets.
+  const engineAdapter = dependencies.adapter ?? createScienceFlowEngineAdapter({
+    deadlineFor: lineDeadlineFor,
+    deadlineVerdict: lineDeadlineVerdict,
+    deliver,
+    now,
+    ownerStopped,
+    persistLineAfterTighten: (record) => {
+      persistParent(
+        researchContractIdentity(record),
+        researchGroupId(record),
+        record.identity,
+        groupOperations(record.identity.projectId, record.identity.sessionId, researchGroupId(record)),
+      );
+    },
+    readArtifactBytes,
+    ...(dependencies.launch ? { launch: dependencies.launch } : {}),
+    ...(dependencies.readSnapshot ? { readSnapshot: dependencies.readSnapshot } : {}),
+    settings,
+    sleep,
+    store,
+  });
+  const lifecycle = createResearchOperationLifecycle<
+    ScienceFlowLocalResearchOperation,
+    ScienceFlowLocalResearchDelivery
+  >({
+    engine: engineAdapter,
+    errorMessage,
+    now,
+    observeMaxWaitMs: settings.defaults.observeMaxWaitMs,
+    onStopConfirmed: (record, at, requestedBy) => markLineStop(record, requestedBy, at, true),
+    onStopRequested: (record, at, requestedBy) => markLineStop(record, requestedBy, at, false),
+    onTerminal: settleParentFor,
+    operations: { get: (operationId) => operations().get(operationId), mutate },
+    ownerStopped,
+    sleep,
+  });
 
   /** The engine adapter settings; present only when the profile enables task choice. */
   const preparation: TaskPreparationSettings | undefined = settings.taskMode === "task-dynamic"
@@ -2353,7 +1705,7 @@ export function createLocalResearchService(input: {
       await captureAgentUsage(groupOperations(request.projectId, request.sessionId, groupId));
       // A rebuilt service reconciles the line's stored children from the engine
       // record before it decides on a new reservation. It never starts one.
-      const groupOps = await reconcileLine(
+      const groupOps = await lifecycle.reconcile(
         groupOperations(request.projectId, request.sessionId, groupId),
       );
       // An explicit `selected_for_next` is a decision, not a display. A start
@@ -2648,104 +2000,30 @@ export function createLocalResearchService(input: {
       );
       // Return the operation identity now; the engine run continues in the
       // background so one HTTP request or tool call is not held open for it.
-      void execute(operationId).catch(() => undefined);
+      void lifecycle.execute(operationId).catch(() => undefined);
       return { attached: false, operation: singleView(stored.record) };
     },
 
     async get(request, options = {}): Promise<ScienceFlowLocalResearchView> {
-      let record = resolveRecord(request);
-      const waitMs = Math.max(0, Math.min(settings.defaults.observeMaxWaitMs, Math.trunc(options.waitMs ?? 0)));
-      const deadline = Date.now() + waitMs;
-      while (true) {
-        options.signal?.throwIfAborted();
-        // Re-read before observing: the launch worker may have advanced this
-        // operation since the previous poll, and its state is authoritative.
-        record = operations().get(record.operationId) ?? record;
-        const facts = await readEngineFacts(record);
-        const progress = await readProgress(record);
-        // With no engine record, the receipt is the only local record of how the
-        // launch ended. It is read, never trusted as a run identity.
-        const receiptOutcome = facts.status === undefined ? await readReceiptOutcome(record) : undefined;
-        // The state is derived against the record as it stands at write time:
-        // the reads above are asynchronous, and a stale snapshot must not
-        // overwrite a state the worker recorded while they were in flight.
-        record = mutate(record.operationId, (current) => {
-          let derived = stateFromFacts(current, facts, receiptOutcome);
-          if (derived === current.state && facts.status === undefined
-            && !activeWorkers.has(current.operationId)
-            && (current.state === "accepted" || current.state === "running")) {
-            // The process that was launching this experiment is gone and the
-            // engine left no record: the outcome is unknown, not a silent relaunch.
-            derived = "unknown";
-          }
-          return {
-            ...current,
-            state: derived,
-            engine: facts,
-            progress: { ...progress, observedAt: now() },
-          };
-        });
-        if (isTerminalResearchState(record.state)) {
-          // An existing terminal run is read back, never relaunched. Delivery is
-          // the only step this observation may reconcile, and only when the
-          // engine left a record whose stages can actually be read.
-          if (facts.status !== undefined && !activeWorkers.has(record.operationId)
-            && record.delivery.state === "pending") {
-            await deliverOperation(record.operationId);
-            record = operations().get(record.operationId) ?? record;
-          }
-          settleParentFor(record);
-          break;
-        }
-        if (Date.now() >= deadline) break;
-        await sleep(Math.min(OBSERVE_POLL_MS, Math.max(0, deadline - Date.now())));
-      }
-      await captureAgentUsage([record]);
-      return singleView(operations().get(record.operationId) ?? record);
+      const record = resolveRecord(request);
+      // Observation, the unknown-without-a-record rule and terminal delivery
+      // reconciliation are the shared lifecycle; this service only projects.
+      const observed = await lifecycle.observe(record, options);
+      await captureAgentUsage([observed]);
+      return singleView(operations().get(observed.operationId) ?? observed);
     },
 
     async stop(request): Promise<LocalResearchStopOutcome> {
       const record = resolveRecord(request);
-      const facts = await readEngineFacts(record);
-      if (facts.status && TERMINAL_ENGINE_STATUSES.has(facts.status)) {
-        const updated = mutate(record.operationId, (current) => ({
-          ...current,
-          state: stateFromFacts(current, facts),
-          engine: facts,
-        }));
-        // Even an already-terminal run records the user's intent to end this
-        // line, so a later same-conversation start cannot reserve another child.
-        markLineStop(updated, "tool", now(), true);
-        settleParentFor(updated);
-        await captureAgentUsage([updated]);
-        return { confirmed: true, operation: singleView(operations().get(updated.operationId) ?? updated), reason: "already-terminal", requested: false };
-      }
-      const requestedAt = now();
-      mutate(record.operationId, (current) => ({
-        ...current,
-        state: current.state === "completed" || current.state === "failed" ? current.state : "stopping",
-        stop: { ...current.stop, requestedAt, requestedBy: "tool" },
-      }));
-      // A stop during the preparation window must abort the staging copy rather
-      // than let a launch follow it.
-      operationAborts.get(record.operationId)?.abort();
-      markLineStop(record, "tool", requestedAt, false);
-      const outcome = await stopEngineRun(record);
-      const confirmed = await confirmStop(record, sleep);
-      const updated = mutate(record.operationId, (current) => ({
-        ...current,
-        state: confirmed ? "stopped" : current.state,
-        engine: { ...current.engine, ...(confirmed ? { status: "stopped" } : {}) },
-        stop: {
-          ...current.stop,
-          ...(confirmed ? { confirmedAt: now(), engineStatus: "stopped" } : {}),
-          ...(outcome.error ? { lastError: outcome.error } : {}),
-        },
-      }));
-      if (confirmed) markLineStop(updated, "tool", now(), true);
-      settleParentFor(updated);
-      await captureAgentUsage([updated]);
-      return { confirmed, operation: singleView(operations().get(updated.operationId) ?? updated), requested: true };
+      const outcome = await lifecycle.stop(record);
+      await captureAgentUsage([outcome.record]);
+      const updated = operations().get(outcome.record.operationId) ?? outcome.record;
+      return {
+        confirmed: outcome.confirmed,
+        operation: singleView(updated),
+        ...(outcome.reason === undefined ? {} : { reason: outcome.reason }),
+        requested: outcome.requested,
+      };
     },
 
     async retryDelivery(request): Promise<ScienceFlowLocalResearchView> {
@@ -2753,8 +2031,7 @@ export function createLocalResearchService(input: {
       // Publication only: the experiment's identity and state are untouched.
       // A delivered result is republished idempotently (unchanged bytes reuse
       // their version) so a corrected note can reach the Session.
-      await deliverOperation(record.operationId, true);
-      const updated = operations().get(record.operationId) ?? record;
+      const updated = await lifecycle.retryDelivery(record);
       await captureAgentUsage([updated]);
       return singleView(operations().get(record.operationId) ?? updated);
     },
@@ -2765,48 +2042,7 @@ export function createLocalResearchService(input: {
       const owned = operations()
         .listForSession(session.projectId, sessionId)
         .filter((candidate) => candidate.ownerRunId === runId && !isTerminalResearchState(candidate.state));
-      for (const record of owned) {
-        try {
-          // Trip the preparation abort even when no engine record exists yet: a
-          // cancel that lands while the operation is staging must not launch.
-          operationAborts.get(record.operationId)?.abort();
-          const facts = await readEngineFacts(record);
-          if (facts.status && TERMINAL_ENGINE_STATUSES.has(facts.status)) {
-            const settled = mutate(record.operationId, (current) => ({
-              ...current,
-              state: stateFromFacts(current, facts),
-              engine: facts,
-            }));
-            markLineStop(settled, "conversation-cancel", now(), true);
-            settleParentFor(settled);
-            continue;
-          }
-          markLineStop(record, "conversation-cancel", now(), false);
-          mutate(record.operationId, (current) => ({
-            ...current,
-            stop: { ...current.stop, requestedAt: now(), requestedBy: "conversation-cancel" },
-          }));
-          await stopEngineRun(record);
-          // Cancellation waits for the engine's own termination record instead
-          // of declaring success when the stop request returned. The bounded
-          // confirmation is the same one the tool path uses.
-          const confirmed = await confirmStop(record, sleep);
-          const updated = mutate(record.operationId, (current) => ({
-            ...current,
-            state: confirmed ? "stopped" : current.state,
-            engine: { ...current.engine, ...(confirmed ? { status: "stopped" } : {}) },
-            stop: {
-              ...current.stop,
-              ...(confirmed ? { confirmedAt: now(), engineStatus: "stopped" } : {}),
-            },
-          }));
-          if (confirmed) markLineStop(updated, "conversation-cancel", now(), true);
-          settleParentFor(updated);
-        } catch {
-          // Cancellation is best effort: a failed stop leaves the recorded
-          // request visible instead of failing the conversation cancellation.
-        }
-      }
+      await lifecycle.stopConversationRun(owned);
     },
 
     async publishPlan(request: LocalResearchPlanInput): Promise<ResearchPlanPublication> {
@@ -3044,129 +2280,6 @@ function compatibleTaskContracts(source: ScienceFlowTaskBinding, target: Science
   });
 }
 
-function artifactRef(  artifact: {
-    readonly artifactId: string;
-    readonly logicalName: string;
-    readonly version: number;
-    readonly versionId: string;
-  },
-  role: ScienceFlowLocalResearchArtifactRef["role"],
-): ScienceFlowLocalResearchArtifactRef {
-  return {
-    artifactId: artifact.artifactId,
-    logicalName: artifact.logicalName,
-    role,
-    version: artifact.version,
-    versionId: artifact.versionId,
-  };
-}
-
-/** Stop the engine's own managed run; the command reaches only this run id. */
-async function stopEngineRun(record: ScienceFlowLocalResearchOperation): Promise<{ readonly error?: string }> {
-  const child = spawn(
-    record.launch.pythonExecutable,
-    ["-P", "-c", LOCAL_RESEARCH_STOP_PROGRAM, record.engineRunId, String(ENGINE_STOP_TIMEOUT_SEC)],
-    {
-      cwd: record.workDir,
-      env: {
-        ...process.env,
-        PYTHONPATH: record.launch.engineCheckout,
-        PYTHONDONTWRITEBYTECODE: "1",
-        XDG_STATE_HOME: join(record.workDir, "state"),
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
-  let stdout = "";
-  let stderr = "";
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (chunk: string) => {
-    if (stdout.length < 65_536) stdout += chunk;
-  });
-  child.stderr.on("data", (chunk: string) => {
-    stderr = (stderr + chunk).slice(-2_000);
-  });
-  const completed = await new Promise<boolean>((resolvePromise) => {
-    const timer = setTimeout(() => resolvePromise(false), (ENGINE_STOP_TIMEOUT_SEC + 20) * 1_000);
-    timer.unref();
-    child.once("error", () => {
-      clearTimeout(timer);
-      resolvePromise(false);
-    });
-    child.once("exit", () => {
-      clearTimeout(timer);
-      resolvePromise(true);
-    });
-  });
-  if (!completed) {
-    child.kill("SIGKILL");
-    return { error: "The engine stop command did not finish in time" };
-  }
-  for (const line of stdout.split("\n").map((value) => value.trim()).reverse()) {
-    if (!line.startsWith("{")) continue;
-    try {
-      const payload = JSON.parse(line) as unknown;
-      if (!isRecord(payload) || payload.protocol !== 1) continue;
-      if (isRecord(payload.error)) {
-        const message = typeof payload.error.message === "string" ? payload.error.message : "The engine stop failed";
-        return { error: message.slice(0, 300) };
-      }
-      return {};
-    } catch {
-      continue;
-    }
-  }
-  return { error: stderr.trim() ? stderr.trim().slice(-300) : "The engine stop command reported no outcome" };
-}
-
-/** Poll the engine record for a short, bounded confirmation window. */
-async function confirmStop(
-  record: ScienceFlowLocalResearchOperation,
-  sleep: (ms: number) => Promise<void>,
-): Promise<boolean> {
-  const deadline = Date.now() + STOP_CONFIRM_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(await readFile(
-        join(record.workDir, "state", "scienceflow", "managed_runs", record.engineRunId, "control.json"),
-        "utf8",
-      ));
-    } catch {
-      parsed = undefined;
-    }
-    if (isRecord(parsed) && typeof parsed.status === "string" && TERMINAL_ENGINE_STATUSES.has(parsed.status)) {
-      return true;
-    }
-    await sleep(OBSERVE_POLL_MS);
-  }
-  return false;
-}
-
-/**
- * The engine's own stop entry. It is a constant, like the pilot launcher: no
- * option or configuration can replace it, and it receives no credential.
- */
-export const LOCAL_RESEARCH_STOP_PROGRAM = String.raw`
-import json, sys
-PROTOCOL = 1
-def emit(payload):
-    sys.stdout.write(json.dumps(payload, default=str) + "\n")
-    sys.stdout.flush()
-if len(sys.argv) != 3:
-    emit({"protocol": PROTOCOL, "outcome": "invalid-arguments"})
-    raise SystemExit(2)
-run_id, timeout = sys.argv[1], float(sys.argv[2])
-from scienceflow.runtime.parallel.control import stop_run
-try:
-    stop_run(run_id, timeout=timeout)
-except Exception as error:
-    emit({"protocol": PROTOCOL, "outcome": "error",
-          "error": {"type": type(error).__name__, "message": str(error)[:300]}})
-    raise SystemExit(1)
-emit({"protocol": PROTOCOL, "outcome": "stopped"})
-`;
 
 /**
  * Append the round's structured proposal and the explicit selection reason to
@@ -3222,8 +2335,4 @@ function withRoundContext(
 function errorMessage(error: unknown): string {
   const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
   return message.slice(0, 500);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

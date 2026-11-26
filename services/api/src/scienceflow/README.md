@@ -39,6 +39,10 @@ versions, and `services/scienceflow-preparation/preparation.py` lists packages
 and probes evaluators through the engine's own backend. The design and scope are
 documented in [`docs/en/scienceflow-task-intake.md`](../../../../docs/en/scienceflow-task-intake.md).
 
+The conversation research mode uses the shared operation lifecycle described in
+the [research engine integration guide](../../../../docs/en/design/research-engine-adapter.md).
+The ScienceFlow-specific wiring is described below.
+
 Files:
 
 | File | Role |
@@ -68,12 +72,50 @@ Files:
 | `prepared-inputs.ts` | Prepare action: gates, contract re-read, Runner call, receipt |
 | `prepared-inputs-http.ts` | The two prepared-input routes and their status mapping |
 | `result-delivery.ts` | `deliver`: resolves one existing run's selected result and publishes it as Session Artifacts |
+| `engine-adapter.ts` | The ScienceFlow engine adapter: staging, pilot launch, engine-record reads, stop and result publication |
+| `../research/engine-adapter.ts` | Engine-neutral operation record, adapter interface and lifecycle transitions |
+| `../research/operation-lifecycle.ts` | Shared lifecycle: launch gating, bounded observation, cancellation and delivery retry |
 
 `result-delivery.ts` backs `research-pilot-cli.ts deliver`: it re-registers the
 run, reads it through the same binding/reader/DTO path, requires the selected
 stage's bytes to match the recorded digest, and publishes the unchanged solution
 plus a factual result note as normal Artifacts (repeating a delivery reuses the
 same versions). It starts no run and adds no route.
+
+## ScienceFlow task-service adapter
+
+`createLocalResearchService` constructs a `createScienceFlowEngineAdapter` and
+passes it to `createResearchOperationLifecycle`. Tests may substitute the
+adapter through the service's optional dependency:
+
+```ts
+createLocalResearchService({ store, settings }, { adapter });
+```
+
+The service entry remains ScienceFlow-specific. `start` resolves the Session's
+SD model, validates the ScienceFlow profile and input versions, reserves the
+research-line budget and persists the existing operation/launch records. Task
+catalog/preparation, proposals, evaluator identity, comparison groups,
+best/selected candidates and continuation rules stay in `local-research.ts`.
+Budget/deadline callbacks connect that policy to the adapter and lifecycle.
+
+`engine-adapter.ts` owns dynamic input staging, prepared-task assets, the model
+freeze check, Python pilot launch, receipt and engine-record reads, stop calls
+and result publication through `result-delivery.ts`. The pilot still launches
+and observes within one call; this refactor changes neither its local process
+execution nor its sandbox guarantees. Persisted records, configuration names,
+tool/HTTP contracts and result bytes retain their existing formats.
+
+The delivery payload remains `ScienceFlowLocalResearchDelivery`. The shared
+lifecycle handles publication scheduling and retry; the adapter maps stage
+results and artifact references. A retry republishes existing results and
+does not restart the pilot.
+
+The service-level substitution seam continues to use ScienceFlow admission,
+model resolution and record shapes. Another product needs its own entry point
+and configuration mapping to the shared lifecycle. The
+`local-research-engine-adapter.test.ts` cases exercise this seam with a fake
+engine, including asynchronous completion and delivery retry.
 
 ## Enable and disable
 
@@ -1116,7 +1158,6 @@ stored row.
    await: nothing is recorded as current.
 8. Delete the Session/Project during the await or before a save: no row is
    resurrected.
-
 
 ## Known limits
 
