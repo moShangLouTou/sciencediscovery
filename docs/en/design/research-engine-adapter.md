@@ -381,7 +381,10 @@ Programs run through the ordinary bubblewrap sandbox with the selected prefix.
 The service captures termination evidence, retains unproven boundaries behind
 the environment mutation gate, and removes temporary workspaces only after
 termination is proven (or no process started). Product modules own protocol
-parsing, source identity rules, and the order of probe phases. Missing durable
+parsing, source identity rules, and the order of probe phases. A workload that
+already owns its environment lease can call `runRuntimeProbe` directly; it
+must retain any returned unverified boundary behind its existing mutation gate.
+Missing durable
 reservation ports provide only an in-process fence, suitable for test doubles.
 
 ## Integration limits
