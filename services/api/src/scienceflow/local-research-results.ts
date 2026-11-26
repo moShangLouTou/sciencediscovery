@@ -53,6 +53,23 @@ import type {
 } from "./local-research-record.js";
 import type { ScienceFlowResearchPreparation } from "./local-research-overhead-repository.js";
 import type { ScienceFlowTaskBinding } from "./local-research-task.js";
+import {
+  projectResearchBudgetLine,
+  RESEARCH_BUDGET_LINE_VERSION,
+  researchBudgetLineView,
+  researchBudgetLineRefusal,
+  withResearchBudgetDecision,
+  type ResearchBudgetChild,
+  type ResearchBudgetDecision,
+  type ResearchBudgetDecisionKind,
+  type ResearchBudgetLimits,
+  type ResearchBudgetLine,
+  type ResearchBudgetReservation,
+  type ResearchBudgetSettlement,
+  type ResearchBudgetStop,
+  type ResearchBudgetTokenUsage,
+  type ResearchBudgetWallClock,
+} from "../research/budget.js";
 
 /** The only selection record version this module writes and reads. */
 export const RESEARCH_RESULT_SELECTION_VERSION = 1;
@@ -283,77 +300,33 @@ export interface ScienceFlowResearchResultSelection {
 }
 
 /** The frozen total budget of one research line. */
-export interface ResearchParentLimits {
-  readonly maxChildRuns: number;
-  readonly totalAllowanceSec: number;
-  /** `startedAt + totalAllowanceSec`; enforced before a new child is reserved. */
-  readonly deadlineAt: string;
-}
+export type ResearchParentLimits = ResearchBudgetLimits;
 
-export interface ResearchParentReservation {
-  readonly operationId: string;
-  readonly reservedSec: number;
-  readonly reservedAt: string;
-}
+export type ResearchParentReservation = ResearchBudgetReservation;
 
-export interface ResearchParentWallClock {
-  readonly status: "known" | "unknown" | "not-launched";
-  readonly seconds: number | null;
-  /** What the line is charged: known seconds, the reservation, or zero. */
-  readonly chargedSeconds: number;
-  readonly source: "launch-receipt" | "reserved-allowance" | "operation-record";
-}
+export type ResearchParentWallClock = ResearchBudgetWallClock;
 
-export interface ResearchParentTokenUsage {
-  readonly status: "known" | "partially-known" | "unknown" | "not-launched";
-  readonly calls: number;
-  readonly completedCalls: number;
-  readonly failedCalls: number;
-  readonly unknownUsageCalls: number;
-  readonly inputTokens: number;
-  readonly outputTokens: number;
-}
+export type ResearchParentTokenUsage = ResearchBudgetTokenUsage;
 
-export interface ResearchParentSettlement {
-  readonly operationId: string;
-  readonly settledAt: string;
-  readonly wallClock: ResearchParentWallClock;
-  readonly tokens: ResearchParentTokenUsage;
-}
+export type ResearchParentSettlement = ResearchBudgetSettlement;
 
-export type ResearchParentDecisionKind =
-  | "start"
-  | "settle"
-  | "stop-requested"
-  | "stop-confirmed"
-  | "select";
+export type ResearchParentDecisionKind = ResearchBudgetDecisionKind;
 
-export interface ResearchParentDecision {
-  readonly at: string;
-  readonly kind: ResearchParentDecisionKind;
-  readonly operationId?: string;
-  readonly summary: string;
-}
+export type ResearchParentDecision = ResearchBudgetDecision;
 
-export interface ScienceFlowResearchParent {
+/**
+ * The ScienceFlow research line: the shared budget ledger plus the frozen
+ * scientific contract that gives this line its product identity. The ledger
+ * mechanism itself lives in `research/budget.ts`.
+ */
+export interface ScienceFlowResearchParent
+  extends Omit<ResearchBudgetLine, "lineId" | "lineKey" | "schemaVersion"> {
   readonly schemaVersion: typeof RESEARCH_PARENT_VERSION;
+  /** The stable product parent id, derived from the comparison group. */
   readonly parentId: string;
-  readonly identity: { readonly projectId: string; readonly sessionId: string };
   readonly groupId: string;
   readonly contract: ResearchContractIdentity;
-  readonly createdAt: string;
-  readonly updatedAt: string;
-  readonly limits: ResearchParentLimits | null;
-  readonly reservations: readonly ResearchParentReservation[];
-  readonly settlements: readonly ResearchParentSettlement[];
-  readonly decisions: readonly ResearchParentDecision[];
-  readonly stop: {
-    readonly requestedAt?: string;
-    readonly requestedBy?: "tool" | "conversation-cancel";
-    readonly ownerRunId?: string;
-    readonly operationId?: string;
-    readonly confirmedAt?: string;
-  };
+  readonly stop: ResearchBudgetStop;
 }
 
 /** The budget view an Agent or the Web panel reads. */
@@ -1011,6 +984,65 @@ export function createResearchSelection(
  * A launched run with no observable elapsed time is charged the reservation, not
  * zero; a launched run with no usage record keeps its token use `unknown`.
  */
+/** The neutral budget facts one stored operation contributes to its line. */
+export function researchBudgetChild(operation: ScienceFlowLocalResearchOperation): ResearchBudgetChild {
+  return {
+    createdAt: operation.createdAt,
+    ...(operation.engine.elapsedSec === undefined ? {} : { elapsedSec: operation.engine.elapsedSec }),
+    launched: operation.launch.launchedAt !== undefined || operation.engine.status !== undefined,
+    operationId: operation.operationId,
+    reservedSec: operation.launch.grant.totalAllowanceSec,
+    state: operation.state,
+    updatedAt: operation.updatedAt,
+    usage: operation.progress.usage ?? null,
+  };
+}
+
+/** The shared ledger projection of a stored ScienceFlow parent. */
+export function researchParentBudgetLine(parent: ScienceFlowResearchParent): ResearchBudgetLine {
+  return {
+    createdAt: parent.createdAt,
+    decisions: parent.decisions,
+    identity: parent.identity,
+    limits: parent.limits,
+    lineId: parent.parentId,
+    lineKey: parent.groupId,
+    reservations: parent.reservations,
+    schemaVersion: RESEARCH_BUDGET_LINE_VERSION,
+    settlements: parent.settlements,
+    stop: parent.stop,
+    updatedAt: parent.updatedAt,
+  };
+}
+
+/** Attach the scientific contract to one shared ledger projection. */
+export function researchParentFromBudgetLine(
+  line: ResearchBudgetLine,
+  contract: ResearchContractIdentity,
+  groupId: string,
+): ScienceFlowResearchParent {
+  return {
+    contract,
+    createdAt: line.createdAt,
+    decisions: line.decisions,
+    groupId,
+    identity: line.identity,
+    limits: line.limits,
+    parentId: line.lineId,
+    reservations: line.reservations,
+    schemaVersion: RESEARCH_PARENT_VERSION,
+    settlements: line.settlements,
+    stop: line.stop,
+    updatedAt: line.updatedAt,
+  };
+}
+
+/**
+ * Project the line from its stored children. The deadline, run limit,
+ * reservations and terminal settlements are the shared budget mechanism; this
+ * function only maps ScienceFlow operations to neutral child facts and keeps
+ * the frozen contract that keys the line.
+ */
 export function projectResearchParent(input: {
   readonly existing: ScienceFlowResearchParent | undefined;
   readonly operations: readonly ScienceFlowLocalResearchOperation[];
@@ -1020,139 +1052,35 @@ export function projectResearchParent(input: {
   readonly limits: { readonly maxChildRuns: number; readonly totalAllowanceSec: number } | undefined;
   readonly now: string;
 }): ScienceFlowResearchParent {
-  const ordered = [...input.operations].sort(
-    (left, right) => left.createdAt.localeCompare(right.createdAt) || left.operationId.localeCompare(right.operationId),
-  );
-  const existing = input.existing;
-  const createdAt = existing?.createdAt ?? ordered[0]?.createdAt ?? input.now;
-  const limits = existing?.limits ?? (input.limits
-    ? {
-        deadlineAt: new Date(Date.parse(createdAt) + input.limits.totalAllowanceSec * 1_000).toISOString(),
-        maxChildRuns: input.limits.maxChildRuns,
-        totalAllowanceSec: input.limits.totalAllowanceSec,
-      }
-    : null);
-  const previousReservations = new Map((existing?.reservations ?? []).map((row) => [row.operationId, row]));
-  const reservations: ResearchParentReservation[] = [];
-  const settlements = [...(existing?.settlements ?? [])];
-  const settled = new Set(settlements.map((row) => row.operationId));
-  const decisions = [...(existing?.decisions ?? [])];
-  let changed = existing === undefined;
-  for (const operation of ordered) {
-    if (isTerminal(operation.state)) {
-      if (!settled.has(operation.operationId)) {
-        const reservation = previousReservations.get(operation.operationId);
-        const settlement = settleOperation(operation, reservation, input.now);
-        settlements.push(settlement);
-        settled.add(operation.operationId);
-        decisions.push({
-          at: settlement.settledAt,
-          kind: "settle",
-          operationId: operation.operationId,
-          summary: settlementSummary(settlement),
-        });
-        changed = true;
-      }
-      continue;
-    }
-    const reservation = previousReservations.get(operation.operationId) ?? {
-      operationId: operation.operationId,
-      reservedAt: operation.createdAt,
-      reservedSec: operation.launch.grant.totalAllowanceSec,
-    };
-    reservations.push(reservation);
-    if (!previousReservations.has(operation.operationId)) changed = true;
-  }
-  if (reservations.length !== (existing?.reservations.length ?? 0)) changed = true;
-  if (settlements.length !== (existing?.settlements.length ?? 0)) changed = true;
-  const stop = existing?.stop ?? {};
-  const next: ScienceFlowResearchParent = {
-    contract: existing?.contract ?? input.contract,
-    createdAt,
-    decisions: decisions.slice(-RESEARCH_PARENT_DECISION_LIMIT),
-    groupId: input.groupId,
+  const parentId = input.existing?.parentId ?? `sf-parent-${input.groupId.replace(/^sfc-/u, "")}`;
+  const line = projectResearchBudgetLine({
+    children: input.operations.map(researchBudgetChild),
+    existing: input.existing === undefined ? undefined : researchParentBudgetLine(input.existing),
     identity: input.identity,
-    limits,
-    parentId: existing?.parentId ?? `sf-parent-${input.groupId.replace(/^sfc-/u, "")}`,
-    reservations,
-    schemaVersion: RESEARCH_PARENT_VERSION,
-    settlements,
-    stop,
-    updatedAt: input.now,
-  };
-  return changed ? next : { ...next, decisions: existing!.decisions, updatedAt: existing!.updatedAt };
+    limits: input.limits,
+    lineId: parentId,
+    lineKey: input.groupId,
+    now: input.now,
+  });
+  return researchParentFromBudgetLine(
+    line,
+    input.existing?.contract ?? input.contract,
+    input.groupId,
+  );
 }
 
-function settleOperation(
-  operation: ScienceFlowLocalResearchOperation,
-  reservation: ResearchParentReservation | undefined,
-  now: string,
-): ResearchParentSettlement {
-  const reservedSec = reservation?.reservedSec ?? operation.launch.grant.totalAllowanceSec;
-  const elapsed = operation.engine.elapsedSec;
-  const launched = operation.launch.launchedAt !== undefined || operation.engine.status !== undefined;
-  const wallClock: ResearchParentWallClock = typeof elapsed === "number" && Number.isFinite(elapsed) && elapsed >= 0
-    ? { chargedSeconds: elapsed, seconds: elapsed, source: "launch-receipt", status: "known" }
-    : launched
-      ? { chargedSeconds: reservedSec, seconds: null, source: "reserved-allowance", status: "unknown" }
-      : (() => {
-          // A preparation/probe that never reached a launch still spent the
-          // accepted operation's own wall clock. Charge what the record shows
-          // instead of silently releasing it as zero.
-          const created = Date.parse(operation.createdAt);
-          const updated = Date.parse(operation.updatedAt);
-          const observed = Number.isFinite(created) && Number.isFinite(updated) && updated >= created
-            ? (updated - created) / 1_000
-            : 0;
-          return {
-            chargedSeconds: observed,
-            seconds: observed,
-            source: "operation-record" as const,
-            status: "not-launched" as const,
-          };
-        })();
-  return {
-    operationId: operation.operationId,
-    settledAt: operation.updatedAt || now,
-    tokens: tokenUsage(operation, launched),
-    wallClock,
-  };
-}
-
-function tokenUsage(operation: ScienceFlowLocalResearchOperation, launched: boolean): ResearchParentTokenUsage {
-  const usage = operation.progress.usage;
-  if (usage) {
-    return {
-      calls: usage.calls,
-      completedCalls: usage.completedCalls,
-      failedCalls: usage.failedCalls,
-      inputTokens: usage.inputTokens,
-      outputTokens: usage.outputTokens,
-      status: usage.unknownUsageCalls > 0 ? "partially-known" : "known",
-      unknownUsageCalls: usage.unknownUsageCalls,
-    };
-  }
-  return {
-    calls: 0,
-    completedCalls: 0,
-    failedCalls: 0,
-    inputTokens: 0,
-    outputTokens: 0,
-    status: launched ? "unknown" : "not-launched",
-    unknownUsageCalls: 0,
-  };
-}
-
-function settlementSummary(settlement: ResearchParentSettlement): string {
-  const wall = settlement.wallClock.status === "known"
-    ? `${settlement.wallClock.seconds}s recorded`
-    : settlement.wallClock.status === "unknown"
-      ? "wall clock unknown; charged at the reserved allowance"
-      : "no engine launch";
-  const tokens = settlement.tokens.status === "unknown"
-    ? "token usage unknown"
-    : `${settlement.tokens.inputTokens + settlement.tokens.outputTokens} tokens recorded`;
-  return `settled ${settlement.operationId}: ${wall}; ${tokens}`;
+/** Preparation records attributable to one frozen scientific contract. */
+function attributablePreparations(
+  contract: ResearchContractIdentity,
+  preparations: readonly ScienceFlowResearchPreparation[],
+): readonly ScienceFlowResearchPreparation[] {
+  // Preparation/probe cost belongs to the contract whose task version it
+  // published. A failed attempt with no version stays in the Session overhead
+  // view instead of being silently dropped.
+  if (contract.source !== "prepared") return [];
+  return preparations.filter((preparation) => preparation.taskVersionId !== null
+    ? preparation.taskVersionId === contract.taskVersionId
+    : preparation.taskId !== null && preparation.taskId === contract.taskId);
 }
 
 /** The budget/usage view for one research line. */
@@ -1163,46 +1091,27 @@ export function researchParentView(
   preparations: readonly ScienceFlowResearchPreparation[] = [],
   agentUsage: readonly NonNullable<ScienceFlowLocalResearchOperation["agentUsage"]>[] = [],
 ): ResearchParentView {
-  const reservations = parent.reservations;
-  const reservedSeconds = reservations.reduce((total, row) => total + row.reservedSec, 0);
-  const knownSeconds = parent.settlements.reduce(
-    (total, row) => total + (row.wallClock.status === "known" ? row.wallClock.seconds ?? 0 : 0),
-    0,
-  );
-  const runChargedSeconds = parent.settlements.reduce((total, row) => total + row.wallClock.chargedSeconds, 0);
-  const unknownSettlements = parent.settlements.filter((row) => row.wallClock.status === "unknown").length;
-  const notLaunched = parent.settlements.filter((row) => row.wallClock.status === "not-launched").length;
-  // Preparation/probe cost belongs to the contract whose task version it
-  // published. A failed attempt with no version stays in the Session overhead
-  // view instead of being silently dropped.
-  const attributablePreparations = parent.contract.source === "prepared"
-    ? preparations.filter((preparation) => preparation.taskVersionId !== null
-      ? preparation.taskVersionId === parent.contract.taskVersionId
-      : preparation.taskId !== null && preparation.taskId === parent.contract.taskId)
-    : [];
-  const preparationSeconds = attributablePreparations.reduce(
+  const attributable = attributablePreparations(parent.contract, preparations);
+  const preparationSeconds = attributable.reduce(
     (total, preparation) => total + (preparation.wallClock.status === "known" ? preparation.wallClock.seconds : 0),
     0,
   );
-  const unknownPreparations = attributablePreparations.filter(
+  const unknownPreparations = attributable.filter(
     (preparation) => preparation.wallClock.status === "unknown",
   ).length;
-  const probeEvaluations = attributablePreparations.reduce(
+  const probeEvaluations = attributable.reduce(
     (total, preparation) => total + (preparation.probe.status === "known" ? preparation.probe.evaluations : 0),
     0,
   );
-  const unknownProbes = attributablePreparations.filter(
+  const unknownProbes = attributable.filter(
     (preparation) => preparation.probe.status === "unknown",
   ).length;
-  const active = operations.filter((operation) => !isTerminal(operation.state));
-  const tokenRows = parent.settlements.map((row) => row.tokens);
-  const tokensStatus = tokenRows.some((row) => row.status === "unknown")
-    ? "unknown"
-    : tokenRows.some((row) => row.status === "partially-known")
-      ? "partially-known"
-      : tokenRows.some((row) => row.status === "known")
-        ? "known"
-        : "not-launched";
+  const core = researchBudgetLineView(
+    researchParentBudgetLine(parent),
+    operations.map(researchBudgetChild),
+    now,
+    { extraChargedSeconds: preparationSeconds },
+  );
   const agentRows = agentUsage.filter((usage) => usage.status !== "not-recorded");
   const agentCalls = agentRows.reduce((total, usage) => total + usage.calls, 0);
   const agentUnknownCalls = agentRows.reduce((total, usage) => total + usage.unknownUsageCalls, 0);
@@ -1214,55 +1123,36 @@ export function researchParentView(
         : agentUnknownCalls > 0
           ? "partially-known"
           : "known";
-  const chargedSeconds = runChargedSeconds + preparationSeconds;
-  const remainingSeconds = parent.limits === null
-    ? null
-    : Math.max(0, parent.limits.totalAllowanceSec - chargedSeconds - reservedSeconds);
   return {
-    activeChild: active.length === 0
-      ? null
-      : {
-          operationId: active[0]!.operationId,
-          reservedSec: reservations.find((row) => row.operationId === active[0]!.operationId)?.reservedSec
-            ?? active[0]!.launch.grant.totalAllowanceSec,
-          state: active[0]!.state,
-        },
-    createdAt: parent.createdAt,
-    deadlinePassed: parent.limits !== null && Date.parse(now) > Date.parse(parent.limits.deadlineAt),
-    decisions: parent.decisions,
-    enforcement: {
-      runCount: parent.limits !== null,
-      tokenCap: false,
-      wallClock: parent.limits !== null,
-    },
+    activeChild: core.activeChild,
+    createdAt: core.createdAt,
+    deadlinePassed: core.deadlinePassed,
+    decisions: core.decisions,
+    enforcement: core.enforcement,
     groupId: parent.groupId,
-    limits: parent.limits,
+    limits: core.limits,
     lowerIsBetter: parent.contract.lowerIsBetter,
     metricName: parent.contract.metricName,
     overhead: {
       evolve: { executed: false, reason: "No Evolve search is executed by this local research line." },
       ideaTree: { executed: false, reason: "No Idea Tree execution is linked to this local research line." },
       preparations: {
-        attempts: attributablePreparations.length,
-        failed: attributablePreparations.filter((preparation) => preparation.outcome === "failed").length,
+        attempts: attributable.length,
+        failed: attributable.filter((preparation) => preparation.outcome === "failed").length,
         knownSeconds: preparationSeconds,
         probeEvaluations,
-        succeeded: attributablePreparations.filter((preparation) => preparation.outcome === "succeeded").length,
+        succeeded: attributable.filter((preparation) => preparation.outcome === "succeeded").length,
         tokens: "not-applicable",
         unknown: unknownPreparations,
         unknownProbes,
       },
     },
-    parentId: parent.parentId,
-    runs: {
-      active: active.length,
-      settled: parent.settlements.length,
-      started: operations.length,
-    },
-    stop: parent.stop,
+    parentId: core.lineId,
+    runs: core.runs,
+    stop: core.stop,
     taskId: parent.contract.taskId,
     title: parent.contract.title,
-    updatedAt: parent.updatedAt,
+    updatedAt: core.updatedAt,
     usage: {
       tokens: {
         agentDecision: {
@@ -1272,24 +1162,24 @@ export function researchParentView(
           status: agentStatus,
           unknownUsageCalls: agentUnknownCalls,
         },
-        calls: tokenRows.reduce((total, row) => total + row.calls, 0),
+        calls: core.usage.tokens.calls,
         coverage: "sf-worker-and-recorded-agent-runs",
         hardCap: null,
-        inputTokens: tokenRows.reduce((total, row) => total + row.inputTokens, 0),
+        inputTokens: core.usage.tokens.inputTokens,
         note: "Known values cover SF worker calls, attributable preparation wall clock, and model usage recorded for this line's conversation runs. A conversation run shared by several lines is counted on each line, and this path cannot enforce a total token hard cap; these are not a global provider-total claim.",
-        outputTokens: tokenRows.reduce((total, row) => total + row.outputTokens, 0),
-        status: tokensStatus,
-        unknownUsageCalls: tokenRows.reduce((total, row) => total + row.unknownUsageCalls, 0) + agentUnknownCalls,
+        outputTokens: core.usage.tokens.outputTokens,
+        status: core.usage.tokens.status,
+        unknownUsageCalls: core.usage.tokens.unknownUsageCalls + agentUnknownCalls,
       },
       wallClock: {
-        chargedSeconds,
-        knownSeconds,
-        notLaunched,
+        chargedSeconds: core.usage.wallClock.chargedSeconds,
+        knownSeconds: core.usage.wallClock.knownSeconds,
+        notLaunched: core.usage.wallClock.notLaunched,
         preparationSeconds,
-        remainingSeconds,
-        reservedSeconds,
+        remainingSeconds: core.usage.wallClock.remainingSeconds,
+        reservedSeconds: core.usage.wallClock.reservedSeconds,
         unknownPreparations,
-        unknownSettlements,
+        unknownSettlements: core.usage.wallClock.unknownSettlements,
       },
     },
   };
@@ -1297,7 +1187,9 @@ export function researchParentView(
 
 /**
  * Whether this line may accept one more child. The reservation is checked before
- * the operation record is created, so a refused start spends nothing.
+ * the operation record is created, so a refused start spends nothing. The
+ * serial-run, stop, deadline and allowance rules are the shared budget
+ * mechanism; this function only supplies the product facts.
  */
 export function researchLineRefusal(input: {
   readonly parent: ScienceFlowResearchParent;
@@ -1309,57 +1201,21 @@ export function researchLineRefusal(input: {
   readonly preparations?: readonly ScienceFlowResearchPreparation[];
   readonly agentUsage?: readonly NonNullable<ScienceFlowLocalResearchOperation["agentUsage"]>[];
 }): ResearchLineRefusal | undefined {
-  const active = input.operations.filter((operation) =>
-    !isTerminal(operation.state) && operation.operationId !== input.excludeOperationId);
-  if (active.length > 0) {
-    return {
-      message: `This research line already has an active experiment (${active[0]!.operationId}); it runs one child at a time`,
-      reason: "research-line-busy",
-    };
-  }
-  if (input.parent.stop.requestedAt && input.parent.stop.ownerRunId === input.ownerRunId) {
-    return {
-      message: "This research line was stopped in this conversation; a later conversation run must request a new start explicitly",
-      reason: "research-line-stopped",
-    };
-  }
-  if (input.parent.limits === null) return undefined;
-  const deadlineMs = Date.parse(input.parent.limits.deadlineAt);
-  const nowMs = Date.parse(input.now);
-  const remainingSec = Number.isFinite(deadlineMs) && Number.isFinite(nowMs)
-    ? (deadlineMs - nowMs) / 1_000
-    : 0;
-  if (remainingSec <= 0) {
-    return {
-      message: `The research line reached its deadline (${input.parent.limits.deadlineAt}); no further child may be reserved`,
-      reason: "parent-deadline-exceeded",
-    };
-  }
-  // A child is granted a fixed wall-clock allowance. Checking only "is it past
-  // the deadline now" would admit a 320s grant one second before the line
-  // deadline; the whole grant has to fit before it is reserved.
-  if (input.allowanceSec > remainingSec) {
-    return {
-      message: `The research line has ${Math.floor(remainingSec)}s before its deadline (${input.parent.limits.deadlineAt}); this child needs ${input.allowanceSec}s`,
-      reason: "parent-deadline-exceeded",
-    };
-  }
-  const started = input.operations.filter((operation) => operation.operationId !== input.excludeOperationId).length;
-  if (started >= input.parent.limits.maxChildRuns) {
-    return {
-      message: `The research line reached its configured limit of ${input.parent.limits.maxChildRuns} child runs`,
-      reason: "parent-budget-exhausted",
-    };
-  }
-  const view = researchParentView(input.parent, input.operations, input.now, input.preparations ?? [], input.agentUsage ?? []);
-  const remaining = view.usage.wallClock.remainingSeconds ?? 0;
-  if (input.allowanceSec > remaining) {
-    return {
-      message: `The research line has ${remaining}s unreserved allowance left; this child needs ${input.allowanceSec}s`,
-      reason: "parent-budget-exhausted",
-    };
-  }
-  return undefined;
+  const attributable = attributablePreparations(input.parent.contract, input.preparations ?? []);
+  const preparationSeconds = attributable.reduce(
+    (total, preparation) => total + (preparation.wallClock.status === "known" ? preparation.wallClock.seconds : 0),
+    0,
+  );
+  const refusal = researchBudgetLineRefusal({
+    allowanceSec: input.allowanceSec,
+    children: input.operations.map(researchBudgetChild),
+    ...(input.excludeOperationId === undefined ? {} : { excludeOperationId: input.excludeOperationId }),
+    line: researchParentBudgetLine(input.parent),
+    now: input.now,
+    ownerRunId: input.ownerRunId,
+    viewOptions: { extraChargedSeconds: preparationSeconds },
+  });
+  return refusal === undefined ? undefined : { message: refusal.message, reason: refusal.reason };
 }
 
 export function isTerminal(state: ScienceFlowLocalResearchOperation["state"]): boolean {
@@ -1371,11 +1227,7 @@ export function withParentDecision(
   parent: ScienceFlowResearchParent,
   decision: ResearchParentDecision,
 ): ScienceFlowResearchParent {
-  return {
-    ...parent,
-    decisions: [...parent.decisions, decision].slice(-RESEARCH_PARENT_DECISION_LIMIT),
-    updatedAt: decision.at,
-  };
+  return withResearchBudgetDecision(parent, decision);
 }
 
 function formatNumber(value: number): string {

@@ -39,9 +39,44 @@ versions, and `services/scienceflow-preparation/preparation.py` lists packages
 and probes evaluators through the engine's own backend. The design and scope are
 documented in [`docs/en/scienceflow-task-intake.md`](../../../../docs/en/scienceflow-task-intake.md).
 
-The conversation research mode uses the shared operation lifecycle described in
+The conversation research mode uses the shared task service described in
 the [research engine integration guide](../../../../docs/en/design/research-engine-adapter.md).
 The ScienceFlow-specific wiring is described below.
+
+### Shared task service and ScienceFlow's retained rules
+
+`local-research.ts` builds a `ResearchTaskProduct` and one
+`createResearchTaskService` instance. The shared service (under
+`services/api/src/research/`) owns request admission, deduplication, the single
+live operation per conversation run, the cancelled-conversation check,
+persistence through `ResearchTaskRepository`, research-line reservation and
+settlement through `research/budget.ts`, background execution, bounded
+observation, stop/cancel and delivery retry. The operation table keeps its
+original name (`science_flow_local_research_operations`) and columns, and its
+codec validates the same record JSON, so an existing data directory is read in
+place and no second ledger is created.
+
+ScienceFlow keeps the domain half: the administrator profile, Session model
+resolution, task catalog and prepared task contracts, the experiment proposal,
+input roles and staging, the frozen grant, the engine adapter and Python
+process calls, metric direction, comparability groups, best/valid and explicit
+selection, result-note prose, stage/attempt roles and the Evolve shape check.
+Those rules are not platform mechanisms and another engine must not inherit
+them.
+
+### Known ScienceFlow limits
+
+- The local pilot is experimental host execution, not the formal Runner sandbox;
+  `canStart=false` and its blockers are unchanged.
+- The research line enforces child count, serial execution and wall clock. It
+  records token usage per operation but cannot enforce a whole-provider token
+  hard cap; no model gateway is added.
+- A rebuilt service observes an existing engine run; it never resubmits a paid
+  run. A run whose record cannot be read is reported `unknown`.
+- Preparation/probe overhead is attributed only when it names the contract's
+  prepared task version; an unattributable attempt stays in the Session overhead
+  view rather than being dropped.
+
 
 Files:
 
@@ -71,8 +106,16 @@ Files:
 | `prepared-inputs-repository.ts` | Additive SQLite table, conditional generation write, corruption detection |
 | `prepared-inputs.ts` | Prepare action: gates, contract re-read, Runner call, receipt |
 | `prepared-inputs-http.ts` | The two prepared-input routes and their status mapping |
-| `result-delivery.ts` | `deliver`: resolves one existing run's selected result and publishes it as Session Artifacts |
+| `result-delivery.ts` | `deliver`: resolves one existing run's selected result, uses the shared publisher and writes the SF result note |
 | `engine-adapter.ts` | The ScienceFlow engine adapter: staging, pilot launch, engine-record reads, stop and result publication |
+| `local-research.ts` | SF product hooks over the shared task service: model/task/input/proposal rules, grant, view and domain budget identity |
+| `local-research-repository.ts` | SF record codec over the shared SQLite operation repository (same table and columns) |
+| `local-research-results.ts` | SF contract groups, metric comparison and selection; delegates the line budget mechanism to `research/budget.ts` |
+| `../research/task-service.ts` | Shared task entry: admission, dedupe, persistence, budget reservation, launch, observe, stop, cancel and retry |
+| `../research/task-repository.ts` | Shared SQLite operation repository and corruption checks |
+| `../research/budget.ts` | Shared research-line ledger: deadline, run limit, reservations, settlements, stop and decisions |
+| `../research/input-binding.ts` | Shared exact Session-version input binding and CAS byte verification |
+| `../research/artifact-publisher.ts` | Shared CAS/Artifact publication and linked-version resolution |
 | `../research/engine-adapter.ts` | Engine-neutral operation record, adapter interface and lifecycle transitions |
 | `../research/operation-lifecycle.ts` | Shared lifecycle: launch gating, bounded observation, cancellation and delivery retry |
 
@@ -85,19 +128,23 @@ same versions). It starts no run and adds no route.
 ## ScienceFlow task-service adapter
 
 `createLocalResearchService` constructs a `createScienceFlowEngineAdapter` and
-passes it to `createResearchOperationLifecycle`. Tests may substitute the
-adapter through the service's optional dependency:
+registers it as the engine of one `createResearchTaskService` instance. Tests
+may substitute the adapter through the service's optional dependency:
 
 ```ts
 createLocalResearchService({ store, settings }, { adapter });
 ```
 
-The service entry remains ScienceFlow-specific. `start` resolves the Session's
-SD model, validates the ScienceFlow profile and input versions, reserves the
-research-line budget and persists the existing operation/launch records. Task
-catalog/preparation, proposals, evaluator identity, comparison groups,
-best/selected candidates and continuation rules stay in `local-research.ts`.
-Budget/deadline callbacks connect that policy to the adapter and lifecycle.
+The shared service owns request admission, deduplication, the live-operation
+rule, the cancelled-conversation check, persistence, research-line reservation
+and settlement, background execution, observation, stop/cancel and delivery
+retry. ScienceFlow supplies the product hooks: `planStart` resolves the
+Session's SD model, validates the profile, task and input versions, builds the
+proposal and lease, and returns the record; `lineFactsFor` supplies the frozen
+contract group. Task catalog/preparation, proposals, evaluator identity,
+comparison groups, best/selected candidates and continuation rules stay in
+`local-research.ts`. Budget/deadline callbacks connect that policy to the
+adapter and lifecycle, while the reservation mechanism itself is shared.
 
 `engine-adapter.ts` owns dynamic input staging, prepared-task assets, the model
 freeze check, Python pilot launch, receipt and engine-record reads, stop calls

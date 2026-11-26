@@ -201,6 +201,8 @@ export interface ScienceFlowLocalResearchOperation {
   readonly identity: { readonly projectId: string; readonly sessionId: string };
   /** The conversation run that started it; the Session's cancel path uses it. */
   readonly ownerRunId: string;
+  /** Stable engine/product identity; the shared service persists it. */
+  readonly engineId?: string;
   readonly intent: string;
   readonly planVersionId?: string;
   readonly incumbentVersionId?: string;

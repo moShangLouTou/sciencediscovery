@@ -13,35 +13,27 @@
 // limitations under the License.
 
 /**
- * Control-plane persistence for experimental local research operations.
+ * ScienceFlow's durable operation rows over the shared task repository.
  *
- * A conversation tool starts a real engine run that outlives the tool call, so
- * the operation's identity, frozen launch facts and latest observed state have
- * to survive a service rebuild. The table lives in the API's existing
- * `catalog.sqlite`; creating it is additive, so an older data directory upgrades
- * in place. Reads re-validate the stored record: a corrupt or unknown-version
- * row throws instead of being skipped or erased.
- *
- * This is not a general job platform: one row per owned experiment, keyed by an
- * idempotency key derived from the accepted start request.
+ * The SQLite table, insert-if-absent deduplication, identity columns and
+ * session/project deletion are the shared mechanism in
+ * `research/task-repository.ts`. This module supplies only what is specific to
+ * ScienceFlow: its record schema version and the validation of its stored JSON.
+ * The table keeps its original name and column set, so a data directory written
+ * before the shared repository existed is read in place and no second ledger
+ * is created.
  */
 import type { DatabaseSync } from "node:sqlite";
 
-import { SCIENCE_FLOW_LOCAL_RESEARCH_OPERATION_VERSION, type ScienceFlowLocalResearchOperation } from "./local-research-record.js";
-
-interface OperationRow {
-  id: string;
-  project_id: string;
-  session_id: string;
-  owner_run_id: string;
-  idempotency_key: string;
-  created_at: string;
-  updated_at: string;
-  record_json: string;
-}
+import { ResearchOperationCorruptError, isPlainRecord, type ResearchOperationCodec, type ResearchOperationRowIdentity } from "../research/task-record.js";
+import { ResearchTaskRepository } from "../research/task-repository.js";
+import {
+  SCIENCE_FLOW_LOCAL_RESEARCH_OPERATION_VERSION,
+  type ScienceFlowLocalResearchOperation,
+} from "./local-research-record.js";
 
 /** A stored row that does not satisfy this module's contract. Never repaired. */
-export class ScienceFlowLocalResearchCorruptError extends Error {
+export class ScienceFlowLocalResearchCorruptError extends ResearchOperationCorruptError {
   constructor() {
     super("Stored local research operation is unreadable");
     this.name = "ScienceFlowLocalResearchCorruptError";
@@ -66,68 +58,55 @@ export interface ScienceFlowLocalResearchStore {
   deleteProject(projectId: string): void;
 }
 
+/**
+ * Validate the ScienceFlow fields a stored row is allowed to omit and the ones
+ * every reader depends on. This is the product's validation boundary; the
+ * shared repository has already checked the identity columns and schema version.
+ */
+const scienceFlowCodec: ResearchOperationCodec<ScienceFlowLocalResearchOperation> = {
+  schemaVersion: SCIENCE_FLOW_LOCAL_RESEARCH_OPERATION_VERSION,
+  encode: (record) => record,
+  decode(value, row: ResearchOperationRowIdentity): ScienceFlowLocalResearchOperation {
+    if (!isPlainRecord(value) || value.schemaVersion !== SCIENCE_FLOW_LOCAL_RESEARCH_OPERATION_VERSION) {
+      throw new ScienceFlowLocalResearchCorruptError();
+    }
+    if (
+      value.operationId !== row.id
+      || !isPlainRecord(value.identity)
+      || value.identity.projectId !== row.projectId
+      || value.identity.sessionId !== row.sessionId
+      || value.ownerRunId !== row.ownerRunId
+      || value.idempotencyKey !== row.idempotencyKey
+      || value.createdAt !== row.createdAt
+      || value.updatedAt !== row.updatedAt
+    ) {
+      throw new ScienceFlowLocalResearchCorruptError();
+    }
+    return value as unknown as ScienceFlowLocalResearchOperation;
+  },
+};
+
 export class ScienceFlowLocalResearchRepository implements ScienceFlowLocalResearchStore {
-  constructor(readonly database: DatabaseSync) {
-    database.exec(`
-      CREATE TABLE IF NOT EXISTS science_flow_local_research_operations (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        owner_run_id TEXT NOT NULL,
-        idempotency_key TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        record_json TEXT NOT NULL,
-        UNIQUE(project_id, session_id, idempotency_key)
-      );
-      CREATE INDEX IF NOT EXISTS science_flow_local_research_operations_session
-        ON science_flow_local_research_operations(session_id);
-      CREATE INDEX IF NOT EXISTS science_flow_local_research_operations_project
-        ON science_flow_local_research_operations(project_id);
-    `);
+  private readonly repository: ResearchTaskRepository<ScienceFlowLocalResearchOperation>;
+
+  constructor(database: DatabaseSync) {
+    // The original table name is kept deliberately: existing rows stay the one
+    // source of truth and two ledgers cannot decide differently for one task.
+    this.repository = new ResearchTaskRepository<ScienceFlowLocalResearchOperation>(database, {
+      codec: scienceFlowCodec,
+      table: "science_flow_local_research_operations",
+    });
   }
 
-  /**
-   * Insert-or-return-existing, keyed by the business idempotency key. The insert
-   * and the read-back happen synchronously on one connection, so two concurrent
-   * starts of the same accepted request cannot split them.
-   */
   createIfAbsent(record: ScienceFlowLocalResearchOperation): {
     readonly created: boolean;
     readonly record: ScienceFlowLocalResearchOperation;
   } {
-    const result = this.database
-      .prepare(
-        `INSERT INTO science_flow_local_research_operations
-           (id, project_id, session_id, owner_run_id, idempotency_key, created_at, updated_at, record_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(project_id, session_id, idempotency_key) DO NOTHING`,
-      )
-      .run(
-        record.operationId,
-        record.identity.projectId,
-        record.identity.sessionId,
-        record.ownerRunId,
-        record.idempotencyKey,
-        record.createdAt,
-        record.updatedAt,
-        JSON.stringify(record),
-      );
-    if (result.changes === 1) return { created: true, record: structuredClone(record) };
-    const existing = this.findByIdempotency(
-      record.identity.projectId,
-      record.identity.sessionId,
-      record.idempotencyKey,
-    );
-    if (!existing) throw new ScienceFlowLocalResearchCorruptError();
-    return { created: false, record: existing };
+    return this.repository.createIfAbsent(record);
   }
 
   get(operationId: string): ScienceFlowLocalResearchOperation | undefined {
-    const row = this.database
-      .prepare("SELECT * FROM science_flow_local_research_operations WHERE id = ?")
-      .get(operationId) as OperationRow | undefined;
-    return row ? parseRow(row) : undefined;
+    return this.repository.get(operationId);
   }
 
   findByIdempotency(
@@ -135,77 +114,22 @@ export class ScienceFlowLocalResearchRepository implements ScienceFlowLocalResea
     sessionId: string,
     idempotencyKey: string,
   ): ScienceFlowLocalResearchOperation | undefined {
-    const row = this.database
-      .prepare(
-        `SELECT * FROM science_flow_local_research_operations
-          WHERE project_id = ? AND session_id = ? AND idempotency_key = ?`,
-      )
-      .get(projectId, sessionId, idempotencyKey) as OperationRow | undefined;
-    return row ? parseRow(row) : undefined;
+    return this.repository.findByIdempotency(projectId, sessionId, idempotencyKey);
   }
 
   listForSession(projectId: string, sessionId: string): ScienceFlowLocalResearchOperation[] {
-    const rows = this.database
-      .prepare(
-        `SELECT * FROM science_flow_local_research_operations
-          WHERE project_id = ? AND session_id = ?
-          ORDER BY created_at, id`,
-      )
-      .all(projectId, sessionId) as unknown as OperationRow[];
-    return rows.map(parseRow);
+    return this.repository.listForSession(projectId, sessionId);
   }
 
-  /** Replace a record's observed state. The identity columns never change. */
   update(record: ScienceFlowLocalResearchOperation): void {
-    const result = this.database
-      .prepare(
-        `UPDATE science_flow_local_research_operations
-            SET updated_at = ?, record_json = ?
-          WHERE id = ? AND project_id = ? AND session_id = ?`,
-      )
-      .run(record.updatedAt, JSON.stringify(record), record.operationId,
-        record.identity.projectId, record.identity.sessionId);
-    if (result.changes !== 1) throw new ScienceFlowLocalResearchCorruptError();
+    this.repository.update(record);
   }
 
   deleteSession(sessionId: string): void {
-    this.database
-      .prepare("DELETE FROM science_flow_local_research_operations WHERE session_id = ?")
-      .run(sessionId);
+    this.repository.deleteSession(sessionId);
   }
 
   deleteProject(projectId: string): void {
-    this.database
-      .prepare("DELETE FROM science_flow_local_research_operations WHERE project_id = ?")
-      .run(projectId);
+    this.repository.deleteProject(projectId);
   }
-}
-
-function parseRow(row: OperationRow): ScienceFlowLocalResearchOperation {
-  let value: unknown;
-  try {
-    value = JSON.parse(row.record_json);
-  } catch {
-    throw new ScienceFlowLocalResearchCorruptError();
-  }
-  if (!isRecord(value) || value.schemaVersion !== SCIENCE_FLOW_LOCAL_RESEARCH_OPERATION_VERSION) {
-    throw new ScienceFlowLocalResearchCorruptError();
-  }
-  if (
-    value.operationId !== row.id
-    || !isRecord(value.identity)
-    || value.identity.projectId !== row.project_id
-    || value.identity.sessionId !== row.session_id
-    || value.ownerRunId !== row.owner_run_id
-    || value.idempotencyKey !== row.idempotency_key
-    || value.createdAt !== row.created_at
-    || value.updatedAt !== row.updated_at
-  ) {
-    throw new ScienceFlowLocalResearchCorruptError();
-  }
-  return value as unknown as ScienceFlowLocalResearchOperation;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

@@ -48,8 +48,24 @@ import type {
   ScienceFlowSnapshotReadResult,
 } from "@sciencediscovery/scienceflow-reader";
 
-import { createResearchOperationLifecycle } from "../research/operation-lifecycle.js";
 import type { ResearchEngineAdapter } from "../research/engine-adapter.js";
+import {
+  bindExactVersionInput,
+  digestInputFile,
+  readVerifiedVersionBytes,
+  resolveSessionArtifactVersion,
+  ResearchInputRefusal,
+} from "../research/input-binding.js";
+import {
+  createResearchTaskService,
+  type ResearchTaskLineStore,
+  type ResearchTaskProduct,
+  type ResearchStartPlan,
+} from "../research/task-service.js";
+import {
+  RESEARCH_BUDGET_LINE_VERSION,
+  type ResearchBudgetLine,
+} from "../research/budget.js";
 import {
   createScienceFlowEngineAdapter,
   type ScienceFlowDeadlineVerdict,
@@ -119,10 +135,14 @@ import {
   readExecutionEnvironment,
   type EngineSourceIdentity,
   type ExecutionEnvironmentIdentity,
+  type ResearchContractIdentity,
   researchContractIdentity,
   researchContractIdentityFrom,
   researchGroupId,
+  researchBudgetChild,
   researchLineRefusal,
+  researchParentBudgetLine,
+  researchParentFromBudgetLine,
   researchParentView,
   researchResultRelations,
   ResearchResultRefusal,
@@ -670,18 +690,6 @@ export function createLocalResearchService(input: {
     }
   };
 
-  /** Keep the line's settlement audit current once a child is terminal. */
-  const settleParentFor = (record: ScienceFlowLocalResearchOperation): void => {
-    if (!isTerminalResearchState(record.state)) return;
-    const groupId = researchGroupId(record);
-    persistParent(
-      researchContractIdentity(record),
-      groupId,
-      record.identity,
-      groupOperations(record.identity.projectId, record.identity.sessionId, groupId),
-    );
-  };
-
   /**
    * The last check before a launch. Staging and task materialisation are
    * asynchronous, so the reservation that fit at `start` may no longer fit
@@ -737,62 +745,6 @@ export function createLocalResearchService(input: {
       grant: { ...grant, reportBudgetSec, researchBudgetSec, totalAllowanceSec },
       kind: "tighten",
     };
-  };
-
-  /**
-   * Record a stop on the research line itself, so a later start in the same
-   * conversation cannot quietly reserve another child.
-   */
-  const markLineStop = (
-    record: ScienceFlowLocalResearchOperation,
-    requestedBy: "tool" | "conversation-cancel",
-    requestedAt: string,
-    confirmed: boolean,
-  ): void => {
-    const groupId = researchGroupId(record);
-    const contract = researchContractIdentity(record);
-    const groupOps = groupOperations(record.identity.projectId, record.identity.sessionId, groupId);
-    let parent = projectResearchParent({
-      contract,
-      existing: parents().get(record.identity.projectId, record.identity.sessionId, groupId),
-      groupId,
-      identity: record.identity,
-      limits: settings.parentBudget,
-      now: requestedAt,
-      operations: groupOps,
-    });
-    const previousStop = parent.stop;
-    const alreadyRequested = previousStop.requestedAt !== undefined
-      && previousStop.operationId === record.operationId;
-    parent = {
-      ...parent,
-      stop: {
-        ...parent.stop,
-        operationId: record.operationId,
-        ownerRunId: record.ownerRunId,
-        requestedAt,
-        requestedBy,
-        ...(confirmed ? { confirmedAt: requestedAt } : {}),
-      },
-      updatedAt: requestedAt,
-    };
-    if (!alreadyRequested) {
-      parent = withParentDecision(parent, {
-        at: requestedAt,
-        kind: "stop-requested",
-        operationId: record.operationId,
-        summary: `stop requested by ${requestedBy} for ${record.operationId}`,
-      });
-    }
-    if (confirmed && previousStop.confirmedAt === undefined) {
-      parent = withParentDecision(parent, {
-        at: requestedAt,
-        kind: "stop-confirmed",
-        operationId: record.operationId,
-        summary: `engine confirmed termination of ${record.operationId}`,
-      });
-    }
-    parents().put(parent);
   };
 
   const parentViewFor = (
@@ -999,15 +951,16 @@ export function createLocalResearchService(input: {
     versionId: string,
     label: string,
   ): NonNullable<ReturnType<LocalResearchServiceStore["getProjectArtifactVersion"]>> => {
-    const version = store.getProjectArtifactVersion(projectId, versionId);
-    const artifact = version ? store.getProjectArtifact(projectId, version.artifactId) : undefined;
-    if (!version || !artifact || artifact.deletedAt || artifact.createdInSessionId !== sessionId) {
-      throw new LocalResearchRefusal(
-        "link-version-not-found",
-        `The ${label} version is not a live artifact version of this Session`,
+    try {
+      return resolveSessionArtifactVersion(
+        store,
+        { projectId, sessionId },
+        versionId,
+        label,
       );
+    } catch (error) {
+      throw inputRefusal(error);
     }
-    return version;
   };
 
   /**
@@ -1019,22 +972,15 @@ export function createLocalResearchService(input: {
     role: ScienceFlowLocalResearchInputRole,
     path: string,
   ): Promise<{ readonly sha256: string; readonly size: number }> => {
-    let bytes: Buffer;
     try {
-      bytes = await readFile(path);
-    } catch {
-      throw new LocalResearchRefusal(
-        "configured-input-unavailable",
-        `This research profile's configured ${role} input could not be read`,
+      return await digestInputFile(
+        () => readFile(path),
+        SCIENCE_FLOW_LOCAL_RESEARCH_INPUT_MAX_BYTES,
+        role,
       );
+    } catch (error) {
+      throw inputRefusal(error);
     }
-    if (bytes.length > SCIENCE_FLOW_LOCAL_RESEARCH_INPUT_MAX_BYTES) {
-      throw new LocalResearchRefusal(
-        "configured-input-unavailable",
-        `This research profile's configured ${role} input is too large`,
-      );
-    }
-    return { sha256: createHash("sha256").update(bytes).digest("hex"), size: bytes.length };
   };
 
   /** Read and verify one linked version's CAS bytes. */
@@ -1042,23 +988,11 @@ export function createLocalResearchService(input: {
     role: ScienceFlowLocalResearchInputRole,
     version: NonNullable<ReturnType<LocalResearchServiceStore["getProjectArtifactVersion"]>>,
   ): Promise<{ readonly sha256: string; readonly size: number }> => {
-    let bytes: Buffer;
     try {
-      bytes = await readArtifactBytes(version.content.hash);
-    } catch {
-      throw new LocalResearchRefusal(
-        "link-version-unreadable",
-        `The ${role} version's content could not be read`,
-      );
+      return await readVerifiedVersionBytes(store, version, role, readArtifactBytes);
+    } catch (error) {
+      throw inputRefusal(error);
     }
-    const digest = createHash("sha256").update(bytes).digest("hex");
-    if (digest !== version.content.hash || bytes.length !== version.content.size) {
-      throw new LocalResearchRefusal(
-        "link-version-unreadable",
-        `The ${role} version's content does not match its recorded digest`,
-      );
-    }
-    return { sha256: digest, size: bytes.length };
   };
 
   /**
@@ -1124,16 +1058,27 @@ export function createLocalResearchService(input: {
             `This research profile runs a fixed experiment and does not accept a ${role} version`,
           );
         }
-        const version = assertLinkVersion(request.sessionId, request.projectId, versionId, role);
-        const actual = await readLinkedInput(role, version);
         const expected = await readConfiguredInput(role, configured);
-        if (actual.sha256 !== expected.sha256 || actual.size !== expected.size) {
-          throw new LocalResearchRefusal(
-            "link-version-mismatch",
-            `The ${role} version is not this research profile's configured ${role} input`,
-          );
+        let bound;
+        try {
+          bound = await bindExactVersionInput({
+            expected,
+            identity: { projectId: request.projectId, sessionId: request.sessionId },
+            label: role,
+            readBytes: readArtifactBytes,
+            store,
+            versionId,
+          });
+        } catch (error) {
+          if (error instanceof ResearchInputRefusal && error.reason === "link-version-mismatch") {
+            throw new LocalResearchRefusal(
+              "link-version-mismatch",
+              `The ${role} version is not this research profile's configured ${role} input`,
+            );
+          }
+          throw inputRefusal(error);
         }
-        inputs.push({ role, sha256: actual.sha256, size: actual.size, versionId });
+        inputs.push({ role, sha256: bound.sha256, size: bound.size, versionId });
       } else if (configured) {
         const expected = await readConfiguredInput(role, configured);
         inputs.push({ role, sha256: expected.sha256, size: expected.size, versionId: null });
@@ -1172,22 +1117,6 @@ export function createLocalResearchService(input: {
     sleep,
     store,
   });
-  const lifecycle = createResearchOperationLifecycle<
-    ScienceFlowLocalResearchOperation,
-    ScienceFlowLocalResearchDelivery
-  >({
-    engine: engineAdapter,
-    errorMessage,
-    now,
-    observeMaxWaitMs: settings.defaults.observeMaxWaitMs,
-    onStopConfirmed: (record, at, requestedBy) => markLineStop(record, requestedBy, at, true),
-    onStopRequested: (record, at, requestedBy) => markLineStop(record, requestedBy, at, false),
-    onTerminal: settleParentFor,
-    operations: { get: (operationId) => operations().get(operationId), mutate },
-    ownerStopped,
-    sleep,
-  });
-
   /** The engine adapter settings; present only when the profile enables task choice. */
   const preparation: TaskPreparationSettings | undefined = settings.taskMode === "task-dynamic"
     ? {
@@ -1423,6 +1352,432 @@ export function createLocalResearchService(input: {
     }
   };
 
+  /** Preparation wall clock attributable to one frozen scientific contract. */
+  const attributablePreparationSeconds = (
+    projectId: string,
+    sessionId: string,
+    contract: ResearchContractIdentity,
+  ): number => {
+    // Only a prepared task version identifies the contract whose preparation
+    // cost this is; a failed attempt with no version stays in Session overhead.
+    if (contract.source !== "prepared") return 0;
+    return preparationsFor(projectId, sessionId).reduce((total, preparation) => {
+      const attributed = preparation.taskVersionId !== null
+        ? preparation.taskVersionId === contract.taskVersionId
+        : preparation.taskId !== null && preparation.taskId === contract.taskId;
+      return total + (attributed && preparation.wallClock.status === "known" ? preparation.wallClock.seconds : 0);
+    }, 0);
+  };
+
+  const lineFactsFor = (
+    record: ScienceFlowLocalResearchOperation,
+  ): { children: readonly ReturnType<typeof researchBudgetChild>[]; extraChargedSeconds: number; limits?: { maxChildRuns: number; totalAllowanceSec: number }; lineId: string; lineKey: string } => {
+    const groupId = researchGroupId(record);
+    const contract = researchContractIdentity(record);
+    const groupOps = groupOperations(record.identity.projectId, record.identity.sessionId, groupId);
+    return {
+      children: groupOps.map(researchBudgetChild),
+      extraChargedSeconds: attributablePreparationSeconds(
+        record.identity.projectId,
+        record.identity.sessionId,
+        contract,
+      ),
+      ...(settings.parentBudget === undefined ? {} : { limits: settings.parentBudget }),
+      lineId: `sf-parent-${groupId.replace(/^sfc-/u, "")}`,
+      lineKey: groupId,
+    };
+  };
+
+  /** The shared budget ledger over the existing ScienceFlow parent rows. */
+  const lines: ResearchTaskLineStore<ScienceFlowLocalResearchOperation> = {
+    get(projectId, sessionId, lineKey) {
+      const parent = parents().get(projectId, sessionId, lineKey);
+      return parent === undefined ? undefined : researchParentBudgetLine(parent);
+    },
+    put(line: ResearchBudgetLine, record) {
+      const existing = parents().get(record.identity.projectId, record.identity.sessionId, line.lineKey);
+      // Preserve the frozen scientific contract when the shared ledger updates
+      // reservations, settlements, decisions or the stop marker.
+      parents().put(researchParentFromBudgetLine(
+        line,
+        existing?.contract ?? researchContractIdentity(record),
+        line.lineKey,
+      ));
+    },
+  };
+
+  /**
+   * ScienceFlow's product half of the shared task service: its model resolution,
+   * task selection, input binding, proposal rules, frozen grant and engine
+   * adapter. Deduplication, admission, persistence, budget reservation,
+   * observation, cancellation and delivery retry are the shared service.
+   */
+  const planStart = async (
+    request: LocalResearchStartInput,
+  ): Promise<ResearchStartPlan<ScienceFlowLocalResearchOperation>> => {
+    request.signal?.throwIfAborted();
+    const intent = request.intent.trim();
+    if (!intent || intent.length > 2_000 || intent.includes("\u0000")) {
+      throw new LocalResearchRefusal("invalid-option", "The research intent must be 1-2000 characters without NUL bytes");
+    }
+    // Resolve the Session's effective model before anything is written, so an
+    // unsupported profile refuses the request instead of failing the launch.
+    // The credential-free selection is frozen in the operation record; the
+    // pilot receipt records the model the launch actually used.
+    let resolvedModel;
+    try {
+      resolvedModel = resolveResearchPilotModel(store, { projectId: request.projectId, sessionId: request.sessionId });
+    } catch (error) {
+      throw new LocalResearchRefusal(
+        "unsupported-model",
+        error instanceof ResearchPilotRefusal ? error.message : errorMessage(error),
+      );
+    }
+    if (request.planVersionId) assertLinkVersion(request.sessionId, request.projectId, request.planVersionId, "plan");
+    if (request.incumbentVersionId) {
+      assertLinkVersion(request.sessionId, request.projectId, request.incumbentVersionId, "incumbent");
+    }
+    request.signal?.throwIfAborted();
+    // Resolve the task before the input binding: a task-dynamic profile must
+    // run the task the conversation named, never its old default package, and
+    // a named task this profile does not allow is refused before any read.
+    const selection = await resolveTaskSelection(request);
+    request.signal?.throwIfAborted();
+    const taskId = selection?.taskId ?? settings.task!;
+    // A catalog task's evaluator identity includes the checkout revision and
+    // the actual evaluator/package digests. An unknown identity is recorded
+    // as unknown and that group is shown but not ranked.
+    const [engineIdentity, executionEnvironment] = await Promise.all([
+      engineIdentityOf(settings.engineCheckout),
+      executionEnvironmentOf(settings.pythonExecutable),
+    ]);
+    const contract = researchContractIdentityFrom(selection?.binding, taskId, {
+      executionEnvironment,
+      revision: engineIdentity?.revision,
+      statusDigest: engineIdentity?.statusDigest,
+      worktreeDirty: engineIdentity?.dirty,
+    });
+    const groupId = contractGroupId(contract);
+    await captureAgentUsage(groupOperations(request.projectId, request.sessionId, groupId));
+    // A rebuilt service reconciles the line's stored children from the engine
+    // record before it decides on a new reservation. It never starts one.
+    const groupOps = await taskService.lifecycle.reconcile(
+      groupOperations(request.projectId, request.sessionId, groupId),
+    );
+    // An explicit `selected_for_next` is a decision, not a display. A start
+    // without an incumbent follows it; a different incumbent conflicts; a
+    // stale selection cannot be silently ignored.
+    let effectiveRequest = request;
+    let followedSelection: NonNullable<ScienceFlowLocalResearchOperation["followedSelection"]> | undefined;
+    const selectionRow = selections().get(request.projectId, request.sessionId, groupId);
+    if (selectionRow) {
+      const selectedGroup = deriveResearchResultGroups(groupOps, [selectionRow])
+        .find((candidate) => candidate.groupId === groupId);
+      const selectedView = selectedGroup?.selection;
+      if (selectedView?.valid === true) {
+        if (request.incumbentVersionId !== undefined
+          && request.incumbentVersionId !== selectionRow.versionId) {
+          throw new LocalResearchRefusal(
+            "selection-conflict",
+            `This research line explicitly selected result ${selectionRow.operationId} (version ${selectionRow.versionId}). `
+              + "Pass that version, or change the selection first; a different incumbent would silently ignore the decision.",
+          );
+        }
+        if (request.incumbentVersionId === undefined) {
+          effectiveRequest = { ...request, incumbentVersionId: selectionRow.versionId };
+        }
+        followedSelection = {
+          isBestValid: selectedView.isBestValid,
+          operationId: selectionRow.operationId,
+          reason: selectionRow.reason,
+          selectedAt: selectionRow.selectedAt,
+          versionId: selectionRow.versionId,
+        };
+      } else if (request.incumbentVersionId === undefined) {
+        throw new LocalResearchRefusal(
+          "selection-stale",
+          "The research line's explicit selection is no longer a valid result. "
+            + "Select a valid result or pass an explicit incumbent before starting.",
+        );
+      }
+    }
+    if (followedSelection !== undefined && settings.inputMode === "dynamic"
+      && settings.dynamicInputs?.incumbent === undefined) {
+      throw new LocalResearchRefusal(
+        "invalid-option",
+        "This research profile does not stage an incumbent, so the explicit selection cannot be followed",
+      );
+    }
+    const resolvedKey = idempotencyKey({ ...effectiveRequest, intent });
+    // A replay of the same request after an automatic selection must attach to
+    // its existing operation instead of being refused as a repeated experiment.
+    const resolvedExisting = operations().findByIdempotency(
+      request.projectId,
+      request.sessionId,
+      resolvedKey,
+    );
+    if (resolvedExisting) return { attachTo: resolvedExisting };
+    // Freeze the fixed input bytes this run will actually use, and prove a
+    // named version is exactly that input before any record or launch exists.
+    const inputs = await resolveInputs(effectiveRequest);
+    assertContinuationCompatible(effectiveRequest, selection);
+
+    // Every continuation round must explain its evidence and make a concrete
+    // method change. First rounds stay compatible with the older entry; the
+    // production tool always supplies the structured proposal.
+    let proposal: ExperimentProposal | undefined;
+    const previousOperation = [...groupOps].reverse().find((operation) => operation.proposal !== undefined);
+    if (request.proposal !== undefined) {
+      try {
+        const parsed = parseExperimentProposal(request.proposal, {
+          maxSubBudgetSeconds: settings.defaults.totalAllowanceSec,
+          now: now(),
+        });
+        const resolvedEvidence: Array<ExperimentProposal["evidence"][number]> = [];
+        for (const entry of parsed.evidence) {
+          if (entry.kind === "artifact-version" && entry.versionId !== undefined) {
+            const version = store.getProjectArtifactVersion(request.projectId, entry.versionId);
+            const artifact = version ? store.getProjectArtifact(request.projectId, version.artifactId) : undefined;
+            const ownsArtifact = artifact !== undefined && artifact.deletedAt === undefined
+              && artifact.createdInSessionId === request.sessionId;
+            const ownsVersion = version !== undefined && version.sessionId === request.sessionId;
+            if (!version || !artifact || artifact.deletedAt || (!ownsArtifact && !ownsVersion)) {
+              throw new LocalResearchRefusal(
+                "proposal-invalid",
+                `Evidence artifact version ${entry.versionId} is not a live version of this Session`,
+              );
+            }
+            resolvedEvidence.push({ ...entry, sha256: version.content.hash });
+          } else if (entry.kind === "operation-result" && entry.operationId !== undefined) {
+            const evidenceOperation = operations().get(entry.operationId);
+            if (!evidenceOperation || evidenceOperation.identity.projectId !== request.projectId
+              || evidenceOperation.identity.sessionId !== request.sessionId) {
+              throw new LocalResearchRefusal(
+                "proposal-invalid",
+                `Evidence operation ${entry.operationId} is not a research operation of this Session`,
+              );
+            }
+            resolvedEvidence.push({ ...entry });
+          }
+        }
+        proposal = { ...parsed, evidence: resolvedEvidence };
+        assertExperimentProposalAdvances(
+          proposal,
+          previousOperation?.proposal === undefined
+            ? undefined
+            : {
+                incumbentVersionId: previousOperation.incumbentVersionId ?? null,
+                proposal: previousOperation.proposal,
+              },
+          effectiveRequest.incumbentVersionId ?? null,
+        );
+      } catch (error) {
+        if (error instanceof LocalResearchRefusal) throw error;
+        if (error instanceof ExperimentProposalRefusal) {
+          throw new LocalResearchRefusal(
+            error.reason === "proposal-not-new" ? "proposal-not-new" : "proposal-invalid",
+            error.message,
+          );
+        }
+        throw new LocalResearchRefusal("proposal-invalid", errorMessage(error));
+      }
+    } else if (settings.taskMode === "task-dynamic" && groupOps.length > 0) {
+      throw new LocalResearchRefusal(
+        "proposal-invalid",
+        "A continuation round needs a structured experiment proposal with its evidence, method change, expected observation, evaluation method, stop condition and sub-budget",
+      );
+    }
+
+    const childTotalAllowanceSec = proposal?.subBudgetSeconds ?? settings.defaults.totalAllowanceSec;
+    const childReportBudgetSec = Math.min(
+      settings.defaults.reportBudgetSec,
+      Math.max(10, childTotalAllowanceSec - 30),
+    );
+    const childResearchBudgetSec = Math.min(
+      settings.defaults.researchBudgetSec,
+      childTotalAllowanceSec - childReportBudgetSec,
+    );
+    if (childResearchBudgetSec < 30) {
+      throw new LocalResearchRefusal("invalid-option", "The proposed sub-budget cannot cover the engine's research minimum");
+    }
+    request.signal?.throwIfAborted();
+
+    const operationId = newOperationId();
+    const createdAt = now();
+    const workDir = join(settings.workRoot, "operations", operationId);
+    const planRole = inputs.find((input) => input.role === "plan");
+    const incumbentRole = inputs.find((input) => input.role === "incumbent");
+    // The researcher's instruction is composed from frozen facts: a selected
+    // package's own description or a prepared contract's objective, plus the
+    // plan and intent. A template problem refuses the start instead of
+    // launching a run with an unfilled instruction.
+    const baseTaskDescription = selection
+      ? composeTaskInstruction({
+          artifactKind: selection.binding.artifactKind,
+          artifactPath: selection.binding.artifactPath,
+          authoritative: selection.binding.authoritative,
+          ...(incumbentRole?.stagedName && incumbentRole.versionId
+            ? { incumbentFile: incumbentRole.stagedName, incumbentVersionId: incumbentRole.versionId }
+            : {}),
+          inputFiles: selection.binding.inputs.map((binding) => binding.logicalName),
+          intent,
+          lowerIsBetter: selection.binding.lowerIsBetter,
+          metricName: selection.binding.metricName,
+          objective: selection.objective,
+          operationId,
+          planFile: settings.dynamicInputs?.plan ?? "experiment_plan.md",
+          planVersionId: planRole?.versionId ?? effectiveRequest.planVersionId ?? "",
+          prepared: selection.prepared,
+          title: selection.binding.title,
+        })
+      : settings.inputMode === "dynamic"
+        ? composeDynamicTaskText(settings.taskTemplate ?? "", {
+            intent,
+            operationId,
+            roles: inputs.flatMap((input) =>
+              input.stagedName === undefined || input.versionId === null
+                ? []
+                : [{
+                    role: input.role,
+                    sha256: input.sha256,
+                    size: input.size,
+                    stagedName: input.stagedName,
+                    versionId: input.versionId,
+                  }]),
+          })
+        : settings.taskDescription;
+    const taskDescription = withRoundContext(baseTaskDescription, proposal, followedSelection);
+    const grant: ScienceFlowLocalResearchGrant = {
+      task: taskId,
+      researchBudgetSec: childResearchBudgetSec,
+      reportBudgetSec: childReportBudgetSec,
+      totalAllowanceSec: childTotalAllowanceSec,
+      maxSteps: settings.defaults.maxSteps,
+      stageCaptureMax: settings.defaults.stageCaptureMax,
+      bashTimeoutSec: settings.defaults.bashTimeoutSec,
+      codeMaxTokens: settings.defaults.codeMaxTokens,
+      feedbackMaxTokens: settings.defaults.feedbackMaxTokens,
+      httpTimeoutSec: settings.defaults.httpTimeoutSec,
+      refusePackageInstall: settings.refusePackageInstall,
+      taskDescriptionPinned: taskDescription !== undefined,
+    };
+    const record: ScienceFlowLocalResearchOperation = {
+      schemaVersion: SCIENCE_FLOW_LOCAL_RESEARCH_OPERATION_VERSION,
+      operationId,
+      idempotencyKey: resolvedKey,
+      identity: { projectId: request.projectId, sessionId: request.sessionId },
+      ownerRunId: request.ownerRunId,
+      engineId: settings.profileId,
+      intent,
+      ...(effectiveRequest.planVersionId ? { planVersionId: effectiveRequest.planVersionId } : {}),
+      ...(effectiveRequest.incumbentVersionId ? { incumbentVersionId: effectiveRequest.incumbentVersionId } : {}),
+      ...(inputs.length ? { inputs } : {}),
+      ...(selection ? { taskBinding: selection.binding } : {}),
+      ...(proposal === undefined ? {} : { proposal }),
+      ...(followedSelection === undefined ? {} : { followedSelection }),
+      createdAt,
+      updatedAt: createdAt,
+      state: "accepted",
+      engineRunId: `sd-research-${operationId.slice(0, 12)}`,
+      task: taskId,
+      workDir,
+      receiptPath: join(workDir, "receipt.json"),
+      deliveryRecordPath: join(workDir, "delivery.json"),
+      launch: {
+        profileId: settings.profileId,
+        engineCheckout: settings.engineCheckout,
+        pythonExecutable: settings.pythonExecutable,
+        readerScriptPath: settings.readerScriptPath,
+        seedDir: settings.seedDir,
+        privateRoot: join(settings.privateRoot, operationId),
+        model: {
+          profileName: resolvedModel.selection.profileName,
+          providerModel: resolvedModel.selection.providerModel,
+          selectionSource: resolvedModel.selection.selectionSource,
+        },
+        grant,
+        ...(settings.inputMode === "dynamic" ? { inputMode: "dynamic" as const } : {}),
+        ...(taskDescription === undefined ? {} : { taskDescription }),
+        ...(engineIdentity?.revision === undefined ? {} : { engineRevision: engineIdentity.revision }),
+        ...(engineIdentity?.dirty === undefined ? {} : { engineWorktreeDirty: engineIdentity.dirty }),
+        ...(engineIdentity?.statusDigest === undefined ? {} : { engineStatusDigest: engineIdentity.statusDigest }),
+        ...(executionEnvironment === undefined ? {} : { executionEnvironment }),
+      },
+      engine: {},
+      progress: { stages: [], usage: null },
+      delivery: { state: "pending", attempts: 0, updatedAt: createdAt },
+      stop: {},
+    };
+    return {
+      dedupeKey: resolvedKey,
+      line: {
+        allowanceSec: childTotalAllowanceSec,
+        children: groupOps.map(researchBudgetChild),
+        extraChargedSeconds: attributablePreparationSeconds(request.projectId, request.sessionId, contract),
+        ...(settings.parentBudget === undefined ? {} : { limits: settings.parentBudget }),
+        lineId: `sf-parent-${groupId.replace(/^sfc-/u, "")}`,
+        lineKey: groupId,
+        startSummary: `started ${operationId} with a ${settings.defaults.totalAllowanceSec}s reservation`,
+      },
+      record,
+    };
+  };
+
+  const taskProduct: ResearchTaskProduct<
+    LocalResearchStartInput,
+    ScienceFlowLocalResearchDelivery,
+    ScienceFlowLocalResearchOperation,
+    ScienceFlowLocalResearchView
+  > = {
+    engineId: settings.profileId,
+    capabilities: {
+      asynchronousLaunch: true,
+      confirmsStop: true,
+      delivers: "Session artifacts with a result note and captured stages",
+      reportsElapsedSec: true,
+      reportsTokenUsage: true,
+    },
+    engine: engineAdapter,
+    requestIdentity: (request) => ({
+      ownerRunId: request.ownerRunId,
+      projectId: request.projectId,
+      sessionId: request.sessionId,
+    }),
+    // The production tool has already passed the governed execution permission;
+    // the shared service below still proves Project/Session ownership and write
+    // access before this hook runs.
+    authorize: () => undefined,
+    idempotencyKey: (request) => idempotencyKey({ ...request, intent: request.intent.trim() }),
+    planStart: (request) => planStart(request),
+    refuse: (reason, message) => new LocalResearchRefusal(reason as LocalResearchRefusalReason, message),
+    present: (record) => singleView(record),
+    list: (projectId, sessionId, records) => viewsFor(projectId, sessionId, records),
+    lineFactsFor,
+    afterObserve: async (record) => captureAgentUsage([record]),
+    afterStop: async (record) => captureAgentUsage([record]),
+  };
+
+  // The shared task service owns admission, deduplication, persistence, budget
+  // reservation, background execution, observation, cancellation and retry.
+  // ScienceFlow supplies the engine adapter and its scientific rules above.
+  const taskService = createResearchTaskService<
+    LocalResearchStartInput,
+    ScienceFlowLocalResearchDelivery,
+    ScienceFlowLocalResearchOperation,
+    ScienceFlowLocalResearchView
+  >({
+    errorMessage,
+    lines,
+    newOperationId,
+    now,
+    observeMaxWaitMs: settings.defaults.observeMaxWaitMs,
+    operations: operations(),
+    ownerStopped,
+    product: taskProduct,
+    sleep,
+    store,
+  });
+
   return {
     enabled: true,
     profileId: settings.profileId,
@@ -1628,421 +1983,42 @@ export function createLocalResearchService(input: {
     },
 
     async start(request: LocalResearchStartInput): Promise<LocalResearchStartOutcome> {
-      request.signal?.throwIfAborted();
-      const intent = request.intent.trim();
-      if (!intent || intent.length > 2_000 || intent.includes("\u0000")) {
-        throw new LocalResearchRefusal("invalid-option", "The research intent must be 1-2000 characters without NUL bytes");
-      }
-      if (!store.getProject(request.projectId)) {
-        throw new LocalResearchRefusal("project-not-found", "The Project does not exist");
-      }
-      const session = store.getSession(request.sessionId);
-      if (!session || session.projectId !== request.projectId) {
-        throw new LocalResearchRefusal("session-not-found", "The Session does not exist in this Project");
-      }
-      store.assertSessionWritable(request.sessionId);
-      // Resolve the Session's effective model before anything is written, so an
-      // unsupported profile refuses the request instead of failing the launch.
-      // The credential-free selection is frozen in the operation record; the
-      // pilot receipt records the model the launch actually used.
-      let resolvedModel;
-      try {
-        resolvedModel = resolveResearchPilotModel(store, { projectId: request.projectId, sessionId: request.sessionId });
-      } catch (error) {
-        throw new LocalResearchRefusal(
-          "unsupported-model",
-          error instanceof ResearchPilotRefusal ? error.message : errorMessage(error),
-        );
-      }
-      if (request.planVersionId) assertLinkVersion(request.sessionId, request.projectId, request.planVersionId, "plan");
-      if (request.incumbentVersionId) {
-        assertLinkVersion(request.sessionId, request.projectId, request.incumbentVersionId, "incumbent");
-      }
-
-      const key = idempotencyKey({ ...request, intent });
-      const existing = operations().findByIdempotency(request.projectId, request.sessionId, key);
-      if (existing) {
-        return { attached: true, attachedReason: "same-request", operation: singleView(existing) };
-      }
-      // One conversation run owns at most one live experiment. A second start
-      // that names different intent while the first is live attaches instead of
-      // launching a second paid run; the user still has the one stop action.
-      const active = operations()
-        .listForSession(request.projectId, request.sessionId)
-        .find((candidate) => candidate.ownerRunId === request.ownerRunId && !isTerminalResearchState(candidate.state));
-      if (active) {
-        return { attached: true, attachedReason: "active-operation", operation: singleView(active) };
-      }
-      // A start that arrives after its conversation run was cancelled must not
-      // create an operation no cancel path owns any more.
-      if (await ownerStopped(request.sessionId, request.ownerRunId)) {
-        throw new LocalResearchRefusal(
-          "conversation-cancelled",
-          "The conversation run that would own this experiment was cancelled",
-        );
-      }
-      request.signal?.throwIfAborted();
-      // Resolve the task before the input binding: a task-dynamic profile must
-      // run the task the conversation named, never its old default package, and
-      // a named task this profile does not allow is refused before any read.
-      const selection = await resolveTaskSelection(request);
-      request.signal?.throwIfAborted();
-      const taskId = selection?.taskId ?? settings.task!;
-      // A catalog task's evaluator identity includes the checkout revision and
-      // the actual evaluator/package digests. An unknown identity is recorded
-      // as unknown and that group is shown but not ranked.
-      const [engineIdentity, executionEnvironment] = await Promise.all([
-        engineIdentityOf(settings.engineCheckout),
-        executionEnvironmentOf(settings.pythonExecutable),
-      ]);
-      const contract = researchContractIdentityFrom(selection?.binding, taskId, {
-        executionEnvironment,
-        revision: engineIdentity?.revision,
-        statusDigest: engineIdentity?.statusDigest,
-        worktreeDirty: engineIdentity?.dirty,
-      });
-      const groupId = contractGroupId(contract);
-      await captureAgentUsage(groupOperations(request.projectId, request.sessionId, groupId));
-      // A rebuilt service reconciles the line's stored children from the engine
-      // record before it decides on a new reservation. It never starts one.
-      const groupOps = await lifecycle.reconcile(
-        groupOperations(request.projectId, request.sessionId, groupId),
-      );
-      // An explicit `selected_for_next` is a decision, not a display. A start
-      // without an incumbent follows it; a different incumbent conflicts; a
-      // stale selection cannot be silently ignored.
-      let effectiveRequest = request;
-      let followedSelection: NonNullable<ScienceFlowLocalResearchOperation["followedSelection"]> | undefined;
-      const selectionRow = selections().get(request.projectId, request.sessionId, groupId);
-      if (selectionRow) {
-        const selectedGroup = deriveResearchResultGroups(groupOps, [selectionRow])
-          .find((candidate) => candidate.groupId === groupId);
-        const selectedView = selectedGroup?.selection;
-        if (selectedView?.valid === true) {
-          if (request.incumbentVersionId !== undefined
-            && request.incumbentVersionId !== selectionRow.versionId) {
-            throw new LocalResearchRefusal(
-              "selection-conflict",
-              `This research line explicitly selected result ${selectionRow.operationId} (version ${selectionRow.versionId}). `
-                + "Pass that version, or change the selection first; a different incumbent would silently ignore the decision.",
-            );
-          }
-          if (request.incumbentVersionId === undefined) {
-            effectiveRequest = { ...request, incumbentVersionId: selectionRow.versionId };
-          }
-          followedSelection = {
-            isBestValid: selectedView.isBestValid,
-            operationId: selectionRow.operationId,
-            reason: selectionRow.reason,
-            selectedAt: selectionRow.selectedAt,
-            versionId: selectionRow.versionId,
-          };
-        } else if (request.incumbentVersionId === undefined) {
-          throw new LocalResearchRefusal(
-            "selection-stale",
-            "The research line's explicit selection is no longer a valid result. "
-              + "Select a valid result or pass an explicit incumbent before starting.",
-          );
-        }
-      }
-      if (followedSelection !== undefined && settings.inputMode === "dynamic"
-        && settings.dynamicInputs?.incumbent === undefined) {
-        throw new LocalResearchRefusal(
-          "invalid-option",
-          "This research profile does not stage an incumbent, so the explicit selection cannot be followed",
-        );
-      }
-      // The early key was computed before the explicit selection was resolved.
-      // Re-check now, before any proposal novelty or continuation requirement:
-      // a replay of the same request after an automatic selection must attach
-      // to its existing operation instead of being refused as a repeated
-      // experiment.
-      const resolvedKey = idempotencyKey({ ...effectiveRequest, intent });
-      if (resolvedKey !== key) {
-        const resolvedExisting = operations().findByIdempotency(
-          request.projectId,
-          request.sessionId,
-          resolvedKey,
-        );
-        if (resolvedExisting) {
-          return { attached: true, attachedReason: "same-request", operation: singleView(resolvedExisting) };
-        }
-      }
-      // Freeze the fixed input bytes this run will actually use, and prove a
-      // named version is exactly that input before any record or launch exists.
-      const inputs = await resolveInputs(effectiveRequest);
-      assertContinuationCompatible(effectiveRequest, selection);
-
-      // Every continuation round must explain its evidence and make a concrete
-      // method change. First rounds stay compatible with the older entry; the
-      // production tool always supplies the structured proposal.
-      let proposal: ExperimentProposal | undefined;
-      const previousOperation = [...groupOps].reverse().find((operation) => operation.proposal !== undefined);
-      if (request.proposal !== undefined) {
-        try {
-          const parsed = parseExperimentProposal(request.proposal, {
-            maxSubBudgetSeconds: settings.defaults.totalAllowanceSec,
-            now: now(),
-          });
-          const resolvedEvidence: Array<ExperimentProposal["evidence"][number]> = [];
-          for (const entry of parsed.evidence) {
-            if (entry.kind === "artifact-version" && entry.versionId !== undefined) {
-              const version = store.getProjectArtifactVersion(request.projectId, entry.versionId);
-              const artifact = version ? store.getProjectArtifact(request.projectId, version.artifactId) : undefined;
-              const ownsArtifact = artifact !== undefined && artifact.deletedAt === undefined
-                && artifact.createdInSessionId === request.sessionId;
-              const ownsVersion = version !== undefined && version.sessionId === request.sessionId;
-              if (!version || !artifact || artifact.deletedAt || (!ownsArtifact && !ownsVersion)) {
-                throw new LocalResearchRefusal(
-                  "proposal-invalid",
-                  `Evidence artifact version ${entry.versionId} is not a live version of this Session`,
-                );
-              }
-              resolvedEvidence.push({ ...entry, sha256: version.content.hash });
-            } else if (entry.kind === "operation-result" && entry.operationId !== undefined) {
-              const evidenceOperation = operations().get(entry.operationId);
-              if (!evidenceOperation || evidenceOperation.identity.projectId !== request.projectId
-                || evidenceOperation.identity.sessionId !== request.sessionId) {
-                throw new LocalResearchRefusal(
-                  "proposal-invalid",
-                  `Evidence operation ${entry.operationId} is not a research operation of this Session`,
-                );
-              }
-              resolvedEvidence.push({ ...entry });
-            }
-          }
-          proposal = { ...parsed, evidence: resolvedEvidence };
-          assertExperimentProposalAdvances(
-            proposal,
-            previousOperation?.proposal === undefined
-              ? undefined
-              : {
-                  incumbentVersionId: previousOperation.incumbentVersionId ?? null,
-                  proposal: previousOperation.proposal,
-                },
-            effectiveRequest.incumbentVersionId ?? null,
-          );
-        } catch (error) {
-          if (error instanceof LocalResearchRefusal) throw error;
-          if (error instanceof ExperimentProposalRefusal) {
-            throw new LocalResearchRefusal(
-              error.reason === "proposal-not-new" ? "proposal-not-new" : "proposal-invalid",
-              error.message,
-            );
-          }
-          throw new LocalResearchRefusal("proposal-invalid", errorMessage(error));
-        }
-      } else if (settings.taskMode === "task-dynamic" && groupOps.length > 0) {
-        throw new LocalResearchRefusal(
-          "proposal-invalid",
-          "A continuation round needs a structured experiment proposal with its evidence, method change, expected observation, evaluation method, stop condition and sub-budget",
-        );
-      }
-
-      const childTotalAllowanceSec = proposal?.subBudgetSeconds ?? settings.defaults.totalAllowanceSec;
-      const childReportBudgetSec = Math.min(
-        settings.defaults.reportBudgetSec,
-        Math.max(10, childTotalAllowanceSec - 30),
-      );
-      const childResearchBudgetSec = Math.min(
-        settings.defaults.researchBudgetSec,
-        childTotalAllowanceSec - childReportBudgetSec,
-      );
-      if (childResearchBudgetSec < 30) {
-        throw new LocalResearchRefusal("invalid-option", "The proposed sub-budget cannot cover the engine's research minimum");
-      }
-      const projectedParent = projectResearchParent({
-        contract,
-        existing: parents().get(request.projectId, request.sessionId, groupId),
-        groupId,
-        identity: { projectId: request.projectId, sessionId: request.sessionId },
-        limits: settings.parentBudget,
-        now: now(),
-        operations: groupOps,
-      });
-      // The line is serial and, when configured, budgeted. This check runs
-      // before an operation row exists, so a refused start spends nothing.
-      const lineRefusal = researchLineRefusal({
-        allowanceSec: childTotalAllowanceSec,
-        now: now(),
-        operations: groupOps,
-        ownerRunId: request.ownerRunId,
-        parent: projectedParent,
-        agentUsage: groupOps.flatMap((operation) => operation.agentUsage === undefined ? [] : [operation.agentUsage]),
-        preparations: preparationsFor(request.projectId, request.sessionId),
-      });
-      if (lineRefusal) throw new LocalResearchRefusal(lineRefusal.reason, lineRefusal.message);
-      request.signal?.throwIfAborted();
-
-      const operationId = newOperationId();
-      const createdAt = now();
-      const workDir = join(settings.workRoot, "operations", operationId);
-      const planRole = inputs.find((input) => input.role === "plan");
-      const incumbentRole = inputs.find((input) => input.role === "incumbent");
-      // The researcher's instruction is composed from frozen facts: a selected
-      // package's own description or a prepared contract's objective, plus the
-      // plan and intent. A template problem refuses the start instead of
-      // launching a run with an unfilled instruction.
-      const baseTaskDescription = selection
-        ? composeTaskInstruction({
-            artifactKind: selection.binding.artifactKind,
-            artifactPath: selection.binding.artifactPath,
-            authoritative: selection.binding.authoritative,
-            ...(incumbentRole?.stagedName && incumbentRole.versionId
-              ? { incumbentFile: incumbentRole.stagedName, incumbentVersionId: incumbentRole.versionId }
-              : {}),
-            inputFiles: selection.binding.inputs.map((binding) => binding.logicalName),
-            intent,
-            lowerIsBetter: selection.binding.lowerIsBetter,
-            metricName: selection.binding.metricName,
-            objective: selection.objective,
-            operationId,
-            planFile: settings.dynamicInputs?.plan ?? "experiment_plan.md",
-            planVersionId: planRole?.versionId ?? effectiveRequest.planVersionId ?? "",
-            prepared: selection.prepared,
-            title: selection.binding.title,
-          })
-        : settings.inputMode === "dynamic"
-          ? composeDynamicTaskText(settings.taskTemplate ?? "", {
-              intent,
-              operationId,
-              roles: inputs.flatMap((input) =>
-                input.stagedName === undefined || input.versionId === null
-                  ? []
-                  : [{
-                      role: input.role,
-                      sha256: input.sha256,
-                      size: input.size,
-                      stagedName: input.stagedName,
-                      versionId: input.versionId,
-                    }]),
-            })
-          : settings.taskDescription;
-      const taskDescription = withRoundContext(baseTaskDescription, proposal, followedSelection);
-      const grant: ScienceFlowLocalResearchGrant = {
-        task: taskId,
-        researchBudgetSec: childResearchBudgetSec,
-        reportBudgetSec: childReportBudgetSec,
-        totalAllowanceSec: childTotalAllowanceSec,
-        maxSteps: settings.defaults.maxSteps,
-        stageCaptureMax: settings.defaults.stageCaptureMax,
-        bashTimeoutSec: settings.defaults.bashTimeoutSec,
-        codeMaxTokens: settings.defaults.codeMaxTokens,
-        feedbackMaxTokens: settings.defaults.feedbackMaxTokens,
-        httpTimeoutSec: settings.defaults.httpTimeoutSec,
-        refusePackageInstall: settings.refusePackageInstall,
-        taskDescriptionPinned: taskDescription !== undefined,
+      const outcome = await taskService.start(request);
+      return {
+        attached: outcome.attached,
+        operation: outcome.view,
+        ...(outcome.attachedReason === undefined ? {} : { attachedReason: outcome.attachedReason }),
       };
-      const record: ScienceFlowLocalResearchOperation = {
-        schemaVersion: SCIENCE_FLOW_LOCAL_RESEARCH_OPERATION_VERSION,
-        operationId,
-        idempotencyKey: resolvedKey,
-        identity: { projectId: request.projectId, sessionId: request.sessionId },
-        ownerRunId: request.ownerRunId,
-        intent,
-        ...(effectiveRequest.planVersionId ? { planVersionId: effectiveRequest.planVersionId } : {}),
-        ...(effectiveRequest.incumbentVersionId ? { incumbentVersionId: effectiveRequest.incumbentVersionId } : {}),
-        ...(inputs.length ? { inputs } : {}),
-        ...(selection ? { taskBinding: selection.binding } : {}),
-        ...(proposal === undefined ? {} : { proposal }),
-        ...(followedSelection === undefined ? {} : { followedSelection }),
-        createdAt,
-        updatedAt: createdAt,
-        state: "accepted",
-        engineRunId: `sd-research-${operationId.slice(0, 12)}`,
-        task: taskId,
-        workDir,
-        receiptPath: join(workDir, "receipt.json"),
-        deliveryRecordPath: join(workDir, "delivery.json"),
-        launch: {
-          profileId: settings.profileId,
-          engineCheckout: settings.engineCheckout,
-          pythonExecutable: settings.pythonExecutable,
-          readerScriptPath: settings.readerScriptPath,
-          seedDir: settings.seedDir,
-          privateRoot: join(settings.privateRoot, operationId),
-          model: {
-            profileName: resolvedModel.selection.profileName,
-            providerModel: resolvedModel.selection.providerModel,
-            selectionSource: resolvedModel.selection.selectionSource,
-          },
-          grant,
-          ...(settings.inputMode === "dynamic" ? { inputMode: "dynamic" as const } : {}),
-          ...(taskDescription === undefined ? {} : { taskDescription }),
-          ...(engineIdentity?.revision === undefined ? {} : { engineRevision: engineIdentity.revision }),
-          ...(engineIdentity?.dirty === undefined ? {} : { engineWorktreeDirty: engineIdentity.dirty }),
-          ...(engineIdentity?.statusDigest === undefined ? {} : { engineStatusDigest: engineIdentity.statusDigest }),
-          ...(executionEnvironment === undefined ? {} : { executionEnvironment }),
-        },
-        engine: {},
-        progress: { stages: [], usage: null },
-        delivery: { state: "pending", attempts: 0, updatedAt: createdAt },
-        stop: {},
-      };
-      const stored = operations().createIfAbsent(record);
-      if (!stored.created) {
-        return { attached: true, attachedReason: "same-request", operation: singleView(stored.record) };
-      }
-      // The accepted child is the line's one reservation until it reaches a
-      // terminal state. Persisting this projection is also the durable audit of
-      // what was reserved and for which contract group.
-      persistParent(
-        contract,
-        groupId,
-        record.identity,
-        groupOperations(request.projectId, request.sessionId, groupId),
-        {
-          kind: "start",
-          operationId,
-          ownerRunId: request.ownerRunId,
-          summary: `started ${operationId} with a ${settings.defaults.totalAllowanceSec}s reservation`,
-        },
-      );
-      // Return the operation identity now; the engine run continues in the
-      // background so one HTTP request or tool call is not held open for it.
-      void lifecycle.execute(operationId).catch(() => undefined);
-      return { attached: false, operation: singleView(stored.record) };
     },
 
-    async get(request, options = {}): Promise<ScienceFlowLocalResearchView> {
-      const record = resolveRecord(request);
-      // Observation, the unknown-without-a-record rule and terminal delivery
-      // reconciliation are the shared lifecycle; this service only projects.
-      const observed = await lifecycle.observe(record, options);
-      await captureAgentUsage([observed]);
-      return singleView(operations().get(observed.operationId) ?? observed);
+    async get(
+      request: LocalResearchOperationInput,
+      options: { readonly waitMs?: number; readonly signal?: AbortSignal } = {},
+    ): Promise<ScienceFlowLocalResearchView> {
+      const observed = await taskService.get(request, options);
+      return observed.view;
     },
 
-    async stop(request): Promise<LocalResearchStopOutcome> {
-      const record = resolveRecord(request);
-      const outcome = await lifecycle.stop(record);
-      await captureAgentUsage([outcome.record]);
-      const updated = operations().get(outcome.record.operationId) ?? outcome.record;
+    async stop(request: LocalResearchOperationInput): Promise<LocalResearchStopOutcome> {
+      const outcome = await taskService.stop(request);
       return {
         confirmed: outcome.confirmed,
-        operation: singleView(updated),
-        ...(outcome.reason === undefined ? {} : { reason: outcome.reason }),
+        operation: outcome.view,
         requested: outcome.requested,
+        ...(outcome.reason === undefined ? {} : { reason: outcome.reason }),
       };
     },
 
-    async retryDelivery(request): Promise<ScienceFlowLocalResearchView> {
-      const record = resolveRecord(request);
+    async retryDelivery(request: LocalResearchOperationInput): Promise<ScienceFlowLocalResearchView> {
       // Publication only: the experiment's identity and state are untouched.
       // A delivered result is republished idempotently (unchanged bytes reuse
       // their version) so a corrected note can reach the Session.
-      const updated = await lifecycle.retryDelivery(record);
-      await captureAgentUsage([updated]);
-      return singleView(operations().get(record.operationId) ?? updated);
+      const updated = await taskService.retryDelivery(request);
+      return updated.view;
     },
 
     async requestStopForConversationRun(sessionId: string, runId: string): Promise<void> {
-      const session = store.getSession(sessionId);
-      if (!session) return;
-      const owned = operations()
-        .listForSession(session.projectId, sessionId)
-        .filter((candidate) => candidate.ownerRunId === runId && !isTerminalResearchState(candidate.state));
-      await lifecycle.stopConversationRun(owned);
+      await taskService.cancelOwnerRun(sessionId, runId);
     },
 
     async publishPlan(request: LocalResearchPlanInput): Promise<ResearchPlanPublication> {
@@ -2078,8 +2054,7 @@ export function createLocalResearchService(input: {
     },
 
     latest(projectId: string, sessionId: string): ScienceFlowLocalResearchOperation | undefined {
-      const rows = operations().listForSession(projectId, sessionId);
-      return [...rows].reverse().find((candidate) => !isTerminalResearchState(candidate.state)) ?? rows.at(-1);
+      return taskService.latest(projectId, sessionId);
     },
 
     list(projectId: string, sessionId: string): readonly ScienceFlowLocalResearchView[] {
@@ -2330,6 +2305,13 @@ function withRoundContext(
     ].join("\n"));
   }
   return parts.length ? parts.join("\n\n") : undefined;
+}
+
+/** Map a shared input-binding refusal to this service's stable reason codes. */
+function inputRefusal(error: unknown): unknown {
+  if (!(error instanceof ResearchInputRefusal)) return error;
+  const reason: LocalResearchRefusalReason = error.reason;
+  return new LocalResearchRefusal(reason, error.message);
 }
 
 function errorMessage(error: unknown): string {

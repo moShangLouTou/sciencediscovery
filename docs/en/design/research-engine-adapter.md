@@ -1,165 +1,203 @@
-# Integrate a research engine with the task lifecycle
+# Integrate a research engine with the shared task service
 
 Use this guide when connecting an external research product to ScienceDiscovery
-(SD) and you need to track long-running work, stop it, and publish its results
-into a Session. The shared task lifecycle is an internal TypeScript integration
-point in the SD API service. Your engine may use HTTP MCP, another service API,
-or a local process; the adapter implements that communication.
+(SD). The shared task service accepts an authorized request, persists one
+operation, starts an engine, observes it, stops it, enforces a research-line
+budget and publishes its result into a Session. Your engine may use HTTP MCP,
+another service API, or a local process; the adapter implements that
+communication.
 
-The integration has three parts: a product entry point accepts a request and
-persists an operation, the shared lifecycle coordinates that operation, and an
-engine adapter performs the product-specific work. Implementing the adapter
-does not automatically register an Agent tool, expose an HTTP route, or install
-your product.
+The shared service is an internal TypeScript integration point in the SD API.
+Implementing an adapter does not install your product, register an Agent tool or
+expose an HTTP route; those remain your product's entry points, which delegate
+to this service.
 
-## Responsibilities
+## What is shared and what stays product-specific
 
 | Component | Responsibilities |
 | --- | --- |
-| Product entry point | Validate Project/Session access, execution permission, required inputs and user confirmations; freeze input versions and configuration; reserve any budget; persist and deduplicate accepted requests; expose tools or routes |
-| Shared lifecycle | Recheck conversation cancellation around preparation, coordinate launch and observation, distinguish stop requests from confirmed termination, reconcile existing runs, and coordinate result delivery and retry |
-| Engine adapter | Prepare inputs, launch or contact the engine, map its status, request and confirm cancellation, and publish its result with provenance |
-| Operation store | Persist operation identity, engine task handles, state and delivery records; provide current records to concurrent callbacks and after service restart |
+| Shared task service (`research/task-service.ts`) | Request admission (Project/Session ownership and write access), deduplication, one live operation per conversation run, the cancelled-conversation check, budget reservation and refusal, persistence, background execution, bounded observation, stop request versus confirmed termination, conversation cancellation, delivery retry, latest/list reads |
+| Shared operation repository (`research/task-repository.ts`) | SQLite table, identity columns, insert-if-absent deduplication, corruption checks, Session/Project deletion |
+| Shared operation lifecycle (`research/operation-lifecycle.ts`) | Preparation-window cancellation, launch/observe sequencing, the unknown-without-a-record rule, stop confirmation, one automatic publication, retry without relaunch |
+| Shared budget ledger (`research/budget.ts`) | Research-line deadline, child-run limit, wall-clock reservation and settlement, single active child, stop per conversation run, durable decision history |
+| Shared input binding (`research/input-binding.ts`) | Exact Session artifact versions, CAS byte verification, configured-input comparison |
+| Shared artifact publisher (`research/artifact-publisher.ts`) | CAS write, content-addressed version reuse, digest verification, linked-version resolution |
+| Product hooks (`ResearchTaskProduct`) | Permission/configuration gate, request validation and record construction, model or task resolution, frozen grant, engine capabilities and adapter, public view, line identity |
+| Engine adapter | Prepare inputs, launch/contact the engine, map its status, request and confirm cancellation, read and publish its result |
+| Product domain code | Metric direction, comparability, best/selected candidate, proof validity, task packages and evaluators, file layout and result prose |
 
-The shared implementation lives in
-[`engine-adapter.ts`](../../../services/api/src/research/engine-adapter.ts) and
-[`operation-lifecycle.ts`](../../../services/api/src/research/operation-lifecycle.ts).
-Those modules have no dependency on a particular research product. Scientific
-decisions, such as how to interpret a proof or compare experimental scores,
-belong to your integration.
+The shared modules under `services/api/src/research/` never import a product's
+code, configuration, model profile or data layout. A product that has no
+ScienceFlow code can use them directly; the repository keeps that boundary
+under test (`research/architecture.test.ts`).
+
+## Request admission and deduplication
+
+The shared service performs these steps in order, and a product cannot skip
+them by re-implementing `start`:
+
+1. Reject blank Project, Session or run ids.
+2. Prove the Project exists, the Session belongs to it, and the Session is
+   writable.
+3. Run the product's `authorize` hook (configuration/model or additional
+   permission policy).
+4. Look up the product's idempotency key. An existing operation is returned as
+   `attached: "same-request"` and nothing is launched.
+5. Attach to the conversation run's live operation when one exists
+   (`attached: "active-operation"`).
+6. Refuse a start whose owning conversation run was already cancelled.
+7. Ask the product to validate and freeze the request (`planStart`). A product
+   may resolve a late deduplication key here (for example after following an
+   automatic selection) by returning `attachTo`.
+8. Reserve the research-line budget; a refusal is thrown before any row exists.
+9. Persist the accepted operation and its reservation, then run the engine in
+   the background and return the SD operation id promptly.
+
+Execution permission remains a product entry concern: the production tool
+passes SD's governed privilege check before it calls the service, and the
+service still proves ownership and write access on every request.
 
 ## Define an operation record
 
-Extend `ResearchOperationRecord<Delivery>` with the durable engine handle,
-frozen input references and other metadata your adapter needs. Keep these
-identities separate:
+Extend `ResearchTaskRecord<Delivery>` with the durable engine handle, frozen
+input references, launch configuration and other metadata your adapter needs.
+The shared service reads only the neutral fields:
 
-- `operationId`: SD's identity for this accepted operation.
-- `identity.projectId` and `identity.sessionId`: the Project and Session that own it.
+- `operationId`: SD's identity for the accepted operation.
+- `identity.projectId` and `identity.sessionId`: the owning Project and Session.
 - `ownerRunId`: the conversation run whose cancellation owns the work.
-- Engine task handle: the engine's identity, stored in your record for later
-  observation and cancellation. Never rely only on an in-memory process object.
+- `engineId`: the registered engine identity.
+- `engineRunId`: the engine's durable task handle. Never rely only on an
+  in-memory process object.
+- `state`, `stop`, `delivery` and `engine.status`.
+- `idempotencyKey`, `createdAt`, `updatedAt` and an optional `error`.
 
-The operation's lifecycle state is `accepted`, `running`, `stopping`,
-`completed`, `failed`, `stopped`, or `unknown`. Map engine facts explicitly;
-`completed` alone says nothing about the scientific validity of the result.
-Keep result validation and any user confirmation as separate domain facts.
+The lifecycle state is `accepted`, `running`, `stopping`, `completed`, `failed`,
+`stopped`, or `unknown`. Map engine facts explicitly; `completed` says nothing
+about scientific validity. Keep result validation and any user confirmation as
+separate domain facts.
 
-Define your delivery payload by extending `ResearchDeliveryProgress`. The
-lifecycle uses `pending` to recognize results awaiting automatic publication
-and `delivered` to skip an ordinary repeat. Include artifact/version references
-and domain-specific outcomes in the payload; publication failure must remain
-distinct from execution failure.
+Persist the product record through `ResearchTaskRepository` with a codec. The
+codec validates the product's stored JSON and throws
+`ResearchOperationCorruptError` for a corrupt or unknown-version row; a row is
+never skipped or repaired silently. Reusing an existing table name keeps one
+ledger per task, so an older data directory upgrades in place and no second
+source of truth can disagree with the first. Deletion of a Session or Project
+removes its rows through the same repository.
 
-Implement `ResearchOperationWriter.get` and `mutate` over your store. `mutate`
-must apply changes to the latest stored record and persist them, including any
-update timestamp. Persist an engine handle before returning from launch so a
-rebuilt service can find the same task.
+## Implement the engine adapter and declare its capabilities
 
-## Implement the engine adapter
-
-Implement `ResearchEngineAdapter<Record, Delivery>` with the following methods.
-Methods receiving a writer must persist changes that subsequent lifecycle calls
-need, rather than only returning a modified in-memory record.
+Implement `ResearchEngineAdapter<Record, Delivery>`:
 
 | Method | Contract |
 | --- | --- |
-| `prepare(record, signal, writer)` | Stage the frozen inputs or perform engine preparation. Honor the abort signal. Return `proceed: false` after recording a preparation failure or other terminal outcome |
-| `beforeLaunch(record, writer)` | Perform the final synchronous checks. Return a refusal with a stable step and safe message if execution must not start |
-| `launch(record, writer)` | Launch once and persist the engine handle and state. Return the engine run ID, or `null` for a confirmed non-start with its outcome recorded |
-| `inspect(record)` | Read the engine status without persisting it; report whether a run was observed and whether it is terminal |
-| `observe(record, writer)` | Read and persist current facts, then return the updated record, terminal flag and mapped lifecycle state |
-| `requestStop(record)` | Ask the engine to stop this specific task; return any safe error information. This does not confirm termination |
-| `confirmStop(record)` | Wait for a bounded time for authoritative termination evidence; return `false` when it cannot be confirmed |
-| `deliver(record, { force })` | Publish existing results into the owning Session and return delivery progress. Never launch or rerun research |
+| `prepare(record, signal, writer)` | Stage frozen inputs or perform engine preparation. Honor the abort signal. Return `proceed: false` after recording a terminal outcome |
+| `beforeLaunch(record, writer)` | Final synchronous checks. Return a refusal with a stable step and safe message |
+| `launch(record, writer)` | Launch once and persist the engine handle and running state. Return the engine run id. Do not assume an engine status you have not read |
+| `inspect(record)` | Read engine status without persisting; report whether a run exists and is terminal |
+| `observe(record, writer)` | Read and persist current facts, then return the record, terminal flag and mapped state |
+| `requestStop(record)` | Ask the engine to stop this specific task; return safe error information |
+| `confirmStop(record)` | Wait a bounded time for authoritative termination evidence |
+| `deliver(record, { force })` | Publish existing results into the Session. Never launch or rerun research |
 
-Supply `transitions` for the record edits used by the lifecycle: stopped,
-conversation-cancelled, stopping, stop-requested, stop-result, failed, unknown,
-and delivery-failed. These edits preserve your record's additional fields.
-Keep adapter error messages safe for storage and display; exclude credentials
-and private connection details.
+Supply `transitions` for the record edits the lifecycle needs: stopped,
+conversation-cancelled, stopping, stop-requested, stop-result, failed, unknown
+and delivery-failed.
 
-For asynchronous engines, `launch` can return while the task is still running.
-Leave delivery `pending`. The lifecycle checks the latest persisted state and
-does not automatically deliver a running launch. A subsequent terminal
-observation can publish the result. The host must arrange those observations;
-there is no automatic background polling scheduler.
+Declare `capabilities` on the product: whether `launch` can return while the
+engine still runs, whether the engine confirms termination, whether it reports
+elapsed wall clock or token usage, and what `deliver` publishes. A declaration
+never creates a capability the adapter does not implement, and the shared
+service never claims a token hard cap it cannot enforce.
 
-## Connect the lifecycle to your entry point
+## Research-line budget
 
-Create one lifecycle instance per task-service instance, after constructing
-your adapter and operation store. The example below shows the dependencies to
-provide; `adapter`, `operations` and `ownerStopped` are your implementations.
+Pass the frozen product identity key (`lineKey`) that groups child runs. For a
+ScienceFlow-style experiment this is one scientific contract; for another
+product it can be any stable business key. The shared ledger enforces:
 
-```ts
-const lifecycle = createResearchOperationLifecycle({
-  engine: adapter,
-  operations,
-  ownerStopped,
-  now: () => new Date().toISOString(),
-  sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
-  observeMaxWaitMs: 30_000,
-  errorMessage: () => "The research engine operation failed",
-});
-```
+- one active child per line;
+- a stop recorded for one conversation run, so a later start in that
+  conversation cannot quietly reserve another child;
+- a deadline (`createdAt + totalAllowanceSec`) that a new child's whole
+  allowance must fit before it is reserved;
+- a configurable child-run limit;
+- reservations for active children and settlements for terminal ones.
 
-Import the constructor from
-`services/api/src/research/operation-lifecycle.ts` using the relative module
-path for your integration. `ownerStopped(sessionId, ownerRunId)` must read the
-owning conversation's cancellation/interruption status. Optional callbacks
-`onTerminal`, `onStopRequested` and `onStopConfirmed` let your service update
-budget or research-line bookkeeping; they do not enforce budgets themselves.
+A launched child whose elapsed time is unknown is charged its reservation,
+never zero; a preparation that never launched is charged its observed operation
+wall clock. A rebuilt service reconstructs the same answer from stored children,
+so a restart does not reset used budget. The ledger records a token status and
+never promises a total token cap. Charge product-attributable preparation time
+through `extraChargedSeconds`; it is counted in the same remaining allowance.
 
-Wire the entry points as follows:
+## Inputs and result publication
 
-1. On an authorized start, validate and freeze the request, deduplicate it,
-   persist the accepted operation, then dispatch `execute(operationId)` with
-   your host's background-task handling. Return the SD operation ID promptly.
-2. On a status request, authorize access to the stored operation and call
-   `observe(record, { waitMs, signal })`. Waiting is bounded by
-   `observeMaxWaitMs`; aborting this wait does not itself cancel engine work.
-3. On an explicit stop, call `stop(record)` and return its `requested` and
-   `confirmed` values separately.
-4. On conversation cancellation, select the operations owned by that
-   `ownerRunId` and call `stopConversationRun(records)`.
-5. After restart or before allocating more work, use `reconcile(records)` to
-   read and settle existing tasks. Do not resubmit them as new launches.
-6. For an authorized delivery retry, call `retryDelivery(record)`. Enforce any
-   readiness policy at your entry point; the explicit retry path invokes
-   publication directly and does not wait for the engine to finish.
+`resolveSessionArtifactVersion` proves that a named version is a live version of
+the authorized Session. `bindExactVersionInput` reads the CAS bytes, verifies
+the recorded digest and size, and optionally proves equality with the configured
+input the product will stage. Freeze the verified digest in your record so a
+later version, profile edit or rebuild cannot change what runs.
 
-## Preserve results and handle failures
+`publishArtifactVersion` writes bytes to the existing CAS and creates or reuses
+a Session artifact version. Identical bytes return the existing version, so a
+repeat or retry does not create a duplicate. An optional digest is verified
+before publication. `resolveLinkedArtifactVersion` links a fixed version (a
+plan, an incumbent, a proof input) without authoring or rewriting it. Bind
+outputs to the operation, frozen input versions and engine result identity with
+your own `originMeta` fields.
 
-`deliver` should bind output bytes to the engine task and frozen input
-versions, validate any provided digests, and publish immutable Session artifact
-versions. Use stable task/result identities or content-based reuse so repeating
-publication does not create duplicate versions. The lifecycle coordinates
-in-flight delivery in one process; artifact idempotency is your publisher's
-responsibility.
+A non-metric result — a proof, a report, a note — is published as its own
+artifact; it does not have to masquerade as a metric-bearing experimental
+candidate. Publication failure is distinct from execution failure, and a retry
+publishes only an existing result.
 
-Observation does not restart an engine. If an accepted/running operation has
-neither a live local worker nor an observed engine record/status, the lifecycle
-can mark it `unknown`. Treat a timeout or missing record as uncertainty, not as
-scientific failure or permission to resubmit a paid task. The adapter must
-persist current facts and consistently map unknown outcomes.
+## Wire the entry points
 
-Cancellation during preparation aborts its signal and is checked again before
-launch. Once engine work exists, cancellation depends on `requestStop` and
-`confirmStop`; an accepted stop request is insufficient evidence that processes
-or remote jobs have ended.
+The shared service exposes `start`, `get`, `stop`, `retryDelivery`,
+`cancelOwnerRun`, `latest` and `list` (list may be called by the product's own
+read path). Wire them as follows:
 
-## Integration limits and verification
+1. The product entry point performs its own governed execution-permission check,
+   then calls `start`. Do not rebuild request validation, deduplication or
+   cancellation in the entry point.
+2. `get` observes the engine. Waiting is bounded by `observeMaxWaitMs`; aborting
+   a wait does not cancel engine work.
+3. `stop` returns `requested` and `confirmed` separately. A recorded request is
+   not evidence that processes or remote jobs have ended.
+4. `cancelOwnerRun` stops the operations owned by one conversation run and
+   records the line's stop.
+5. After a restart, `get` or `latest` reads the same rows and observes the
+   existing engine task. It never resubmits a paid task.
+6. `retryDelivery` republishes an existing result. It never launches.
 
-The lifecycle provides no installation, credential distribution, model
-selection, sandbox, remote authentication, user-confirmation UI, or general
-budget enforcement. Implement the requirements your product needs at its entry
-point and execution boundary. The worker, preparation-abort and delivery locks
-are process-local; a deployment with multiple API processes needs additional
-coordination in its operation store or scheduler.
+## Integration limits
 
-Exercise your adapter through its real task-service wiring with a fake engine.
-Cover cancellation before and during preparation, launch failures, asynchronous
-completion, missing records after restart, unconfirmed stops, repeated status
-requests, and delivery failure/retry without another launch. The shared
+The shared service does not provide engine installation, credential
+distribution, model selection, a sandbox, remote authentication, a proof-signing
+system, or a general model proxy. Those stay with the product or its execution
+boundary. The worker, preparation-abort and delivery locks are process-local; a
+deployment with several API processes needs additional coordination in its
+scheduler or store. The session cancel path must call `cancelOwnerRun`; the
+service does not observe conversation state by itself unless the product
+supplies an `ownerStopped` reader.
+
+## Verify an integration
+
+Exercise the product through the real task service, real repository and real
+publication path with a fake engine. The fake engine needs no product
+configuration, model profile, Python checkout, seed or evaluator, and its result
+can be an ordinary file with a verified digest. Cover: submit, replay
+deduplication, one active child, running delivery stays pending, terminal
+delivery happens once, restart observes without relaunch, a missing engine
+record becomes `unknown`, cancellation, reservation and run-limit refusals, and
+delivery failure/retry reusing one version.
+
+The shared
+[`task-service tests`](../../../services/api/src/research/task-service.test.ts)
+and
 [`lifecycle tests`](../../../services/api/src/research/operation-lifecycle.test.ts)
-provide examples that do not require an engine installation.
+are runnable examples that require no engine installation. A product's own
+domain rules (task packages, evaluators, metric comparison, best candidate,
+proof semantics, file layout) belong in the product; see the ScienceFlow README
+for one product's retained rules and limits.

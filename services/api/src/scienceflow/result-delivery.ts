@@ -33,7 +33,6 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
-import { CasStore } from "@sciencediscovery/cas";
 import type {
   CasObjectRef,
   ScienceFlowPublicRunPhase,
@@ -48,6 +47,12 @@ import type {
 } from "@sciencediscovery/scienceflow-reader";
 
 import type { SessionStore } from "../store.js";
+import {
+  publishArtifactVersion,
+  resolveLinkedArtifactVersion,
+  ResearchPublicationRefusal,
+  type PublishedArtifact,
+} from "../research/artifact-publisher.js";
 import { projectScienceFlowRunSnapshot } from "./dto.js";
 import { createScienceFlowRegistrationService } from "./registration.js";
 import { readStageRows, type ResearchPilotStageRow } from "./research-pilot.js";
@@ -771,69 +776,47 @@ async function publishDeliveredArtifact(
     readonly title: string;
   },
 ): Promise<ScienceFlowDeliveredArtifact> {
-  const session = store.getSession(input.sessionId);
-  if (!session) throw new DeliveryRefusal("session-not-found", "The Session does not exist");
-  const digest = createHash("sha256").update(input.bytes).digest("hex");
-  if (input.digest !== undefined && digest !== input.digest) {
-    throw new DeliveryRefusal(
-      "candidate-sha-mismatch",
-      "The published content does not match the selected artifact digest",
-    );
-  }
-  const content: CasObjectRef = { hash: digest, size: input.bytes.length };
-
-  const existing = store.getArtifactByName(input.sessionId, input.logicalName);
-  if (existing) {
-    const versions = store.listProjectArtifactVersions(session.projectId, existing.id);
-    const match = versions.find((version) =>
-      version.content.hash === content.hash && version.content.size === content.size);
-    if (match) {
-      return {
-        artifactId: existing.id,
-        content: match.content,
-        kind: existing.kind,
-        logicalName: input.logicalName,
-        mediaType: match.mediaType,
-        status: "reused",
-        version: match.version,
-        versionId: match.id,
-      };
+  try {
+    const published: PublishedArtifact = await publishArtifactVersion(store, {
+      bytes: input.bytes,
+      description: input.description,
+      ...(input.digest === undefined ? {} : { digest: input.digest }),
+      ...(input.inputArtifactVersionIds === undefined
+        ? {}
+        : { inputArtifactVersionIds: [...input.inputArtifactVersionIds] }),
+      kind: input.kind,
+      logicalName: input.logicalName,
+      mediaType: input.mediaType,
+      originMeta: input.originMeta,
+      sessionId: input.sessionId,
+      title: input.title,
+    });
+    return published;
+  } catch (error) {
+    if (error instanceof ResearchPublicationRefusal) {
+      throw new DeliveryRefusal(publicationReason(error.reason), error.message);
     }
+    throw error;
   }
+}
 
-  const cas = new CasStore(store.dataDir);
-  const stored = await cas.put(input.bytes);
-  if (stored.hash !== content.hash || stored.size !== content.size) {
-    throw new DeliveryRefusal("publication-failed", "The content store did not retain the delivered bytes");
+/** Map a shared publication refusal to this delivery's stable reason codes. */
+function publicationReason(reason: ResearchPublicationRefusal["reason"]): ScienceFlowResultDeliveryFailureReason {
+  switch (reason) {
+    case "content-mismatch":
+      return "candidate-sha-mismatch";
+    case "version-not-found":
+      return "plan-version-not-found";
+    case "version-unreadable":
+      return "plan-unreadable";
+    case "invalid-option":
+      return "invalid-option";
+    case "session-not-found":
+      return "session-not-found";
+    case "publication-failed":
+    default:
+      return "publication-failed";
   }
-  const latest = existing
-    ? store.listProjectArtifactVersions(session.projectId, existing.id).at(-1)
-    : undefined;
-  const { artifact, version } = await store.createArtifactVersion({
-    ...(existing && latest ? { artifactId: existing.id, baseVersionId: latest.id } : {}),
-    content: stored,
-    description: input.description,
-    ...(input.inputArtifactVersionIds?.length
-      ? { inputArtifactVersionIds: [...input.inputArtifactVersionIds] }
-      : {}),
-    kind: input.kind,
-    logicalName: input.logicalName,
-    mediaType: input.mediaType,
-    origin: "server_generated",
-    originMeta: { ...input.originMeta },
-    sessionId: input.sessionId,
-    title: input.title,
-  });
-  return {
-    artifactId: artifact.id,
-    content: version.content,
-    kind: artifact.kind,
-    logicalName: input.logicalName,
-    mediaType: version.mediaType,
-    status: "created",
-    version: version.version,
-    versionId: version.id,
-  };
 }
 
 function deliveryOriginMeta(
@@ -852,9 +835,9 @@ function deliveryOriginMeta(
 
 /**
  * Resolve a fixed version the operator names (the plan or the incumbent) to
- * the Session's own artifact record. Delivery only links it: it never writes,
- * rewrites or interprets the linked content, and it refuses a version from
- * another Session or an unreadable one.
+ * the Session's own artifact record. The shared publisher only links it: it
+ * never writes, rewrites or interprets the linked content, and it refuses a
+ * version from another Session or an unreadable one.
  */
 async function resolveLinkedVersion(
   store: SessionStore,
@@ -862,35 +845,14 @@ async function resolveLinkedVersion(
   versionId: string,
   label: "plan" | "incumbent",
 ): Promise<ScienceFlowLinkedVersion> {
-  if (!isUsableId(versionId)) {
-    throw new DeliveryRefusal("invalid-option", `The ${label} version id is not a usable business id`);
-  }
-  const version = store.getProjectArtifactVersion(identity.projectId, versionId);
-  const artifact = version ? store.getProjectArtifact(identity.projectId, version.artifactId) : undefined;
-  if (!version || !artifact || artifact.deletedAt || artifact.createdInSessionId !== identity.sessionId) {
-    throw new DeliveryRefusal(
-      "plan-version-not-found",
-      `The ${label} version is not a live artifact version of this Session`,
-    );
-  }
-  let bytes: Buffer;
   try {
-    bytes = await new CasStore(store.dataDir).read(version.content.hash);
-  } catch {
-    throw new DeliveryRefusal("plan-unreadable", `The ${label} version's content could not be read`);
+    return await resolveLinkedArtifactVersion(store, identity, versionId, label);
+  } catch (error) {
+    if (error instanceof ResearchPublicationRefusal) {
+      throw new DeliveryRefusal(publicationReason(error.reason), error.message);
+    }
+    throw error;
   }
-  const digest = createHash("sha256").update(bytes).digest("hex");
-  if (bytes.length !== version.content.size || digest !== version.content.hash) {
-    throw new DeliveryRefusal("plan-unreadable", `The ${label} version's content does not match its recorded digest`);
-  }
-  return {
-    artifactId: artifact.id,
-    content: version.content,
-    logicalName: artifact.name,
-    title: artifact.title ?? null,
-    version: version.version,
-    versionId: version.id,
-  };
 }
 
 /**
