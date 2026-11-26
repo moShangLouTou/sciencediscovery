@@ -124,7 +124,15 @@ export interface ResearchEngineRefusal {
   readonly message: string;
 }
 
+/** A service-computed cap; adapters only apply engine-specific minimums and configuration. */
+export interface ResearchEngineLaunchBudget {
+  readonly allowanceSec: number;
+  readonly deadlineAt?: string;
+}
+
 export interface ResearchEngineBeforeLaunch<Record> {
+  /** Required when the service tightens a reservation; confirms the applied engine limit. */
+  readonly appliedAllowanceSec?: number;
   readonly record: Record;
   readonly refusal?: ResearchEngineRefusal;
 }
@@ -187,7 +195,11 @@ export interface ResearchEngineAdapter<
     writer: ResearchOperationWriter<Record>,
   ): Promise<ResearchEnginePreparation<Record>>;
   /** The final pre-launch check; a refusal is recorded as a failed operation. */
-  beforeLaunch(record: Record, writer: ResearchOperationWriter<Record>): ResearchEngineBeforeLaunch<Record>;
+  beforeLaunch(
+    record: Record,
+    writer: ResearchOperationWriter<Record>,
+    budget?: ResearchEngineLaunchBudget,
+  ): ResearchEngineBeforeLaunch<Record>;
   /** Start the engine run and observe it to its own terminal or allowance boundary. */
   launch(record: Record, writer: ResearchOperationWriter<Record>): Promise<ResearchEngineLaunch<Record>>;
   /** Read the engine's own record without persisting; used to decide whether a

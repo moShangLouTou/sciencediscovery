@@ -31,6 +31,7 @@ import {
   isTerminalResearchLifecycleState,
   type ResearchDeliveryProgress,
   type ResearchEngineAdapter,
+  type ResearchEngineBeforeLaunch,
   type ResearchOperationRecord,
   type ResearchOperationWriter,
   type ResearchStopRequester,
@@ -51,7 +52,9 @@ export interface ResearchOperationLifecycleOptions<
   readonly ownerStopped: (sessionId: string, runId: string) => Promise<boolean>;
   /** Upper bound for one bounded observation wait a tool may request. */
   readonly observeMaxWaitMs: number;
-  /** Called after an observation leaves the operation terminal. */
+  /** Service-owned budget gate, followed by engine-specific launch checks. */
+  readonly beforeLaunch?: (record: Record) => ResearchEngineBeforeLaunch<Record>;
+  /** Called when execution or observation leaves the operation terminal. */
   readonly onTerminal?: (record: Record) => void;
   /** Called when a stop request is recorded on the owning research line. */
   readonly onStopRequested?: (record: Record, at: string, requestedBy: ResearchStopRequester) => void;
@@ -112,7 +115,7 @@ export function createResearchOperationLifecycle<
     deliveryInFlight.add(operationId);
     try {
       const record = operations.get(operationId);
-      if (!record) return;
+      if (!record || !isTerminalResearchLifecycleState(record.state)) return;
       if (!force && record.delivery.state === "delivered") return;
       try {
         const delivery = await engine.deliver(record, { force });
@@ -160,7 +163,7 @@ export function createResearchOperationLifecycle<
       }
       // The last check before the launch: an asynchronous preparation may have
       // outlived the line's deadline even though the reservation fitted at start.
-      const verdict = engine.beforeLaunch(current, operations);
+      const verdict = options.beforeLaunch?.(current) ?? engine.beforeLaunch(current, operations);
       current = verdict.record;
       const refusal = verdict.refusal;
       if (refusal) {
@@ -186,6 +189,8 @@ export function createResearchOperationLifecycle<
     } finally {
       operationAborts.delete(operationId);
       activeWorkers.delete(operationId);
+      const latest = operations.get(operationId);
+      if (latest && isTerminalResearchLifecycleState(latest.state)) options.onTerminal?.(latest);
     }
   };
 

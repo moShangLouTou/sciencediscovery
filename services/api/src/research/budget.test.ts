@@ -29,6 +29,7 @@ import assert from "node:assert/strict";
 import {
   projectResearchBudgetLine,
   researchBudgetLineRefusal,
+  researchBudgetLaunchAllowance,
   researchBudgetLineView,
   withResearchBudgetDecision,
   type ResearchBudgetChild,
@@ -195,4 +196,26 @@ test("a rebuilt projection preserves reservations, settlements and decisions", (
   assert.ok(projected.decisions.some((decision) => decision.kind === "settle"));
   const view = researchBudgetLineView(projected, [completed], NOW);
   assert.equal(view.usage.wallClock.remainingSeconds, 570);
+});
+
+
+test("pre-launch allowance includes preparation charges without double-counting its own hold", () => {
+  const active = child({ state: "accepted", launched: false, reservedSec: 400 });
+  const line = project([active]);
+  const result = researchBudgetLaunchAllowance(line, [active], active.operationId, "owner", NOW,
+    { extraChargedSeconds: 350 });
+  assert.deepEqual(result, { allowanceSec: 250, deadlineAt: line.limits!.deadlineAt });
+});
+
+test("pre-launch refusal preserves other active reservations and the owner's stop", () => {
+  const active = child({ state: "accepted", launched: false });
+  const other = { ...active, operationId: "operation-2" };
+  const line = project([active, other]);
+  const busy = researchBudgetLaunchAllowance(line, [active, other], active.operationId, "owner", NOW);
+  assert.ok("reason" in busy);
+  assert.equal(busy.reason, "research-line-busy");
+  const stopped = researchBudgetLaunchAllowance({ ...project([active]),
+    stop: { ownerRunId: "owner", requestedAt: NOW } }, [active], active.operationId, "owner", NOW);
+  assert.ok("reason" in stopped);
+  assert.equal(stopped.reason, "research-line-stopped");
 });

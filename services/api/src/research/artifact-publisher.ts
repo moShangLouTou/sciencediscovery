@@ -129,7 +129,34 @@ export interface PublishArtifactInput {
  * instead of a duplicate, so repeated delivery and retries are idempotent and a
  * retry never creates the same output twice.
  */
+// One SessionStore owns the catalog. Coordinate all publisher callers on that
+// store, including separate task-service instances, before reading versions.
+const publicationQueues = new WeakMap<ResearchArtifactStore, Map<string, Promise<void>>>();
+
 export async function publishArtifactVersion(
+  store: ResearchArtifactStore,
+  input: PublishArtifactInput,
+): Promise<PublishedArtifact> {
+  let queues = publicationQueues.get(store);
+  if (!queues) {
+    queues = new Map();
+    publicationQueues.set(store, queues);
+  }
+  const key = JSON.stringify([input.sessionId, input.logicalName]);
+  const previous = queues.get(key);
+  let release: () => void = () => undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  queues.set(key, held);
+  await previous;
+  try {
+    return await publishArtifactVersionLocked(store, input);
+  } finally {
+    release();
+    if (queues.get(key) === held) queues.delete(key);
+  }
+}
+
+async function publishArtifactVersionLocked(
   store: ResearchArtifactStore,
   input: PublishArtifactInput,
 ): Promise<PublishedArtifact> {

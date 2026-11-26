@@ -78,6 +78,7 @@ interface FakeDelivery extends ResearchDeliveryProgress {
 
 interface FakeRecord extends ResearchTaskRecord<FakeDelivery> {
   readonly intent: string;
+  readonly launchAllowanceSec?: number;
   readonly engineId?: string;
   readonly engine: { readonly status?: string; readonly elapsedSec?: number };
 }
@@ -104,6 +105,14 @@ interface EngineRun {
   elapsedSec?: number;
 }
 
+interface ServiceTestOptions {
+  readonly hideEngineRecords?: boolean;
+  readonly now?: () => string;
+  readonly planBarrier?: () => Promise<void>;
+  readonly prepare?: ResearchEngineAdapter<FakeRecord, FakeDelivery>["prepare"];
+  readonly ignoreBudget?: boolean;
+}
+
 interface Fixture {
   readonly root: string;
   readonly store: SessionStore;
@@ -115,7 +124,7 @@ interface Fixture {
   readonly counters: { launches: number; deliverCalls: number; failDelivery: boolean; engineRecordsVisible: boolean };
   readonly service: ResearchTaskService<FakeRequest, FakeRecord, FakeView>;
   readonly budget: { maxChildRuns: number; totalAllowanceSec: number } | undefined;
-  readonly newService: (options?: { readonly hideEngineRecords?: boolean }) => ResearchTaskService<FakeRequest, FakeRecord, FakeView>;
+  readonly newService: (options?: ServiceTestOptions) => ResearchTaskService<FakeRequest, FakeRecord, FakeView>;
 }
 
 interface FakeRequest {
@@ -168,8 +177,12 @@ async function fixture(
   const engineRuns = new Map<string, EngineRun>();
   const counters = { deliverCalls: 0, engineRecordsVisible: true, failDelivery: false, launches: 0 };
 
-  const createService = (options: { readonly hideEngineRecords?: boolean } = {}): ResearchTaskService<FakeRequest, FakeRecord, FakeView> => {
-    const engine = fakeEngine(store, engineRuns, counters, () => options.hideEngineRecords ?? false);
+  const createService = (options: ServiceTestOptions = {}): ResearchTaskService<FakeRequest, FakeRecord, FakeView> => {
+    const baseEngine = fakeEngine(store, engineRuns, counters, () => options.hideEngineRecords ?? false);
+    const engine = { ...baseEngine,
+      ...(options.prepare ? { prepare: options.prepare } : {}),
+      ...(options.ignoreBudget ? { beforeLaunch: (record: FakeRecord) => ({ record }) } : {}),
+    };
     const product: ResearchTaskProduct<FakeRequest, FakeDelivery, FakeRecord, FakeView> = {
       authorize: () => undefined,
       afterObserve: () => undefined,
@@ -201,6 +214,7 @@ async function fixture(
         const children = contextValue.operations
           .listForSession(request.projectId, request.sessionId)
           .map((row) => childFacts(row));
+        await options.planBarrier?.();
         const record: FakeRecord = {
           createdAt,
           delivery: { attempts: 0, state: "pending", updatedAt: createdAt },
@@ -241,6 +255,7 @@ async function fixture(
       errorMessage: (error) => (error instanceof Error ? error.message : String(error)).slice(0, 200),
       lines,
       observeMaxWaitMs: 100,
+      ...(options.now ? { now: options.now } : {}),
       operations: repository,
       product,
       store,
@@ -491,8 +506,10 @@ function fakeEngine(
       return {};
     },
     transitions: transitions(now),
-    beforeLaunch(record) {
-      return { record };
+    beforeLaunch(record, writer, budget) {
+      if (!budget) return { record };
+      return { appliedAllowanceSec: budget.allowanceSec,
+        record: writer.mutate(record.operationId, (current) => ({ ...current, launchAllowanceSec: budget.allowanceSec })) };
     },
   };
 }
@@ -732,4 +749,114 @@ test("durable records reject a corrupted row instead of skipping or repairing it
     () => fx.repository.get(started.record.operationId),
     (error: unknown) => error instanceof ResearchOperationCorruptError,
   );
+});
+
+
+function deferred() {
+  let resolve: () => void = () => undefined;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+function twoPlans() {
+  const gate = deferred();
+  let count = 0;
+  return async () => { if (++count === 2) gate.resolve(); await gate.promise; };
+}
+
+test("concurrent different requests from one owner attach after asynchronous planning", async (context) => {
+  const fx = await fixture(context, { maxChildRuns: 1, totalAllowanceSec: 300 });
+  const service = fx.newService({ planBarrier: twoPlans() });
+  const results = await Promise.all([
+    service.start(request(fx, "owner", "first")), service.start(request(fx, "owner", "second")),
+  ]);
+  await waitFor(() => fx.counters.launches === 1);
+  assert.equal(results[0]!.record.operationId, results[1]!.record.operationId);
+  assert.equal(results.filter((result) => result.attached).length, 1);
+  assert.equal(fx.repository.listForSession(fx.projectId, fx.sessionId).length, 1);
+  assert.equal(fx.lines.get(fx.projectId, fx.sessionId, LINE_KEY)!.reservations.length, 1);
+});
+
+test("concurrent owners reserve one child across service instances", async (context) => {
+  const fx = await fixture(context, { maxChildRuns: 1, totalAllowanceSec: 300 });
+  const options = { planBarrier: twoPlans() };
+  const results = await Promise.allSettled([
+    fx.newService(options).start(request(fx, "owner-1", "first")),
+    fx.newService(options).start(request(fx, "owner-2", "second")),
+  ]);
+  await waitFor(() => fx.counters.launches === 1);
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+  const rejected = results.find((result) => result.status === "rejected");
+  assert.ok(rejected?.status === "rejected" && rejected.reason instanceof FakeRefusal);
+  assert.equal(rejected.reason.reason, "research-line-busy");
+  assert.equal(fx.repository.listForSession(fx.projectId, fx.sessionId).length, 1);
+  assert.equal(fx.lines.get(fx.projectId, fx.sessionId, LINE_KEY)!.reservations.length, 1);
+});
+
+test("concurrent identical requests attach to the same durable operation", async (context) => {
+  const fx = await fixture(context);
+  const service = fx.newService({ planBarrier: twoPlans() });
+  const input = request(fx, "owner", "same request");
+  const results = await Promise.all([service.start(input), service.start(input)]);
+  assert.equal(results[0]!.record.operationId, results[1]!.record.operationId);
+  assert.equal(results.find((result) => result.attached)!.attachedReason, "same-request");
+  await waitFor(() => fx.counters.launches === 1);
+});
+
+test("delivery retry while running stays pending until terminal observation", async (context) => {
+  const fx = await fixture(context);
+  const started = await fx.service.start(request(fx, "owner", "still running"));
+  await waitFor(() => fx.counters.launches === 1);
+  const input = { projectId: fx.projectId, sessionId: fx.sessionId, operationId: started.record.operationId };
+  const retry = await fx.service.retryDelivery(input);
+  assert.equal(retry.record.state, "running");
+  assert.equal(retry.record.delivery.state, "pending");
+  assert.equal(fx.counters.deliverCalls, 0);
+  fx.engineRuns.get(`fake-run-${started.record.operationId}`)!.status = "completed";
+  await settle(fx, fx.service, started.record.operationId);
+  assert.equal(fx.counters.deliverCalls, 1);
+});
+
+for (const mode of ["expired", "tightened", "unsupported"] as const) {
+  test(`preparation budget is ${mode} by the shared service`, async (context) => {
+    const fx = await fixture(context, { maxChildRuns: 2, totalAllowanceSec: 120 });
+    let now = "2026-01-01T00:00:00.000Z";
+    const entered = deferred();
+    const release = deferred();
+    const service = fx.newService({ now: () => now, ignoreBudget: mode === "unsupported",
+      prepare: async (record) => { entered.resolve(); await release.promise; return { record, proceed: true }; },
+    });
+    const started = await service.start(request(fx, "owner", mode, 90));
+    await entered.promise;
+    now = mode === "expired" ? "2026-01-01T00:02:01.000Z" : "2026-01-01T00:01:00.000Z";
+    release.resolve();
+    await waitFor(() => fx.counters.launches > 0 || fx.repository.get(started.record.operationId)!.state === "failed");
+    const record = fx.repository.get(started.record.operationId)!;
+    const line = fx.lines.get(fx.projectId, fx.sessionId, LINE_KEY)!;
+    if (mode === "tightened") {
+      assert.equal(fx.counters.launches, 1);
+      assert.equal(record.launchAllowanceSec, 60);
+      assert.equal(line.reservations[0]!.reservedSec, 60);
+    } else {
+      assert.equal(fx.counters.launches, 0);
+      assert.equal(record.error?.step, "budget");
+      assert.equal(line.reservations.length, 0);
+      assert.equal(line.settlements.length, 1);
+    }
+  });
+}
+
+test("parallel publishers reuse one version and a failed write releases the queue", async (context) => {
+  const fx = await fixture(context);
+  const input = { bytes: Buffer.from("verified fact"), description: "result", kind: "other" as const,
+    logicalName: "parallel.txt", mediaType: "text/plain", sessionId: fx.sessionId, title: "result" };
+  const failed = publishArtifactVersion(fx.store, { ...input, digest: "wrong" });
+  const results = await Promise.all([failed.catch(() => undefined),
+    ...Array.from({ length: 8 }, () => publishArtifactVersion(fx.store, input))]);
+  const published = results.slice(1).filter((result) => result !== undefined);
+  assert.equal(published.length, 8);
+  assert.equal(new Set(published.map((result) => result.versionId)).size, 1);
+  assert.deepEqual(published.map((result) => result.version), Array(8).fill(1));
+  const artifact = fx.store.getArtifactByName(fx.sessionId, input.logicalName)!;
+  assert.equal(fx.store.listProjectArtifactVersions(fx.projectId, artifact.id).length, 1);
 });
