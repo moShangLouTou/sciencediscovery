@@ -43,6 +43,19 @@ The conversation research mode uses the shared task service described in
 the [research engine integration guide](../../../../docs/en/design/research-engine-adapter.md).
 The ScienceFlow-specific wiring is described below.
 
+Runtime-check and prepared-input persistence use the shared
+`research/generation-repository.ts` for durable generation allocation,
+conditional latest-result writes, and deletion-safe transactions. This layer
+retains only the SF payload codecs, redaction rules, and legacy table/column
+bindings. Existing rows and public DTOs require no migration.
+
+Runner identity checks use `runtime-probe.ts` for environment leases,
+exclusion, sandbox execution, termination evidence and retained fences. The
+SF module supplies the fixed Python program, static-before-runtime phase order,
+package/source checks and public result mapping. Source binding immediately
+before research also uses the same shared phase runner inside the workload's
+existing lease; its unverified boundary follows the workload's mutation gate.
+
 ### Shared execution boundary after extraction
 
 Runner is a shared execution platform. Its workload registry, signed research

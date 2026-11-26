@@ -18,3 +18,14 @@ test("SF experiment domain modules have no process, persistence or engine-transp
     assert.doesNotMatch(source, /from\s+["'](?:node:(?:fs|child_process|sqlite)|[^"']*(?:research-pilot|result-delivery|engine-adapter|local-research\.js|store\.js))["']/u, file);
   }
 });
+
+test("SF observation codecs and identity checks delegate persistence and probe execution", async () => {
+  for (const file of ["runtime-check-repository.ts", "prepared-inputs-repository.ts"]) {
+    const source = await readFile(new URL(`./${file}`, import.meta.url), "utf8");
+    assert.match(source, /from "\.\.\/research\/generation-repository\.js"/);
+    assert.doesNotMatch(source, /BEGIN IMMEDIATE|CREATE TABLE|ON CONFLICT|database\.prepare/);
+  }
+  const source = await readFile(new URL("../../../runner/src/scienceflow-runtime-check.ts", import.meta.url), "utf8");
+  assert.match(source, /from "\.\/runtime-probe\.js"/);
+  assert.doesNotMatch(source, /runSandboxed|captureExecutionBoundaryOutcome|boundaryTerminationVerified|mkdtemp|reserveRuntimeCheck\(/);
+});

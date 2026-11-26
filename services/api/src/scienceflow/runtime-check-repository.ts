@@ -30,6 +30,7 @@
  * throws rather than being skipped, repaired, or erased.
  */
 import type { DatabaseSync } from "node:sqlite";
+import { ResearchGenerationRepository, type ResearchGenerationIdentity } from "../research/generation-repository.js";
 
 import {
   SCIENCE_FLOW_RUNTIME_CHECK_DTO_VERSION,
@@ -45,22 +46,6 @@ import {
   runtimeCheckChecksDto,
   SCIENCE_FLOW_RUNTIME_CHECK_UNKNOWNS,
 } from "./runtime-check-dto.js";
-
-interface RuntimeCheckRow {
-  plan_id: string;
-  project_id: string;
-  session_id: string;
-  generation: number;
-  checked_at: string;
-  record_json: string;
-}
-
-interface GenerationRow {
-  plan_id: string;
-  project_id: string;
-  session_id: string;
-  allocated: number;
-}
 
 /** A new check taken at `generation`, already reduced to public evidence. */
 export interface ScienceFlowRuntimeCheckDraft {
@@ -112,244 +97,36 @@ export interface ScienceFlowRuntimeCheckStore {
   deleteProject(projectId: string): void;
 }
 
-export class ScienceFlowRuntimeCheckRepository
-  implements ScienceFlowRuntimeCheckStore
-{
+export class ScienceFlowRuntimeCheckRepository implements ScienceFlowRuntimeCheckStore {
+  private readonly observations: ResearchGenerationRepository<ScienceFlowRuntimeCheckDto>;
   constructor(readonly database: DatabaseSync) {
-    database.exec(`
-      CREATE TABLE IF NOT EXISTS science_flow_runtime_checks (
-        plan_id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        generation INTEGER NOT NULL,
-        checked_at TEXT NOT NULL,
-        record_json TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS science_flow_runtime_checks_session
-        ON science_flow_runtime_checks(session_id);
-      CREATE INDEX IF NOT EXISTS science_flow_runtime_checks_project
-        ON science_flow_runtime_checks(project_id);
-      CREATE TABLE IF NOT EXISTS science_flow_runtime_check_generations (
-        plan_id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        allocated INTEGER NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS science_flow_runtime_check_generations_session
-        ON science_flow_runtime_check_generations(session_id);
-      CREATE INDEX IF NOT EXISTS science_flow_runtime_check_generations_project
-        ON science_flow_runtime_check_generations(project_id);
-    `);
+    this.observations = new ResearchGenerationRepository(database, {
+      table: "science_flow_runtime_checks", generationsTable: "science_flow_runtime_check_generations",
+      keyColumn: "plan_id", timeColumn: "checked_at",
+      encode: reduceCheck, decode: decodeCheck, corrupt: () => new ScienceFlowRuntimeCheckCorruptError(),
+    });
   }
-
-  latest(
-    projectId: string,
-    sessionId: string,
-    planId: string,
-  ): ScienceFlowStoredRuntimeCheck | undefined {
-    const row = this.select(projectId, sessionId, planId);
-    return row ? parseRow(row) : undefined;
+  latest(projectId: string, sessionId: string, planId: string): ScienceFlowStoredRuntimeCheck | undefined {
+    const snapshot = this.observations.latest(projectId, sessionId, planId);
+    return snapshot ? Object.freeze({ check: snapshot.record, generation: snapshot.generation }) : undefined;
   }
-
-  /**
-   * Reserve a generation inside one write transaction.
-   *
-   * The counter is seeded by both the last allocation and the last stored row,
-   * so a row written before this table existed (or a table restored from a
-   * backup) cannot hand out a generation that is not strictly newer. Allocation
-   * happens before the await, so overlapping requests cannot read the same
-   * "latest" and both claim the next integer.
-   */
   allocate(projectId: string, sessionId: string, planId: string): number {
-    if (
-      !isIdentityText(projectId) ||
-      !isIdentityText(sessionId) ||
-      !isIdentityText(planId)
-    ) {
+    return this.observations.allocate(projectId, sessionId, planId);
+  }
+  save(draft: ScienceFlowRuntimeCheckDraft): { readonly saved: boolean; readonly stored?: ScienceFlowStoredRuntimeCheck } {
+    if (draft.check.schemaVersion !== SCIENCE_FLOW_RUNTIME_CHECK_DTO_VERSION || draft.generation !== draft.check.generation) {
       throw new ScienceFlowRuntimeCheckCorruptError();
     }
-    this.database.exec("BEGIN IMMEDIATE");
-    try {
-      const allocation = this.database
-        .prepare(
-          `SELECT plan_id, project_id, session_id, allocated
-             FROM science_flow_runtime_check_generations
-            WHERE plan_id = ?`,
-        )
-        .get(planId) as GenerationRow | undefined;
-      let allocated = 0;
-      if (allocation !== undefined) {
-        // A generation row that names a different owner is corruption, not a
-        // counter to trust.
-        if (
-          allocation.plan_id !== planId ||
-          allocation.project_id !== projectId ||
-          allocation.session_id !== sessionId ||
-          typeof allocation.allocated !== "number" ||
-          !Number.isSafeInteger(allocation.allocated) ||
-          allocation.allocated < 0
-        ) {
-          throw new ScienceFlowRuntimeCheckCorruptError();
-        }
-        allocated = allocation.allocated;
-      }
-      const storedRow = this.select(projectId, sessionId, planId);
-      const storedGeneration = storedRow ? parseRow(storedRow).generation : 0;
-      const generation = Math.max(allocated, storedGeneration) + 1;
-      if (!Number.isSafeInteger(generation)) {
-        throw new ScienceFlowRuntimeCheckCorruptError();
-      }
-      this.database
-        .prepare(
-          `INSERT INTO science_flow_runtime_check_generations
-             (plan_id, project_id, session_id, allocated)
-           VALUES (?, ?, ?, ?)
-           ON CONFLICT(plan_id) DO UPDATE SET
-             project_id = excluded.project_id,
-             session_id = excluded.session_id,
-             allocated = excluded.allocated`,
-        )
-        .run(planId, projectId, sessionId, generation);
-      this.database.exec("COMMIT");
-      return generation;
-    } catch (error) {
-      try {
-        this.database.exec("ROLLBACK");
-      } catch {
-        /* preserve the original error */
-      }
-      throw error;
-    }
+    const result = this.observations.save({
+      key: draft.check.planId, projectId: draft.projectId, sessionId: draft.sessionId,
+      generation: draft.generation, recordedAt: draft.check.checkedAt, record: draft.check,
+    });
+    return { saved: result.saved, ...(result.stored ? { stored: Object.freeze({
+      check: result.stored.record, generation: result.stored.generation,
+    }) } : {}) };
   }
-
-  save(draft: ScienceFlowRuntimeCheckDraft): {
-    readonly saved: boolean;
-    readonly stored?: ScienceFlowStoredRuntimeCheck;
-  } {
-    if (
-      draft.check.planId.trim().length === 0 ||
-      draft.check.schemaVersion !== SCIENCE_FLOW_RUNTIME_CHECK_DTO_VERSION ||
-      draft.generation !== draft.check.generation ||
-      !Number.isSafeInteger(draft.generation) ||
-      draft.generation < 1
-    ) {
-      throw new ScienceFlowRuntimeCheckCorruptError();
-    }
-    // Share a write lock with deletion from validation through the returned
-    // snapshot. Another API connection cannot remove the allocation after the
-    // check and before this insert, or resurrect a row after deletion commits.
-    this.database.exec("BEGIN IMMEDIATE");
-    try {
-      // Only a generation this plan actually issued may be written. Once the
-      // Session/Project delete removed the allocations, a check that was still in
-      // flight cannot insert a row back into an empty table.
-      const allocation = this.database
-        .prepare(
-          `SELECT plan_id, project_id, session_id, allocated
-             FROM science_flow_runtime_check_generations
-            WHERE plan_id = ?`,
-        )
-        .get(draft.check.planId) as GenerationRow | undefined;
-      if (
-        allocation === undefined ||
-        allocation.plan_id !== draft.check.planId ||
-        allocation.project_id !== draft.projectId ||
-        allocation.session_id !== draft.sessionId ||
-        typeof allocation.allocated !== "number" ||
-        !Number.isSafeInteger(allocation.allocated) ||
-        draft.generation > allocation.allocated
-      ) {
-        this.database.exec("COMMIT");
-        return { saved: false };
-      }
-      const record = JSON.stringify(reduceCheck(draft.check));
-      const result = this.database
-        .prepare(
-          `INSERT INTO science_flow_runtime_checks
-             (plan_id, project_id, session_id, generation, checked_at, record_json)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(plan_id) DO UPDATE SET
-             generation = excluded.generation,
-             checked_at = excluded.checked_at,
-             record_json = excluded.record_json
-           WHERE excluded.generation > science_flow_runtime_checks.generation
-             AND science_flow_runtime_checks.project_id = excluded.project_id
-             AND science_flow_runtime_checks.session_id = excluded.session_id`,
-        )
-        .run(
-          draft.check.planId,
-          draft.projectId,
-          draft.sessionId,
-          draft.generation,
-          draft.check.checkedAt,
-          record,
-        );
-      const saved = Number(result.changes) === 1;
-      const row = this.select(draft.projectId, draft.sessionId, draft.check.planId);
-      // Read the winning generation under the same lock. Deletion cannot
-      // change the returned snapshot between the upsert and this read.
-      const outcome = row ? { saved, stored: parseRow(row) } : { saved };
-      this.database.exec("COMMIT");
-      return outcome;
-    } catch (error) {
-      try { this.database.exec("ROLLBACK"); } catch { /* Preserve the original failure. */ }
-      throw error;
-    }
-  }
-
-  deleteSession(sessionId: string): void {
-    this.database.exec("BEGIN IMMEDIATE");
-    try {
-      this.database
-        .prepare("DELETE FROM science_flow_runtime_checks WHERE session_id = ?")
-        .run(sessionId);
-      this.database
-        .prepare("DELETE FROM science_flow_runtime_check_generations WHERE session_id = ?")
-        .run(sessionId);
-      this.database.exec("COMMIT");
-    } catch (error) {
-      try {
-        this.database.exec("ROLLBACK");
-      } catch {
-        /* preserve the original error */
-      }
-      throw error;
-    }
-  }
-
-  deleteProject(projectId: string): void {
-    this.database.exec("BEGIN IMMEDIATE");
-    try {
-      this.database
-        .prepare("DELETE FROM science_flow_runtime_checks WHERE project_id = ?")
-        .run(projectId);
-      this.database
-        .prepare("DELETE FROM science_flow_runtime_check_generations WHERE project_id = ?")
-        .run(projectId);
-      this.database.exec("COMMIT");
-    } catch (error) {
-      try {
-        this.database.exec("ROLLBACK");
-      } catch {
-        /* preserve the original error */
-      }
-      throw error;
-    }
-  }
-
-  private select(
-    projectId: string,
-    sessionId: string,
-    planId: string,
-  ): RuntimeCheckRow | undefined {
-    return this.database
-      .prepare(
-        `SELECT plan_id, project_id, session_id, generation, checked_at, record_json
-           FROM science_flow_runtime_checks
-          WHERE plan_id = ? AND project_id = ? AND session_id = ?`,
-      )
-      .get(planId, projectId, sessionId) as RuntimeCheckRow | undefined;
-  }
+  deleteSession(sessionId: string): void { this.observations.deleteSession(sessionId); }
+  deleteProject(projectId: string): void { this.observations.deleteProject(projectId); }
 }
 
 /** The read answer: the latest stored check, or none performed yet. */
@@ -392,23 +169,13 @@ function reduceCheck(check: ScienceFlowRuntimeCheckDto): StoredRuntimeCheck {
   };
 }
 
-function parseRow(row: RuntimeCheckRow): ScienceFlowStoredRuntimeCheck {
-  if (
-    typeof row.plan_id !== "string" ||
-    row.plan_id.trim().length === 0 ||
-    typeof row.generation !== "number" ||
-    !Number.isSafeInteger(row.generation) ||
-    row.generation < 1
-  ) {
-    throw new ScienceFlowRuntimeCheckCorruptError();
-  }
-  const value = parseJson(row.record_json);
+function decodeCheck(value: unknown, identity: ResearchGenerationIdentity): ScienceFlowRuntimeCheckDto {
   if (!isRecord(value)) throw new ScienceFlowRuntimeCheckCorruptError();
   const checkedAt = value.checkedAt;
   if (
     typeof checkedAt !== "string" ||
     checkedAt.trim().length === 0 ||
-    checkedAt !== row.checked_at
+    checkedAt !== identity.recordedAt
   ) {
     throw new ScienceFlowRuntimeCheckCorruptError();
   }
@@ -450,7 +217,7 @@ function parseRow(row: RuntimeCheckRow): ScienceFlowStoredRuntimeCheck {
   }
   const check: ScienceFlowRuntimeCheckDto = Object.freeze({
     schemaVersion: SCIENCE_FLOW_RUNTIME_CHECK_DTO_VERSION,
-    planId: row.plan_id,
+    planId: identity.key,
     contractDigest,
     bindingDigest,
     runnerId,
@@ -463,17 +230,9 @@ function parseRow(row: RuntimeCheckRow): ScienceFlowStoredRuntimeCheck {
     sourceRevision,
     checks: runtimeCheckChecksDto(checks),
     unknowns: SCIENCE_FLOW_RUNTIME_CHECK_UNKNOWNS,
-    generation: row.generation,
+    generation: identity.generation,
   });
-  return Object.freeze({ check, generation: row.generation });
-}
-
-function parseJson(text: string): unknown {
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new ScienceFlowRuntimeCheckCorruptError();
-  }
+  return check;
 }
 
 function isDigest(value: unknown): value is string {

@@ -40,9 +40,8 @@
  * - every answer is a fixed check code and status. Host paths, `sys.path`
  *   entries, Git output, and probe stderr never leave this module.
  */
-import { mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { resolve } from "node:path";
-import { randomUUID } from "node:crypto";
 
 import type {
   ScienceFlowPlanCheckStatus,
@@ -61,26 +60,10 @@ import {
   type EngineRevisionCheckResult,
 } from "@sciencediscovery/scienceflow-reader";
 
-import type { EnvironmentStore, EnvironmentRuntime } from "./environment-store.js";
-import {
-  boundaryTerminationVerified,
-  captureExecutionBoundaryOutcome,
-  type BoundaryCaptureOutcome,
-  type ExecutionBoundaryHandle,
-} from "./execution-boundary.js";
-import {
-  environmentPrefixBindArguments,
-  executorSandboxKind,
-  hostInterpreterMaskArguments,
-  prepareSandboxLaunch,
-  ProcessTerminationUnverifiedError,
-  resolveHostRuntimeSupport,
-  runSandboxed,
-  sandboxCommandPath,
-  workspaceBindArguments,
-  type ExecutorConfig,
-  type SandboxLaunch,
-} from "./executor.js";
+import type { EnvironmentRuntime } from "./environment-store.js";
+import type { ExecutorConfig } from "./executor.js";
+import type { ExecutionBoundaryHandle } from "./execution-boundary.js";
+import { createRuntimeProbeService, runRuntimeProbe, type RuntimeProbeContext, type RuntimeProbeEnvironmentStore } from "./runtime-probe.js";
 import type {
   ScienceFlowRuntimeBinding,
   ScienceFlowRuntimeBindings,
@@ -184,11 +167,7 @@ export interface ScienceFlowRuntimeCheckDeps {
    * reservation methods are optional so a test double can still lease without
    * a ledger; without them only this process's in-memory fence applies.
    */
-  readonly environmentStore: Pick<EnvironmentStore, "withRuntime">
-    & Partial<Pick<
-      EnvironmentStore,
-      "releaseRuntimeCheckReservation" | "reserveRuntimeCheck" | "runtimeCheckBoundary"
-    >>;
+  readonly environmentStore: RuntimeProbeEnvironmentStore;
   readonly bindings?: ScienceFlowRuntimeBindings;
   /** Test seam: a synthetic `/proc` root for boundary observations. */
   readonly procRoot?: string;
@@ -203,58 +182,11 @@ export interface ScienceFlowRuntimeCheckService {
 export function createScienceFlowRuntimeCheckService(
   deps: ScienceFlowRuntimeCheckDeps,
 ): ScienceFlowRuntimeCheckService {
-  const { config, environmentStore, bindings } = deps;
-  // Keep both identities exclusive for the entire lease wait and both phases.
-  // Different bindings may name the same environment; allowing them to run
-  // together would let their single-environment reservation overwrite an owner.
-  const inFlight = new Set<string>();
-  const inFlightEnvironments = new Set<string>();
-  // A store without durable reservations keeps the handle here; with the real
-  // store this is only a mirror used before the store is consulted.
-  const unverified = new Map<string, ExecutionBoundaryHandle | "unproven">();
-
+  const { bindings } = deps;
   const diagnose = (reason: string, detail?: Record<string, unknown>) => {
     deps.onDiagnostic?.("scienceflow_runtime_check_unavailable", { reason, ...detail });
   };
-
-  /**
-   * Clear a reservation only with proof that its boundary is empty. Anything
-   * else — unproven, corrupt, a row this store cannot clear — stays fenced.
-   */
-  const clearProvenReservation = (environmentId: string): "clear" | "fenced" | "corrupt" => {
-    const local = unverified.get(environmentId);
-    if (local !== undefined) {
-      if (local === "unproven" || !boundaryTerminationVerified(local, deps.procRoot)) return "fenced";
-      unverified.delete(environmentId);
-    }
-    const read = environmentStore.runtimeCheckBoundary?.bind(environmentStore);
-    if (!read) return "clear";
-    const boundary = read(environmentId);
-    if (boundary === undefined) return "clear";
-    if (boundary === "corrupt") return "corrupt";
-    if (boundary === "unproven" || !boundaryTerminationVerified(boundary, deps.procRoot)) return "fenced";
-    try {
-      environmentStore.releaseRuntimeCheckReservation?.(environmentId);
-    } catch {
-      diagnose("fence-release-failed");
-      return "fenced";
-    }
-    return read(environmentId) === undefined ? "clear" : "fenced";
-  };
-
-  /** Keep the environment fenced after an unproven termination. */
-  const fenceEnvironment = (environmentId: string, handle: ExecutionBoundaryHandle | "unproven") => {
-    unverified.set(environmentId, handle);
-    if (!environmentStore.reserveRuntimeCheck) return;
-    try {
-      environmentStore.reserveRuntimeCheck(environmentId, handle);
-    } catch {
-      // The store installs its in-process fence before the durable write, so
-      // this process still refuses environment changes; only a Runner restart
-      // loses the record. Say so instead of implying a durable fence exists.
-      diagnose("fence-persist-failed");
-    }
-  };
+  const probes = createRuntimeProbeService({ ...deps, onDiagnostic: diagnose });
 
   return {
     hasBinding: (bindingId) => bindings?.bindingFor(bindingId) !== undefined,
@@ -273,312 +205,157 @@ export function createScienceFlowRuntimeCheckService(
           sourceKind: "unsupported",
         });
       }
-      if (executorSandboxKind(config) !== "bubblewrap") {
-        diagnose("sandbox-unsupported");
-        return unavailableResult(request);
-      }
-      if (inFlight.has(binding.bindingId) || inFlightEnvironments.has(request.environmentId)) {
-        diagnose("concurrent-check");
-        return unavailableResult(request);
-      }
-      const reservation = clearProvenReservation(request.environmentId);
-      if (reservation !== "clear") {
-        diagnose(reservation === "corrupt" ? "reservation-corrupt" : "termination-unverified");
-        return unavailableResult(request);
-      }
-
-      inFlight.add(binding.bindingId);
-      inFlightEnvironments.add(request.environmentId);
-      try {
-        return await environmentStore.withRuntime(request.environmentId, async (leased) => {
-          // A reservation can appear while this reader waits behind an update.
-          // Recheck before using the leased prefix or launching either phase.
-          const afterLease = clearProvenReservation(request.environmentId);
-          if (afterLease !== "clear") {
-            diagnose(afterLease === "corrupt" ? "reservation-corrupt" : "termination-unverified");
-            return unavailableResult(request);
-          }
-          if (
-            leased.revision.id !== request.expectedEnvironmentRevisionId ||
-            leased.revision.language !== "python"
-          ) {
-            return result(request, {
-              environmentRevisionId: null,
-              outcome: "blocked",
-              overrides: { environment_revision: "failed" },
-              revision: null,
-              sourceKind: "unsupported",
-            });
-          }
-
-          // Phase A: no site processing. If it shows any executable startup
-          // configuration, the answer is refused here, before a normal start
-          // could run that configuration.
-          const staticProbe = await runProbe({
-            binding,
-            config,
-            environment: leased,
-            mode: "static",
-            procRoot: deps.procRoot,
+      const outcome = await probes.withEnvironment({ scopeKey: binding.bindingId, environmentId: request.environmentId }, async (probe) => {
+        const leased = probe.environment;
+        if (
+          leased.revision.id !== request.expectedEnvironmentRevisionId ||
+          leased.revision.language !== "python"
+        ) {
+          return result(request, {
+            environmentRevisionId: null,
+            outcome: "blocked",
+            overrides: { environment_revision: "failed" },
+            revision: null,
+            sourceKind: "unsupported",
           });
-          if (staticProbe.status === "termination-unverified") {
-            fenceEnvironment(request.environmentId, staticProbe.handle);
-            diagnose("termination-unverified");
-            return unavailableResult(request);
-          }
-          if (staticProbe.status === "unavailable") {
-            diagnose(staticProbe.reason);
-            return unavailableResult(request);
-          }
-          if (staticProbe.facts.mode !== "static") {
-            diagnose("protocol-error", { phase: "static" });
-            return unavailableResult(request);
-          }
-          const facts = staticProbe.facts;
+        }
 
-          const assessment = assessStaticProbeFacts({
-            environmentPrefix: leased.prefixPath,
-            facts,
-            languageVersion: leased.revision.languageVersion,
-            sourceRoot: binding.sourceRoot,
-          });
-          if (!assessment.ready) {
-            return result(request, {
-              environmentRevisionId: leased.revision.id,
-              outcome: "blocked",
-              overrides: {
-                binding_identity: "passed",
-                environment_revision: "passed",
-                ...assessment.overrides,
-              },
-              revision: null,
-              sourceKind: assessment.sourceKind,
-            });
-          }
+        // Phase A: no site processing. If it shows any executable startup
+        // configuration, the answer is refused here, before a normal start
+        // could run that configuration.
+        const staticProbe = await runProbe({
+          binding,
+          probe,
+          mode: "static",
+        });
+        if (staticProbe.status === "termination-unverified") {
+          diagnose("termination-unverified");
+          return unavailableResult(request);
+        }
+        if (staticProbe.status === "unavailable") {
+          diagnose(staticProbe.reason);
+          return unavailableResult(request);
+        }
+        if (staticProbe.facts.mode !== "static") {
+          diagnose("protocol-error", { phase: "static" });
+          return unavailableResult(request);
+        }
+        const facts = staticProbe.facts;
 
-          // The checkout revision is checked on this host only after the static
-          // answer proved the origin is exactly the trusted checkout. A wheel or
-          // a second copy has no Git history to confirm and is never guessed.
-          const revisionCheck = await checkEngineRevision({
-            expectedRevision: binding.expectedRevision,
-            path: binding.sourceRoot,
-            timeoutMs: DEFAULT_REVISION_TIMEOUT_MS,
-          });
-          const revisionOverrides = revisionStatusOverrides(revisionCheck);
-          const revisionSettled = revisionOverrides.source_revision === "passed"
-            && revisionOverrides.source_cleanliness === "passed";
-          if (!revisionSettled) {
-            return result(request, {
-              environmentRevisionId: leased.revision.id,
-              outcome: "blocked",
-              overrides: {
-                binding_identity: "passed",
-                environment_revision: "passed",
-                ...assessment.overrides,
-                ...revisionOverrides,
-              },
-              revision: revisionCheck.revision,
-              sourceKind: assessment.sourceKind,
-            });
-          }
-
-          // Phase B: the static answer was clean, so a normal start cannot run
-          // an import line or sitecustomize. It confirms the reconstruction.
-          const runtimeProbe = await runProbe({
-            binding,
-            config,
-            environment: leased,
-            mode: "runtime",
-            procRoot: deps.procRoot,
-          });
-          if (runtimeProbe.status === "termination-unverified") {
-            fenceEnvironment(request.environmentId, runtimeProbe.handle);
-            diagnose("termination-unverified");
-            return unavailableResult(request);
-          }
-          if (runtimeProbe.status === "unavailable") {
-            diagnose(runtimeProbe.reason);
-            return unavailableResult(request);
-          }
-          if (runtimeProbe.facts.mode !== "runtime") {
-            diagnose("protocol-error", { phase: "runtime" });
-            return unavailableResult(request);
-          }
-
-          const classified = classifyProbeFacts({
-            environmentPrefix: leased.prefixPath,
-            facts,
-            languageVersion: leased.revision.languageVersion,
-            revisionCheck,
-            runtime: runtimeProbe.facts,
-            sourceRoot: binding.sourceRoot,
-          });
+        const assessment = assessStaticProbeFacts({
+          environmentPrefix: leased.prefixPath,
+          facts,
+          languageVersion: leased.revision.languageVersion,
+          sourceRoot: binding.sourceRoot,
+        });
+        if (!assessment.ready) {
           return result(request, {
             environmentRevisionId: leased.revision.id,
-            outcome: classified.outcome,
+            outcome: "blocked",
             overrides: {
-              // Both bindings were compared before the probe started and the
-              // lease matched the configured revision; the result states that
-              // rather than leaving the codes unaccounted for.
               binding_identity: "passed",
               environment_revision: "passed",
-              ...classified.overrides,
+              ...assessment.overrides,
             },
-            revision: classified.revision,
-            sourceKind: classified.sourceKind,
+            revision: null,
+            sourceKind: assessment.sourceKind,
           });
+        }
+
+        // The checkout revision is checked on this host only after the static
+        // answer proved the origin is exactly the trusted checkout. A wheel or
+        // a second copy has no Git history to confirm and is never guessed.
+        const revisionCheck = await checkEngineRevision({
+          expectedRevision: binding.expectedRevision,
+          path: binding.sourceRoot,
+          timeoutMs: DEFAULT_REVISION_TIMEOUT_MS,
         });
-      } catch (error) {
-        if (error instanceof ScienceFlowRuntimeBindingUnknownError) throw error;
-        diagnose("scientific-env-unavailable");
-        return unavailableResult(request);
-      } finally {
-        inFlight.delete(binding.bindingId);
-        inFlightEnvironments.delete(request.environmentId);
-      }
+        const revisionOverrides = revisionStatusOverrides(revisionCheck);
+        const revisionSettled = revisionOverrides.source_revision === "passed"
+          && revisionOverrides.source_cleanliness === "passed";
+        if (!revisionSettled) {
+          return result(request, {
+            environmentRevisionId: leased.revision.id,
+            outcome: "blocked",
+            overrides: {
+              binding_identity: "passed",
+              environment_revision: "passed",
+              ...assessment.overrides,
+              ...revisionOverrides,
+            },
+            revision: revisionCheck.revision,
+            sourceKind: assessment.sourceKind,
+          });
+        }
+
+        // Phase B: the static answer was clean, so a normal start cannot run
+        // an import line or sitecustomize. It confirms the reconstruction.
+        const runtimeProbe = await runProbe({
+          binding,
+          probe,
+          mode: "runtime",
+        });
+        if (runtimeProbe.status === "termination-unverified") {
+          diagnose("termination-unverified");
+          return unavailableResult(request);
+        }
+        if (runtimeProbe.status === "unavailable") {
+          diagnose(runtimeProbe.reason);
+          return unavailableResult(request);
+        }
+        if (runtimeProbe.facts.mode !== "runtime") {
+          diagnose("protocol-error", { phase: "runtime" });
+          return unavailableResult(request);
+        }
+
+        const classified = classifyProbeFacts({
+          environmentPrefix: leased.prefixPath,
+          facts,
+          languageVersion: leased.revision.languageVersion,
+          revisionCheck,
+          runtime: runtimeProbe.facts,
+          sourceRoot: binding.sourceRoot,
+        });
+        return result(request, {
+          environmentRevisionId: leased.revision.id,
+          outcome: classified.outcome,
+          overrides: {
+            // Both bindings were compared before the probe started and the
+            // lease matched the configured revision; the result states that
+            // rather than leaving the codes unaccounted for.
+            binding_identity: "passed",
+            environment_revision: "passed",
+            ...classified.overrides,
+          },
+          revision: classified.revision,
+          sourceKind: classified.sourceKind,
+        });
+      });
+      return outcome.status === "result" ? outcome.value : unavailableResult(request);
     },
   };
 }
 
-/** Run one probe phase through the ordinary supervised sandbox path. */
+/** Supply the fixed SF program and interpret its protocol; execution is shared. */
 async function runProbe(options: {
   binding: ScienceFlowRuntimeBinding;
-  config: ExecutorConfig;
-  environment: EnvironmentRuntime;
+  probe: Pick<RuntimeProbeContext, "run">;
   mode: ProbeMode;
-  procRoot?: string;
 }): Promise<ProbeRunOutcome> {
-  const { binding, config, environment, mode } = options;
-  const runRoot = resolve(config.dataDir, "runtime-checks");
-  await mkdir(runRoot, { mode: 0o700, recursive: true });
-  // The only writable path of the run. It holds no project data and is removed
-  // once the sandbox is proven gone.
-  const workspace = await mkdtemp(resolve(runRoot, "probe-"));
-  let capture: BoundaryCaptureOutcome | undefined;
-  let started = false;
-
-  let launch: SandboxLaunch;
-  try {
-    const workspaceBinds = workspaceBindArguments(workspace, undefined);
-    launch = await prepareSandboxLaunch(config, {
-      chdir: workspaceBinds.chdir,
-      environmentBinds: environmentPrefixBindArguments(environment.prefixPath),
-      environmentPaths: [environment.prefixPath],
-      hostInterpreterMasks: await hostInterpreterMaskArguments(),
-      hostRuntimeSupport: await resolveHostRuntimeSupport(config.dataDir),
-      language: "python",
-      pathEnv: "/opt/science-env/bin:/usr/bin",
-      // Exactly one extra read-only bind: the trusted checkout, at its own host
-      // path, so `sys.path` resolution inside the sandbox is the same one a
-      // future execution would get. Internal option; never a request field.
-      readOnlyHostBinds: [binding.sourceRoot],
-      workspaceBindArgs: workspaceBinds.args,
-      workspaceRoot: workspace,
-    });
-  } catch {
-    await rm(workspace, { force: true, recursive: true }).catch(() => undefined);
-    return { reason: "launch-failed", status: "unavailable" };
-  }
-
-  // `-S` disables site processing and `.pth` execution; `-B` disables bytecode
-  // writing from startup, not from the first line of the program. The static
-  // phase must never run either, so its refusal cannot be post hoc.
-  const interpreterFlags = mode === "static" ? ["-I", "-S", "-B"] : ["-I", "-B"];
-  const commandArguments = [
-    sandboxCommandPath(launch, "/opt/science-env/bin/python", environment.interpreterPath),
-    ...interpreterFlags,
-    "-",
-  ];
-  try {
-    const run = await runSandboxed(
-      config,
-      launch,
-      commandArguments,
-      `${SCIENCE_FLOW_RUNTIME_PROBE_SOURCE}\n`,
-      SCIENCE_FLOW_RUNTIME_PROBE_TIMEOUT_MS,
-      workspace,
-      undefined,
-      "ScienceFlow runtime check",
-      0,
-      SCIENCE_FLOW_RUNTIME_PROBE_MAX_OUTPUT_BYTES,
-      "baseline",
-      undefined,
-      // Captured synchronously inside the spawn turn: the only moment the pid
-      // provably still names the sandbox this check created.
-      (child, sandbox) => {
-        started = true;
-        capture = captureExecutionBoundaryOutcome(
-          `scienceflow-runtime-check:${randomUUID()}`,
-          {
-            kind: sandbox === "bubblewrap" ? "pid-namespace" : "process",
-            pid: child.pid ?? 0,
-            sandbox,
-          },
-          options.procRoot,
-        );
-      },
-    );
-
-    // A probe that ran had a process; a missing proof of termination still
-    // ends the check as unavailable rather than claiming a supervised run.
-    const termination = await settled(capture, options.procRoot, started);
-    if (termination !== null) return termination;
-    if (run.exitCode !== 0) return { reason: "probe-failed", status: "unavailable" };
-    const parsed = mode === "static"
-      ? parseScienceFlowRuntimeProbeAnswer(run.stdout, "static")
-      : parseScienceFlowRuntimeProbeAnswer(run.stdout, "runtime");
-    return parsed.status === "ok"
-      ? { facts: parsed.facts, status: "facts" }
-      : { reason: parsed.status === "failed" ? "probe-failed" : "protocol-error", status: "unavailable" };
-  } catch (error) {
-    if (error instanceof ProcessTerminationUnverifiedError) {
-      return { handle: capture?.status === "captured" ? capture.handle : "unproven", status: "termination-unverified" };
-    }
-    // A timeout or abort is still a supervised kill; whether it was proven is
-    // exactly what the captured boundary answers.
-    const termination = await settled(capture, options.procRoot, started);
-    if (termination !== null) return termination;
-    const timedOut = error instanceof Error && /timed out|aborted/iu.test(error.message);
-    return { reason: timedOut ? "probe-timeout" : "probe-failed", status: "unavailable" };
-  } finally {
-    // Only remove the workspace when the monitor is known to have joined; a
-    // failed termination keeps the directory so nothing deletes a live writer's
-    // files underneath it.
-    const terminationProven = capture !== undefined
-      && (capture.status === "ended"
-        || (capture.status === "captured" && boundaryTerminationVerified(capture.handle, options.procRoot)));
-    if (terminationProven) {
-      await rm(workspace, { force: true, recursive: true }).catch(() => undefined);
-    }
-  }
-}
-
-/**
- * Decide whether the sandbox that ran one probe phase provably ended.
- *
- * Returns null when it did; otherwise a result that stands in for the probe's
- * facts, with the handle kept for a later observation. A run that never started
- * a process has nothing to fence and returns null.
- */
-async function settled(
-  capture: BoundaryCaptureOutcome | undefined,
-  procRoot: string | undefined,
-  started: boolean,
-): Promise<ProbeRunOutcome | null> {
-  if (capture === undefined) {
-    return started
-      ? { handle: "unproven", status: "termination-unverified" }
-      : { reason: "launch-failed", status: "unavailable" };
-  }
-  if (capture.status === "ended") return null;
-  if (capture.status === "captured") {
-    return boundaryTerminationVerified(capture.handle, procRoot)
-      ? null
-      : { handle: capture.handle, status: "termination-unverified" };
-  }
-  // `not-applicable` cannot happen for a bubblewrap launch, and `unavailable`
-  // means the kernel never named the boundary: neither is a proof.
-  return { handle: "unproven", status: "termination-unverified" };
+  const run = await options.probe.run({
+    program: SCIENCE_FLOW_RUNTIME_PROBE_SOURCE,
+    interpreterFlags: options.mode === "static" ? ["-I", "-S", "-B"] : ["-I", "-B"],
+    readOnlyHostBinds: [options.binding.sourceRoot],
+    timeoutMs: SCIENCE_FLOW_RUNTIME_PROBE_TIMEOUT_MS,
+    maxOutputBytes: SCIENCE_FLOW_RUNTIME_PROBE_MAX_OUTPUT_BYTES,
+  });
+  if (run.status !== "output") return run;
+  const parsed = options.mode === "static"
+    ? parseScienceFlowRuntimeProbeAnswer(run.stdout, "static")
+    : parseScienceFlowRuntimeProbeAnswer(run.stdout, "runtime");
+  return parsed.status === "ok"
+    ? { facts: parsed.facts, status: "facts" }
+    : { reason: parsed.status === "failed" ? "probe-failed" : "protocol-error", status: "unavailable" };
 }
 
 export interface StaticProbeAssessment {
@@ -927,10 +704,8 @@ export async function verifyScienceFlowSourceBinding(options: {
   }
   const probe = await runProbe({
     binding,
-    config,
-    environment,
+    probe: { run: program => runRuntimeProbe({ ...program, config, environment, procRoot: options.procRoot }) },
     mode: "static",
-    procRoot: options.procRoot,
   });
   if (probe.status === "termination-unverified") {
     return { boundary: probe.handle, reason: "termination-unverified", status: "unavailable" };

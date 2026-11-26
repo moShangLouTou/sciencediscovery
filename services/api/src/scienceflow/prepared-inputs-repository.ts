@@ -36,6 +36,7 @@
  */
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
+import { ResearchGenerationRepository, type ResearchGenerationIdentity } from "../research/generation-repository.js";
 
 import {
   canonicalScienceFlowInputBundleManifest,
@@ -51,25 +52,9 @@ import {
   type ScienceFlowPreparedInputsStateDto,
 } from "@sciencediscovery/schema";
 
-interface PreparedInputRow {
-  plan_id: string;
-  project_id: string;
-  session_id: string;
-  generation: number;
-  prepared_at: string;
-  record_json: string;
-}
-
 const ROLE_INDEX = new Map(
   SCIENCE_FLOW_INPUT_FILE_ROLES.map((role, index) => [role, index] as const),
 );
-
-interface GenerationRow {
-  plan_id: string;
-  project_id: string;
-  session_id: string;
-  allocated: number;
-}
 
 /** A new receipt taken at `generation`, already reduced to public evidence. */
 export interface ScienceFlowPreparedInputsDraft {
@@ -121,254 +106,36 @@ export interface ScienceFlowPreparedInputsStore {
   deleteProject(projectId: string): void;
 }
 
-export class ScienceFlowPreparedInputsRepository
-  implements ScienceFlowPreparedInputsStore
-{
+export class ScienceFlowPreparedInputsRepository implements ScienceFlowPreparedInputsStore {
+  private readonly observations: ResearchGenerationRepository<ScienceFlowPreparedInputsDto>;
   constructor(readonly database: DatabaseSync) {
-    database.exec(`
-      CREATE TABLE IF NOT EXISTS science_flow_prepared_inputs (
-        plan_id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        generation INTEGER NOT NULL,
-        prepared_at TEXT NOT NULL,
-        record_json TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS science_flow_prepared_inputs_session
-        ON science_flow_prepared_inputs(session_id);
-      CREATE INDEX IF NOT EXISTS science_flow_prepared_inputs_project
-        ON science_flow_prepared_inputs(project_id);
-      CREATE TABLE IF NOT EXISTS science_flow_prepared_input_generations (
-        plan_id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        allocated INTEGER NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS science_flow_prepared_input_generations_session
-        ON science_flow_prepared_input_generations(session_id);
-      CREATE INDEX IF NOT EXISTS science_flow_prepared_input_generations_project
-        ON science_flow_prepared_input_generations(project_id);
-    `);
+    this.observations = new ResearchGenerationRepository(database, {
+      table: "science_flow_prepared_inputs", generationsTable: "science_flow_prepared_input_generations",
+      keyColumn: "plan_id", timeColumn: "prepared_at",
+      encode: reducePrepared, decode: decodePrepared, corrupt: () => new ScienceFlowPreparedInputsCorruptError(),
+    });
   }
-
-  latest(
-    projectId: string,
-    sessionId: string,
-    planId: string,
-  ): ScienceFlowStoredPreparedInputs | undefined {
-    const row = this.select(projectId, sessionId, planId);
-    return row ? parseRow(row) : undefined;
+  latest(projectId: string, sessionId: string, planId: string): ScienceFlowStoredPreparedInputs | undefined {
+    const snapshot = this.observations.latest(projectId, sessionId, planId);
+    return snapshot ? Object.freeze({ prepared: snapshot.record, generation: snapshot.generation }) : undefined;
   }
-
-  /**
-   * Reserve a generation inside one write transaction. The counter is seeded
-   * by both the last allocation and the last stored row, so a backed-up table
-   * cannot hand out a generation that is not strictly newer.
-   */
   allocate(projectId: string, sessionId: string, planId: string): number {
-    if (
-      !isIdentityText(projectId) ||
-      !isIdentityText(sessionId) ||
-      !isIdentityText(planId)
-    ) {
+    return this.observations.allocate(projectId, sessionId, planId);
+  }
+  save(draft: ScienceFlowPreparedInputsDraft): { readonly saved: boolean; readonly stored?: ScienceFlowStoredPreparedInputs } {
+    if (draft.prepared.schemaVersion !== SCIENCE_FLOW_PREPARED_INPUTS_DTO_VERSION || draft.generation !== draft.prepared.generation) {
       throw new ScienceFlowPreparedInputsCorruptError();
     }
-    this.database.exec("BEGIN IMMEDIATE");
-    try {
-      const allocation = this.database
-        .prepare(
-          `SELECT plan_id, project_id, session_id, allocated
-             FROM science_flow_prepared_input_generations
-            WHERE plan_id = ?`,
-        )
-        .get(planId) as GenerationRow | undefined;
-      let allocated = 0;
-      if (allocation !== undefined) {
-        if (
-          allocation.plan_id !== planId ||
-          allocation.project_id !== projectId ||
-          allocation.session_id !== sessionId ||
-          typeof allocation.allocated !== "number" ||
-          !Number.isSafeInteger(allocation.allocated) ||
-          allocation.allocated < 0
-        ) {
-          throw new ScienceFlowPreparedInputsCorruptError();
-        }
-        allocated = allocation.allocated;
-      }
-      const storedRow = this.select(projectId, sessionId, planId);
-      const storedGeneration = storedRow ? parseRow(storedRow).generation : 0;
-      const generation = Math.max(allocated, storedGeneration) + 1;
-      if (!Number.isSafeInteger(generation)) {
-        throw new ScienceFlowPreparedInputsCorruptError();
-      }
-      this.database
-        .prepare(
-          `INSERT INTO science_flow_prepared_input_generations
-             (plan_id, project_id, session_id, allocated)
-           VALUES (?, ?, ?, ?)
-           ON CONFLICT(plan_id) DO UPDATE SET
-             project_id = excluded.project_id,
-             session_id = excluded.session_id,
-             allocated = excluded.allocated`,
-        )
-        .run(planId, projectId, sessionId, generation);
-      this.database.exec("COMMIT");
-      return generation;
-    } catch (error) {
-      try {
-        this.database.exec("ROLLBACK");
-      } catch {
-        /* preserve the original error */
-      }
-      throw error;
-    }
+    const result = this.observations.save({
+      key: draft.prepared.planId, projectId: draft.projectId, sessionId: draft.sessionId,
+      generation: draft.generation, recordedAt: draft.prepared.preparedAt, record: draft.prepared,
+    });
+    return { saved: result.saved, ...(result.stored ? { stored: Object.freeze({
+      prepared: result.stored.record, generation: result.stored.generation,
+    }) } : {}) };
   }
-
-  save(draft: ScienceFlowPreparedInputsDraft): {
-    readonly saved: boolean;
-    readonly stored?: ScienceFlowStoredPreparedInputs;
-  } {
-    if (
-      draft.prepared.planId.trim().length === 0 ||
-      draft.prepared.schemaVersion !== SCIENCE_FLOW_PREPARED_INPUTS_DTO_VERSION ||
-      draft.generation !== draft.prepared.generation ||
-      !Number.isSafeInteger(draft.generation) ||
-      draft.generation < 1
-    ) {
-      throw new ScienceFlowPreparedInputsCorruptError();
-    }
-    // A receipt is stored only if it describes one complete bundle: the fixed
-    // role set, one byte set per path, counts that follow from the files, and
-    // a bundle digest recomputed from the same canonical manifest the Runner
-    // hashed. A caller cannot persist a self-inconsistent record and have it
-    // read back as a successful preparation.
-    const record = reducePrepared(draft.prepared);
-    parseRecord(record, draft.prepared.preparedAt);
-    // Share a write lock with deletion from validation through the returned
-    // snapshot, so a late receipt cannot insert after a delete commits.
-    this.database.exec("BEGIN IMMEDIATE");
-    try {
-      const allocation = this.database
-        .prepare(
-          `SELECT plan_id, project_id, session_id, allocated
-             FROM science_flow_prepared_input_generations
-            WHERE plan_id = ?`,
-        )
-        .get(draft.prepared.planId) as GenerationRow | undefined;
-      // Only a generation this plan actually issued may be written. After a
-      // Session/Project delete removed the allocations, a preparation still in
-      // flight cannot insert a row back into an empty table.
-      if (
-        allocation === undefined ||
-        allocation.plan_id !== draft.prepared.planId ||
-        allocation.project_id !== draft.projectId ||
-        allocation.session_id !== draft.sessionId ||
-        typeof allocation.allocated !== "number" ||
-        !Number.isSafeInteger(allocation.allocated) ||
-        draft.generation > allocation.allocated
-      ) {
-        this.database.exec("COMMIT");
-        return { saved: false };
-      }
-      const serialized = JSON.stringify(record);
-      const result = this.database
-        .prepare(
-          `INSERT INTO science_flow_prepared_inputs
-             (plan_id, project_id, session_id, generation, prepared_at, record_json)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(plan_id) DO UPDATE SET
-             generation = excluded.generation,
-             prepared_at = excluded.prepared_at,
-             record_json = excluded.record_json
-           WHERE excluded.generation > science_flow_prepared_inputs.generation
-             AND science_flow_prepared_inputs.project_id = excluded.project_id
-             AND science_flow_prepared_inputs.session_id = excluded.session_id`,
-        )
-        .run(
-          draft.prepared.planId,
-          draft.projectId,
-          draft.sessionId,
-          draft.generation,
-          draft.prepared.preparedAt,
-          serialized,
-        );
-      const saved = Number(result.changes) === 1;
-      const row = this.select(
-        draft.projectId,
-        draft.sessionId,
-        draft.prepared.planId,
-      );
-      const outcome = row ? { saved, stored: parseRow(row) } : { saved };
-      this.database.exec("COMMIT");
-      return outcome;
-    } catch (error) {
-      try {
-        this.database.exec("ROLLBACK");
-      } catch {
-        /* preserve the original failure */
-      }
-      throw error;
-    }
-  }
-
-  deleteSession(sessionId: string): void {
-    this.database.exec("BEGIN IMMEDIATE");
-    try {
-      this.database
-        .prepare("DELETE FROM science_flow_prepared_inputs WHERE session_id = ?")
-        .run(sessionId);
-      this.database
-        .prepare(
-          "DELETE FROM science_flow_prepared_input_generations WHERE session_id = ?",
-        )
-        .run(sessionId);
-      this.database.exec("COMMIT");
-    } catch (error) {
-      try {
-        this.database.exec("ROLLBACK");
-      } catch {
-        /* preserve the original error */
-      }
-      throw error;
-    }
-  }
-
-  deleteProject(projectId: string): void {
-    this.database.exec("BEGIN IMMEDIATE");
-    try {
-      this.database
-        .prepare("DELETE FROM science_flow_prepared_inputs WHERE project_id = ?")
-        .run(projectId);
-      this.database
-        .prepare(
-          "DELETE FROM science_flow_prepared_input_generations WHERE project_id = ?",
-        )
-        .run(projectId);
-      this.database.exec("COMMIT");
-    } catch (error) {
-      try {
-        this.database.exec("ROLLBACK");
-      } catch {
-        /* preserve the original error */
-      }
-      throw error;
-    }
-  }
-
-  private select(
-    projectId: string,
-    sessionId: string,
-    planId: string,
-  ): PreparedInputRow | undefined {
-    return this.database
-      .prepare(
-        `SELECT plan_id, project_id, session_id, generation, prepared_at, record_json
-           FROM science_flow_prepared_inputs
-          WHERE plan_id = ? AND project_id = ? AND session_id = ?`,
-      )
-      .get(planId, projectId, sessionId) as PreparedInputRow | undefined;
-  }
+  deleteSession(sessionId: string): void { this.observations.deleteSession(sessionId); }
+  deleteProject(projectId: string): void { this.observations.deleteProject(projectId); }
 }
 
 /** The read answer: the latest stored receipt, or none performed yet. */
@@ -411,25 +178,16 @@ function reducePrepared(
   };
 }
 
-function parseRow(row: PreparedInputRow): ScienceFlowStoredPreparedInputs {
-  if (
-    typeof row.plan_id !== "string" ||
-    row.plan_id.trim().length === 0 ||
-    typeof row.generation !== "number" ||
-    !Number.isSafeInteger(row.generation) ||
-    row.generation < 1
-  ) {
-    throw new ScienceFlowPreparedInputsCorruptError();
-  }
-  const record = parseRecord(parseJson(row.record_json), row.prepared_at);
+function decodePrepared(value: unknown, identity: ResearchGenerationIdentity): ScienceFlowPreparedInputsDto {
+  const record = parseRecord(value, identity.recordedAt);
   const prepared: ScienceFlowPreparedInputsDto = Object.freeze({
     schemaVersion: SCIENCE_FLOW_PREPARED_INPUTS_DTO_VERSION,
-    planId: row.plan_id,
+    planId: identity.key,
     ...record,
     canStart: false as const,
-    generation: row.generation,
+    generation: identity.generation,
   });
-  return Object.freeze({ prepared, generation: row.generation });
+  return prepared;
 }
 
 /**
@@ -590,14 +348,6 @@ function receiptDigest(manifest: ScienceFlowInputBundleManifest): string {
   return createHash("sha256")
     .update(canonicalScienceFlowInputBundleManifest(manifest), "utf8")
     .digest("hex");
-}
-
-function parseJson(text: string): unknown {
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new ScienceFlowPreparedInputsCorruptError();
-  }
 }
 
 function isDigest(value: unknown): value is string {
