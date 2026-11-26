@@ -33,6 +33,7 @@
 import type {
   ResearchDeliveryProgress,
   ResearchEngineAdapter,
+  ResearchEngineBeforeLaunch,
   ResearchOperationWriter,
   ResearchStopRequester,
 } from "./engine-adapter.js";
@@ -42,6 +43,7 @@ import {
 } from "./operation-lifecycle.js";
 import {
   projectResearchBudgetLine,
+  researchBudgetLaunchAllowance,
   researchBudgetLineRefusal,
   withResearchBudgetDecision,
   type ResearchBudgetChild,
@@ -157,7 +159,7 @@ export interface ResearchTaskProduct<
   present(record: Record): Promise<View> | View;
   /** Project many records with their product relations. */
   list?(projectId: string, sessionId: string, records: readonly Record[]): Promise<readonly View[]> | readonly View[];
-  /** The frozen line facts for one stored record, for settlement and stops. */
+  /** Fresh synchronous line facts, including before a planned record is inserted. */
   lineFactsFor(record: Record): ResearchLineFacts | undefined;
   afterObserve?(record: Record): Promise<void> | void;
   afterStop?(record: Record): Promise<void> | void;
@@ -326,8 +328,37 @@ export function createResearchTaskService<
     lines.put(line, record);
   };
 
+  const beforeLaunch = (record: Record): ResearchEngineBeforeLaunch<Record> => {
+    store.assertSessionWritable(record.identity.sessionId);
+    const facts = product.lineFactsFor(record);
+    if (!facts) return { record, refusal: { step: "budget", message: "The task has no durable budget line" } };
+    const line = projectResearchBudgetLine({
+      ...facts,
+      limits: facts.limits,
+      existing: lines.get(record.identity.projectId, record.identity.sessionId, facts.lineKey),
+      identity: record.identity,
+      now: now(),
+    });
+    const verdict = researchBudgetLaunchAllowance(line, facts.children, record.operationId, record.ownerRunId, now(), facts);
+    if ("reason" in verdict) return { record, refusal: { step: "budget", message: verdict.message } };
+    const result = product.engine.beforeLaunch(record, writer, verdict);
+    if (result.refusal) return result;
+    const reservation = line.reservations.find((row) => row.operationId === record.operationId);
+    const applied = result.appliedAllowanceSec;
+    if ((applied !== undefined && (!Number.isFinite(applied) || applied <= 0 || applied > verdict.allowanceSec))
+      || (reservation && verdict.allowanceSec < reservation.reservedSec && applied === undefined)) {
+      return { record: result.record, refusal: {
+        step: "budget", message: "The engine did not apply the reduced launch allowance",
+      } };
+    }
+    lines.put({ ...line, updatedAt: now(), reservations: line.reservations.map((row) =>
+      row.operationId === record.operationId ? { ...row, reservedSec: applied ?? verdict.allowanceSec } : row) }, result.record);
+    return result;
+  };
+
   const lifecycle = createResearchOperationLifecycle<Record, Delivery>({
     engine: product.engine,
+    beforeLaunch,
     errorMessage,
     now,
     observeMaxWaitMs: options.observeMaxWaitMs,
@@ -440,26 +471,34 @@ export function createResearchTaskService<
       };
     }
     assertPlanIdentity(plan, identity, product);
-    // The early key was computed before product resolution (for example an
-    // automatic selection). Re-check so a replay attaches to its operation.
-    if (plan.dedupeKey !== key) {
-      const resolvedExisting = operations.findByIdempotency(
-        identity.projectId,
-        identity.sessionId,
-        plan.dedupeKey,
-      );
-      if (resolvedExisting) {
-        return {
-          attached: true,
-          attachedReason: "same-request",
-          record: resolvedExisting,
-          view: await present(resolvedExisting),
-        };
-      }
+    if (!Number.isFinite(plan.line.allowanceSec) || plan.line.allowanceSec <= 0) {
+      throw product.refuse("invalid-option", "The launch allowance must be positive finite seconds");
     }
+    if (await ownerStopped(identity.sessionId, identity.ownerRunId)) {
+      throw product.refuse("conversation-cancelled", "The owning conversation was cancelled while planning");
+    }
+    requireProjectSession(identity.projectId, identity.sessionId);
+    store.assertSessionWritable(identity.sessionId);
+    // Planning can await I/O. Refresh all admission facts after it; there is no
+    // await between these reads, record creation and durable reservation.
+    const resolvedExisting = operations.findByIdempotency(identity.projectId, identity.sessionId, plan.dedupeKey);
+    if (resolvedExisting) return {
+      attached: true, attachedReason: "same-request", record: resolvedExisting, view: await present(resolvedExisting),
+    };
+    const activeNow = operations.listForSession(identity.projectId, identity.sessionId)
+      .find((candidate) => candidate.ownerRunId === identity.ownerRunId && !isTerminalTaskState(candidate.state));
+    if (activeNow) return {
+      attached: true, attachedReason: "active-operation", record: activeNow, view: await present(activeNow),
+    };
+    const freshFacts = product.lineFactsFor(plan.record);
+    if (!freshFacts || freshFacts.lineKey !== plan.line.lineKey || freshFacts.lineId !== plan.line.lineId) {
+      throw product.refuse("invalid-option", "The planned budget line does not match the product's frozen identity");
+    }
+    const freshPlan = { ...plan, line: { ...plan.line, children: freshFacts.children,
+      extraChargedSeconds: freshFacts.extraChargedSeconds } };
 
     const storedLine = lines.get(identity.projectId, identity.sessionId, plan.line.lineKey);
-    const refusal = budgetRefusal(storedLine, plan, identity, now());
+    const refusal = budgetRefusal(storedLine, freshPlan, identity, now());
     if (refusal) throw product.refuse(refusal.reason, refusal.message);
 
     const accepted: Record = plan.record.engineId === undefined
@@ -485,7 +524,7 @@ export function createResearchTaskService<
       launched: false,
     };
     let line = projectResearchBudgetLine({
-      children: [...plan.line.children, acceptedChild],
+      children: [...freshFacts.children, acceptedChild],
       existing: storedLine,
       identity: stored.record.identity,
       limits: plan.line.limits,

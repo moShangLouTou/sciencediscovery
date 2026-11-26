@@ -98,7 +98,7 @@ Implement `ResearchEngineAdapter<Record, Delivery>`:
 | Method | Contract |
 | --- | --- |
 | `prepare(record, signal, writer)` | Stage frozen inputs or perform engine preparation. Honor the abort signal. Return `proceed: false` after recording a terminal outcome |
-| `beforeLaunch(record, writer)` | Final synchronous checks. Return a refusal with a stable step and safe message |
+| `beforeLaunch(record, writer, budget)` | Apply the shared allowance/deadline cap and engine-specific minimums; return `appliedAllowanceSec` when applying a cap. Return a refusal with a stable step and safe message |
 | `launch(record, writer)` | Launch once and persist the engine handle and running state. Return the engine run id. Do not assume an engine status you have not read |
 | `inspect(record)` | Read engine status without persisting; report whether a run exists and is terminal |
 | `observe(record, writer)` | Read and persist current facts, then return the record, terminal flag and mapped state |
@@ -130,6 +130,19 @@ product it can be any stable business key. The shared ledger enforces:
 - a configurable child-run limit;
 - reservations for active children and settlements for terminal ones.
 
+After asynchronous planning, the service rereads idempotency, the owner's
+active operation and `lineFactsFor(record)` before reserving without an await.
+`lineFactsFor` must return fresh stored children even for a planned record that
+has not yet been inserted; do not return the planning snapshot.
+
+After preparation, the service recomputes the allowed wall clock from the
+reservation, remaining quota, attributable overhead and deadline. An exhausted
+line cannot launch. `beforeLaunch` receives this cap; the adapter applies its
+engine's minimums and research/report split and returns `appliedAllowanceSec`.
+If a reduced cap is not acknowledged, the service refuses launch. Applied caps
+are persisted in the reservation. Actual termination at the cap depends on the
+engine enforcing its applied limit; the service is not an execution watchdog.
+
 A launched child whose elapsed time is unknown is charged its reservation,
 never zero; a preparation that never launched is charged its observed operation
 wall clock. A rebuilt service reconstructs the same answer from stored children,
@@ -146,7 +159,9 @@ input the product will stage. Freeze the verified digest in your record so a
 later version, profile edit or rebuild cannot change what runs.
 
 `publishArtifactVersion` writes bytes to the existing CAS and creates or reuses
-a Session artifact version. Identical bytes return the existing version, so a
+a Session artifact version. Calls for the same Session/name on one store are
+serialized through lookup and publication, including failed attempts. Identical
+bytes return the existing version, so a
 repeat or retry does not create a duplicate. An optional digest is verified
 before publication. `resolveLinkedArtifactVersion` links a fixed version (a
 plan, an incumbent, a proof input) without authoring or rewriting it. Bind
@@ -241,7 +256,7 @@ Wire them as follows:
    records the line's stop.
 5. After a restart, `get` or `latest` reads the same rows and observes the
    existing engine task. It never resubmits a paid task.
-6. `retryDelivery` republishes an existing result. It never launches.
+6. `retryDelivery` publishes only terminal tasks. Active tasks stay pending and never call the publisher. It never launches.
 
 ## Integration limits
 
@@ -252,7 +267,8 @@ boundary. The worker, preparation-abort, delivery locks and the budget
 reservation are process-local: reservations are checked and written without an
 intervening await, which is atomic within one API process, but a deployment with
 several API processes must serialize starts for a line in its store or
-scheduler. The session cancel path must call `cancelOwnerRun`; the service does
+scheduler. Publication serialization is scoped to one SessionStore instance;
+multiple store owners require a shared catalog transaction/coordination layer. The session cancel path must call `cancelOwnerRun`; the service does
 not observe conversation state by itself unless the product supplies an
 `ownerStopped` reader.
 

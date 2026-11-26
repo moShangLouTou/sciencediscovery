@@ -29,7 +29,7 @@
  * charged its reservation, never zero.
  */
 import { isTerminalTaskState } from "./task-record.js";
-import type { ResearchLifecycleState } from "./engine-adapter.js";
+import type { ResearchEngineLaunchBudget, ResearchLifecycleState } from "./engine-adapter.js";
 
 export const RESEARCH_BUDGET_LINE_VERSION = 1;
 export const RESEARCH_BUDGET_DECISION_LIMIT = 200;
@@ -494,4 +494,32 @@ export function withResearchBudgetDecision<
     decisions: [...line.decisions, decision].slice(-RESEARCH_BUDGET_DECISION_LIMIT),
     updatedAt: decision.at,
   };
+}
+
+/** Recheck a durable reservation after preparation, excluding only its own hold. */
+export function researchBudgetLaunchAllowance(
+  line: ResearchBudgetLine,
+  children: readonly ResearchBudgetChild[],
+  operationId: string,
+  ownerRunId: string,
+  now: string,
+  options: ResearchBudgetViewOptions = {},
+): ResearchEngineLaunchBudget | ResearchBudgetRefusal {
+  const reservation = line.reservations.find((row) => row.operationId === operationId);
+  if (!reservation || !Number.isFinite(reservation.reservedSec) || reservation.reservedSec <= 0) {
+    return { reason: "parent-budget-exhausted", message: "The task has no valid durable reservation" };
+  }
+  const availableLine = { ...line, reservations: line.reservations.filter((row) => row.operationId !== operationId) };
+  const view = researchBudgetLineView(availableLine, children, now, options);
+  const deadlineSeconds = line.limits === null ? Infinity
+    : (Date.parse(line.limits.deadlineAt) - Date.parse(now)) / 1_000;
+  const allowanceSec = Math.floor(Math.min(reservation.reservedSec, deadlineSeconds,
+    view.usage.wallClock.remainingSeconds ?? Infinity));
+  if (!Number.isFinite(allowanceSec) || allowanceSec <= 0) return {
+    reason: deadlineSeconds <= 0 ? "parent-deadline-exceeded" : "parent-budget-exhausted",
+    message: "The research line's allowance or deadline was exhausted during preparation",
+  };
+  const refusal = researchBudgetLineRefusal({ line: availableLine, children, allowanceSec, ownerRunId,
+    now, excludeOperationId: operationId, viewOptions: options });
+  return refusal ?? { allowanceSec, ...(line.limits === null ? {} : { deadlineAt: line.limits.deadlineAt }) };
 }
