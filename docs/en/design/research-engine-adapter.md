@@ -57,6 +57,12 @@ Execution permission remains a product entry concern: the production tool
 passes SD's governed privilege check before it calls the service, and the
 service still proves ownership and write access on every request.
 
+The shared service never treats a tool's execution authorization as a user's
+acceptance of a formal proposition or a scientific claim. A product that needs
+an explicit confirmation keeps it as its own version-bound domain fact and
+checks it in `authorize` (before admission) or in `deliver` (before publishing a
+proof). This release provides the extension point, not a proof-signing system.
+
 ## Define an operation record
 
 Extend `ResearchTaskRecord<Delivery>` with the durable engine handle, frozen
