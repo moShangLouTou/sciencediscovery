@@ -53,6 +53,8 @@ export class ResearchPublicationRefusal extends Error {
 /** The store surface publication needs. `SessionStore` satisfies it. */
 export interface ResearchArtifactStore {
   readonly dataDir: string;
+  /** The Session's write gate; a read-only or archived Session is refused. */
+  assertSessionWritable?(sessionId: string): unknown;
   getSession(sessionId: string): { readonly projectId: string } | undefined;
   getArtifactByName(sessionId: string, logicalName: string): {
     readonly currentVersion: number;
@@ -133,6 +135,8 @@ export async function publishArtifactVersion(
 ): Promise<PublishedArtifact> {
   const session = store.getSession(input.sessionId);
   if (!session) throw new ResearchPublicationRefusal("session-not-found", "The Session does not exist");
+  // A late publication still respects the Session's write gate.
+  store.assertSessionWritable?.(input.sessionId);
   const digest = createHash("sha256").update(input.bytes).digest("hex");
   if (input.digest !== undefined && digest !== input.digest) {
     throw new ResearchPublicationRefusal(
