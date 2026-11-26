@@ -18,9 +18,9 @@
  * The product entry point owns the durable operation, its Project/Session
  * association, and permission and version-binding checks at acceptance. The
  * shared lifecycle coordinates cancellation and publication/retry policy.
- * Engine-specific operations — preparing inputs, starting the engine, reading
- * its record, asking it to stop and reading its result — are behind this
- * interface. The lifecycle module (`operation-lifecycle.ts`) is written against
+ * This is the composed service contract. `engine-service.ts` combines a
+ * communication-only transport with preparation, launch policy and delivery.
+ * Existing complete adapters remain supported through this interface. The lifecycle module (`operation-lifecycle.ts`) is written against
  * exactly these types, independently of any engine's transport, disk layout or
  * model configuration.
  *
@@ -188,7 +188,7 @@ export interface ResearchEngineAdapter<
   /** Stable engine name for diagnostics; never a credential or host path. */
   readonly engine: string;
   readonly transitions: ResearchLifecycleTransitions<Record>;
-  /** Engine-specific preparation before launch (staging, task assets, ...). */
+  /** Platform-orchestrated preparation steps supplied by the product. */
   prepare(
     record: Record,
     signal: AbortSignal,
@@ -211,6 +211,6 @@ export interface ResearchEngineAdapter<
   requestStop(record: Record): Promise<{ readonly error?: string }>;
   /** Bounded wait for the engine's own termination record. */
   confirmStop(record: Record): Promise<boolean>;
-  /** Publish the run's result into the Session. Never restarts research. */
+  /** Service publication hook; never part of the execution transport and never restarts research. */
   deliver(record: Record, options: { readonly force: boolean }): Promise<Delivery>;
 }

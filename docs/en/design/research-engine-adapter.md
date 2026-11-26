@@ -23,7 +23,8 @@ to this service.
 | Shared input binding (`research/input-binding.ts`) | Exact Session artifact versions, CAS byte verification, configured-input comparison |
 | Shared artifact publisher (`research/artifact-publisher.ts`) | CAS write, content-addressed version reuse, digest verification, linked-version resolution |
 | Product hooks (`ResearchTaskProduct`) | Permission/configuration gate, request validation and record construction, model or task resolution, frozen grant, engine capabilities and adapter, public view, line identity |
-| Engine adapter | Prepare inputs, launch/contact the engine, map its status, request and confirm cancellation, read and publish its result |
+| Execution transport (`ResearchExecutionTransport`) | Launch/contact the engine, map its status and progress, request and confirm cancellation |
+| Shared engine service (`research/engine-service.ts`) | Order preparation steps, recheck cancellation after asynchronous work, persist preparation failures, compose launch policy and delivery with the transport |
 | Product domain code | Metric direction, comparability, best/selected candidate, proof validity, task packages and evaluators, file layout and result prose |
 
 The shared modules under `services/api/src/research/` never import a product's
@@ -80,6 +81,30 @@ resource fences, recovery and CAS snapshot publication. An engine adapter owns
 engine checkout verification, engine-specific arguments and evidence parsing.
 Engine evidence can use an `engineId` and `engineRunId` without fabricating
 another product's revision metadata. Legacy evidence records remain readable.
+
+## Compose a transport with platform services
+
+Implement `ResearchExecutionTransport` for engine communication and format
+conversion. Pass it to `createResearchEngineService` with preparation steps,
+record transitions, an engine grant mapper and a delivery callback. The service
+checks persisted stop intent, terminal state and conversation cancellation
+between asynchronous steps and after the owner lookup; a failed step cannot
+revive a stopped operation. The existing `ResearchEngineAdapter` remains the
+composed contract consumed by the task lifecycle.
+
+Use `withResearchPreparationWorkspace` for disposable probe state,
+`observeResearchPreparation` for durable attempt observations, and
+`overhead-ledger.ts` for preparation time, probe counts and model usage
+summaries. Products choose scientific attribution; the platform preserves
+unknown time/usage separately from measured zero. `ResearchVersionRepository`
+stores immutable evidence bound to exact artifact versions, verifies mirrored
+row identities and refuses conflicting re-records. Its configurable table and
+column names support existing product records without migration.
+
+Product-specific artifact descriptions and result selection belong in product
+services; those services call `publishArtifactVersion` and `publishResearchPlan`
+for CAS/catalog/version behavior. A transport does not publish artifacts or
+register SD result records as a side effect of launch.
 
 ## Shared persistence and preparation
 

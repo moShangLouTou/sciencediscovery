@@ -26,3 +26,13 @@ export async function observeResearchPreparation<T>(options: {
   if (result.outcome === "failed") throw result.error;
   return result.value;
 }
+
+/** A private workspace exists only while preparation runs, including failed probes. */
+export async function withResearchPreparationWorkspace<T>(parent: string, work: (root: string) => Promise<T>): Promise<T> {
+  const { mkdir, mkdtemp, rm } = await import("node:fs/promises");
+  const { join } = await import("node:path");
+  await mkdir(parent, { recursive: true, mode: 0o755 });
+  const root = await mkdtemp(join(parent, ".prepare-"));
+  try { return await work(root); }
+  finally { await rm(root, { force: true, recursive: true }).catch(() => undefined); }
+}
