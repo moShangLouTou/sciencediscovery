@@ -154,9 +154,75 @@ publishes only an existing result.
 
 ## Wire the entry points
 
-The shared service exposes `start`, `get`, `stop`, `retryDelivery`,
-`cancelOwnerRun`, `latest` and `list` (list may be called by the product's own
-read path). Wire them as follows:
+The shape of a product object is small; the shared service supplies the rest.
+
+```ts
+const product: ResearchTaskProduct<MyRequest, MyDelivery, MyRecord, MyView> = {
+  engineId: "my-engine",
+  capabilities: {
+    asynchronousLaunch: true,
+    confirmsStop: true,
+    delivers: "one verified result file",
+    reportsElapsedSec: true,
+    reportsTokenUsage: false,
+  },
+  engine: adapter,
+  requestIdentity: (request) => ({
+    ownerRunId: request.ownerRunId,
+    projectId: request.projectId,
+    sessionId: request.sessionId,
+  }),
+  authorize: async (request) => { /* product permission/configuration gate */ },
+  idempotencyKey: (request) => stableHash(request),
+  planStart: async (request, context) => {
+    const key = stableHash(request);
+    const existing = context.operations.findByIdempotency(
+      request.projectId, request.sessionId, key,
+    );
+    if (existing) return { attachTo: existing };
+    const createdAt = context.now();
+    const operationId = context.newOperationId();
+    const record: MyRecord = {
+      schemaVersion: MY_VERSION, operationId, idempotencyKey: key,
+      identity: { projectId: request.projectId, sessionId: request.sessionId },
+      ownerRunId: request.ownerRunId, engineId: "my-engine", engineRunId: null,
+      state: "accepted", createdAt, updatedAt: createdAt,
+      delivery: { state: "pending", attempts: 0, updatedAt: createdAt },
+      stop: {}, engine: {},
+    };
+    return {
+      dedupeKey: key,
+      line: {
+        allowanceSec: request.allowanceSec,
+        children: context.operations
+          .listForSession(request.projectId, request.sessionId)
+          .map(childBudgetFacts),
+        lineId: "my-line", lineKey: "my-line-key",
+      },
+      record,
+    };
+  },
+  refuse: (reason, message) => new MyRefusal(reason, message),
+  present: (record) => viewFor(record),
+  lineFactsFor: (record) => ({
+    children: operations.listForSession(record.identity.projectId, record.identity.sessionId)
+      .map(childBudgetFacts),
+    lineId: "my-line", lineKey: "my-line-key",
+  }),
+};
+
+const service = createResearchTaskService({
+  store, operations, lines, product,
+  observeMaxWaitMs: 30_000,
+});
+```
+
+`operations` is a `ResearchTaskRepository` over your table and codec; `lines` is
+your durable research-line store. The service exposes `start`, `get`, `stop`,
+`retryDelivery`, `cancelOwnerRun`, `latest` and `list` (list may instead be
+projected by the product's own read path).
+
+Wire them as follows:
 
 1. The product entry point performs its own governed execution-permission check,
    then calls `start`. Do not rebuild request validation, deduplication or
