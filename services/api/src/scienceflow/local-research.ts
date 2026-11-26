@@ -62,10 +62,7 @@ import {
   type ResearchTaskProduct,
   type ResearchStartPlan,
 } from "../research/task-service.js";
-import {
-  RESEARCH_BUDGET_LINE_VERSION,
-  type ResearchBudgetLine,
-} from "../research/budget.js";
+import type { ResearchBudgetLine } from "../research/budget.js";
 import {
   createScienceFlowEngineAdapter,
   type ScienceFlowDeadlineVerdict,
@@ -781,29 +778,6 @@ export function createLocalResearchService(input: {
     const next = { ...change(current), updatedAt: now() };
     operations().update(next);
     return next;
-  };
-
-  const resolveRecord = (request: LocalResearchOperationInput): ScienceFlowLocalResearchOperation => {
-    if (!store.getProject(request.projectId)) {
-      throw new LocalResearchRefusal("project-not-found", "The Project does not exist");
-    }
-    const session = store.getSession(request.sessionId);
-    if (!session || session.projectId !== request.projectId) {
-      throw new LocalResearchRefusal("session-not-found", "The Session does not exist in this Project");
-    }
-    const rows = operations().listForSession(request.projectId, request.sessionId);
-    const record = request.operationId
-      ? rows.find((candidate) => candidate.operationId === request.operationId)
-      : [...rows].reverse().find((candidate) => !isTerminalResearchState(candidate.state)) ?? rows.at(-1);
-    if (!record) {
-      throw new LocalResearchRefusal("operation-not-found", "This Session has no research operation to observe");
-    }
-    if (record.identity.projectId !== request.projectId || record.identity.sessionId !== request.sessionId) {
-      // The lookup is already Session-scoped; keep the guard explicit so a future
-      // lookup change cannot retarget another Session.
-      throw new LocalResearchRefusal("operation-identity-mismatch", "The research operation belongs to another Session");
-    }
-    return record;
   };
 
   /** The absolute parent-line deadline, when this deployment configured one. */
