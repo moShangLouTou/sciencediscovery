@@ -74,6 +74,8 @@ export interface ModelTurn {
     protocol: ModelApiProtocol;
     unparseableSsePayloads: number;
     toolCallDeltasWithoutIndex?: number;
+    /** Named tool calls whose provider id was absent and had to be minted. */
+    toolCallIdsSynthesized?: number;
   };
   usage?: AgentModelUsage;
   /**
@@ -1164,7 +1166,7 @@ async function streamOpenAiTurn(
   let recoveredAfterCompletion = false;
   const buffersInlineThinking = variant === "minimax" || variant === "ollama";
 
-  const streamDiagnostics = { protocol: "openai-chat-completions" as const, unparseableSsePayloads: 0, toolCallDeltasWithoutIndex: 0 };
+  const streamDiagnostics = { protocol: "openai-chat-completions" as const, unparseableSsePayloads: 0, toolCallDeltasWithoutIndex: 0, toolCallIdsSynthesized: 0 };
   try {
     for await (const payload of sseData(body, recorder, callbacks.onProgress)) {
       let chunk: Record<string, unknown>;
@@ -1261,7 +1263,16 @@ async function streamOpenAiTurn(
     if (text) callbacks.onTextDelta?.(text);
   }
   const orderedFragments = [...fragments.entries()].sort((a, b) => a[0] - b[0]).map(([, value]) => value);
-  if (orderedFragments.some(f => f.function?.name && !(typeof f.id === "string" && f.id))) throw new Error("Chat completion omitted a tool call ID");
+  // A named tool call with no provider id used to fail the whole turn. Some
+  // OpenAI-compatible gateways (a Qwen proxy among them) stream the call
+  // without one, and the id is an opaque correlation token SD only replays
+  // verbatim — so it can be synthesized and the turn stays usable. The count is
+  // recorded, so a reader can tell an invented id from provider evidence.
+  // Responses and Messages keep their strict checks: there the id is part of
+  // the provider's own record, not a token this parser may mint.
+  const synthesizedToolCallIds = orderedFragments.filter((fragment) =>
+    fragment.function?.name && !(typeof fragment.id === "string" && fragment.id)).length;
+  if (synthesizedToolCallIds) streamDiagnostics.toolCallIdsSynthesized = synthesizedToolCallIds;
   const wireToolCalls = orderedFragments.map((fragment) => ({
     ...fragment,
     id: typeof fragment.id === "string" && fragment.id ? fragment.id : `call_${randomUUID()}`,

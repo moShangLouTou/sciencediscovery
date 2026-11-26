@@ -81,7 +81,10 @@ function rejectQuarantinedContinuation(f: Awaited<ReturnType<typeof fixture>>, i
 
 /** CPU-only process fixture, not a substitute for the production sandbox tests. */
 function operation(input: ShellExecutionRequest, revision = environmentRevisionId, launched?: () => void) {
-  return async (signal: AbortSignal, log: ExecutionLogSink, expectedEnvironmentRevisionId?: string): Promise<ShellExecutionResult> => {
+  // The lifecycle argument exists so the manager always passes four parameters;
+  // this fixture starts no managed sandbox, so it has no boundary to record.
+  return async (signal: AbortSignal, log: ExecutionLogSink, expectedEnvironmentRevisionId?: string,
+    _lifecycle?: unknown): Promise<ShellExecutionResult> => {
     if (expectedEnvironmentRevisionId !== undefined && expectedEnvironmentRevisionId !== revision) {
       throw new Error("RECOVERY_ENVIRONMENT_CHANGED");
     }

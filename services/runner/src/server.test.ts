@@ -2333,7 +2333,12 @@ test("managed recovery HTTP contract returns original receipts, scoped conflicts
   const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const health = await fetch(`${origin}/health`, { headers: { authorization: "Bearer runner-test-token" } })
     .then(response => response.json()) as RunnerHealth;
-  assert.equal(health.capabilities?.executionRecoveryVersion, 1);
+  assert.equal(health.capabilities?.executionRecoveryVersion, 2);
+  // The boundary claim is derived from the sandbox this host actually has, so
+  // only the shape is asserted here; the values are checked against the real
+  // bubblewrap capability in the boundary tests.
+  assert.ok(health.capabilities?.executionBoundary);
+  assert.ok(["pid-namespace", "none"].includes(health.capabilities!.executionBoundary!.handle));
   assert.ok(health.runnerInstanceId);
   assert.ok(health.runnerBootId);
   const input = { agentId: "main", executionId: "cpu-http", workspaceRoot, permissionEpoch: epoch(), code: "mock command" };

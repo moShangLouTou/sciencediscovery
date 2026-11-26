@@ -203,6 +203,8 @@ import { effectiveModelTurns } from "@sciencediscovery/runtime-core";
 import { classifySubagentFailure } from "@sciencediscovery/specialist";
 import { jiuwenSwarmConfigFromEnv } from "../agent-run/jiuwenswarm-agent.js";
 import { createConfigurationAgentTools } from "../configuration/agent-tools.js";
+import { getLocalResearchService } from "../scienceflow/local-research-runtime.js";
+import { createLocalResearchTools, localResearchInstructions } from "../scienceflow/local-research-tools.js";
 import { runMainRequestExecution, runSubagentTask } from "../agent-run/orchestrators.js";
 import { createAgentPermissionRuntime } from "@sciencediscovery/governance";
 import type { EvolveRunProposal } from "@sciencediscovery/schema";
@@ -865,10 +867,14 @@ async function executeAgentRun(
         sessionId,
       }, ideaTreeExecutor)
     : [];
+  // The experimental local research mode is a deployment decision made once at
+  // composition time; when it is off this is undefined and no tool is built.
+  const localResearchService = getLocalResearchService();
   const workflowInstructions = [
     CONFIGURATION_CONNECTOR_DISCOVERY_INSTRUCTIONS,
     ideaTreeLeadInstructions(settingsSnapshot.ideaTreeSettings),
     sessionTitleInstructions(session.title),
+    ...(localResearchService ? [localResearchInstructions(localResearchService)] : []),
   ].filter(Boolean).join("\n\n");
   let leaseHeartbeatQueue = Promise.resolve();
   let leaseHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
@@ -2475,6 +2481,18 @@ async function executeAgentRun(
     createSessionTitleTool(store, sessionId, async (updated) => {
       await emit({ session: updated, type: "session.updated" });
     }),
+    ...(localResearchService ? createLocalResearchTools({ service: localResearchService,
+      projectId: session.projectId, sessionId, runId,
+      requirePrivilege: (request) => permissionRuntime.requirePrivilege({
+        action: "code", executionId: runId, resource: request.resource, summary: request.summary,
+        ...(request.signal ? { signal: request.signal } : {}),
+        ...(request.toolCallId ? { toolCallId: request.toolCallId } : {}),
+      }),
+      beginExternalWait: () => {
+        if (!mainExecution) throw new Error("No main AgentRun is active");
+        return mainExecution.beginExternalWait();
+      },
+    }) : []),
   ];
   agentOptions.extraTools = [...leadExtraTools, mainRuntimeConfigTool(store)];
   if (configurationResume) verifyNativeConfigurationToolAssembly({ store, sessionId, runId,
@@ -2957,6 +2975,12 @@ export async function cancelCurrentSessionRun(
   }
   cancelledRuns.add(active.id);
   runLog.info("run_cancel_requested", { reason: "user_cancelled", runId: active.id, sessionId });
+  // Stop owns the conversation: an experiment this run started is not detached
+  // state, so cancellation requests the engine's own stop for that owned run
+  // only. It never reaches another run id or another Session's operation.
+  void getLocalResearchService()
+    ?.requestStopForConversationRun(sessionId, active.id)
+    .catch(() => undefined);
   const controller = activeRunAbortControllers.get(active.id);
   if (controller) controller.abort();
   else if (active.status === "blocked" && active.configurationWait) {
@@ -4205,6 +4229,11 @@ export async function cancelSessionRun(
   }
   cancelledRuns.add(runId);
   runLog.info("run_cancel_requested", { reason: "user_cancelled", runId, sessionId });
+  // Same narrow behaviour as the current-run cancel: only this conversation
+  // run's owned research operation is asked to stop.
+  void getLocalResearchService()
+    ?.requestStopForConversationRun(sessionId, runId)
+    .catch(() => undefined);
   const controller = activeRunAbortControllers.get(runId);
   if (controller) {
     controller.abort();

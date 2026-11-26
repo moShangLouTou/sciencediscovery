@@ -1,0 +1,223 @@
+/*
+ * Copyright (C) 2026-2026 Huawei Technologies Co., Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* Research uses the scrollable workspace rail, alongside SD artifacts/tasks. */
+.research-operation-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m);
+  background: var(--surface-subtle);
+  box-sizing: border-box;
+  min-width: 0;
+  margin: 0;
+  padding: 8px 10px;
+  width: 100%;
+}
+
+.research-operation-panel > header {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  justify-content: space-between;
+}
+
+.research-operation-panel > header > span {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+}
+
+.research-operation-panel > header small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.research-operation-panel > ul {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+}
+
+.research-operation {
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding-top: 8px;
+}
+
+.research-operation:first-child { border-top: 0; padding-top: 0; }
+
+.research-operation-head {
+  align-items: flex-start;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.research-operation-title {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.45;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.research-operation-ordinal { color: var(--muted); font-weight: 500; }
+
+.research-operation-status {
+  border-radius: 999px;
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 8px;
+  white-space: nowrap;
+}
+
+.research-operation-status.active { background: var(--accent-soft); color: var(--accent-ink); }
+.research-operation-status.waiting { background: var(--warning-soft); color: var(--warning); }
+.research-operation-status.done { background: var(--success-soft); color: var(--success); }
+.research-operation-status.failed { background: var(--danger-soft); color: var(--danger); }
+.research-operation-status.unknown { background: var(--surface-soft); color: var(--muted); }
+
+.research-operation-meta,
+.research-operation-execution,
+.research-operation-outputs,
+.research-operation-delivery {
+  color: var(--muted);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 11px;
+  gap: 2px 10px;
+}
+
+.research-operation-meta span { font-family: var(--font-mono); }
+
+.research-operation-meta,
+.research-operation-execution,
+.research-operation-outputs,
+.research-operation-delivery { min-width: 0; overflow-wrap: anywhere; }
+
+/* A resizable rail can be narrow even on a desktop viewport. */
+.research-operation-head { flex-wrap: wrap; }
+.research-operation-actions .compact-button { white-space: normal; }
+
+.research-operation-delivery-label {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.research-operation-delivery.delivered { color: var(--success); }
+.research-operation-delivery.failed { color: var(--danger); }
+
+.research-operation-delivery-detail { overflow-wrap: anywhere; }
+
+.research-operation-relations {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.research-relation {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 0 6px;
+  white-space: nowrap;
+}
+
+.research-relation.best { border-color: var(--success); color: var(--success); }
+.research-relation.latest { border-color: var(--accent); color: var(--accent-ink); }
+.research-relation.selected { border-color: var(--warning); color: var(--warning); }
+.research-relation.invalid { border-color: var(--danger); color: var(--danger); }
+
+.research-operation-best {
+  color: var(--muted);
+  font-size: 11px;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.research-operation-budget {
+  color: var(--muted);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 11px;
+  gap: 2px 10px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.research-operation-outputs .link-button,
+.research-operation-panel .link-button {
+  background: none;
+  border: 0;
+  color: var(--accent-ink);
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+  text-align: left;
+  text-decoration: underline;
+}
+
+.research-operation-outputs .link-button:hover,
+.research-operation-panel .link-button:hover { color: var(--accent-strong); }
+
+.research-operation-error {
+  color: var(--danger);
+  font-size: 11px;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.research-operation-notice {
+  font-size: 11px;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.research-operation-notice.done { color: var(--success); }
+.research-operation-notice.waiting { color: var(--warning); }
+.research-operation-notice.failed { color: var(--danger); }
+
+.research-operation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.research-operation-panel > footer { margin-top: 6px; }
+.research-operation-panel > footer .link-button { font-size: 11px; }
+
+.research-operation-empty {
+  color: var(--muted);
+  font-size: 11px;
+  margin: 6px 0 0;
+}
+
+@media (max-width: 640px) {
+  .research-operation-panel { border-radius: var(--radius-s); padding: 6px 8px; }
+  .research-operation-head { flex-direction: column; gap: 2px; }
+  .research-operation-status { align-self: flex-start; }
+  .research-operation-actions .compact-button { min-height: 38px; width: 100%; }
+}

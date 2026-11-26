@@ -15,10 +15,13 @@
 import { createTest } from "../../../test/support/tagged/compat.mjs";
 const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:linux", "arch:amd64", "arch:arm64", "sandbox:bubblewrap"] });
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { createScienceFlowRuntimeCheckService } from "./scienceflow-runtime-check.js";
+import { loadRunnerConfig } from "./server.js";
 
 
 import { PathBudgetExceededError } from "./environment-paths.js";
@@ -269,6 +272,122 @@ test("a too-deep custom data directory fails before any provisioning command", a
     return true;
   });
   assert.equal(commands.length, 0, "the path budget is checked before micromamba runs");
+});
+
+test("execution resource fences guard startup starter repairs and fresh bootstrap before provisioner writes", async context => {
+  const { store, root, provisionerPath, executor, commands } = await fixture(context);
+  await store.initialize();
+  await store.setupManagedEnvironments();
+  const ledger = resolve(root, "execution-fences.sqlite");
+  const db = new DatabaseSync(ledger);
+  db.exec("CREATE TABLE executions (id TEXT, record TEXT); CREATE TABLE execution_resources (execution TEXT, environment TEXT)");
+  db.prepare("INSERT INTO executions VALUES (?, ?)").run("legacy", JSON.stringify({ state: "unknown" }));
+  db.close();
+  const before = commands.length;
+  const reloaded = new EnvironmentStore({
+    allowedChannels: ["conda-forge"], enabled: true, provisionerPath,
+    root: resolve(root, "envs"), runnerVersion: "test", executionLedgerPath: ledger,
+  }, executor);
+  await reloaded.initialize();
+  assert.equal(reloaded.setup.state, "failed");
+  assert.equal(commands.length, before, "startup must not repair an environment whose execution is unverified");
+  const fresh = new EnvironmentStore({
+    allowedChannels: ["conda-forge"], enabled: true, provisionerPath,
+    root: resolve(root, "blocked-envs"), runnerVersion: "test", executionLedgerPath: ledger,
+  }, executor);
+  await fresh.initialize();
+  await assert.rejects(fresh.setupManagedEnvironments(), /execution still owns this environment/);
+  assert.equal(commands.length, before, "bootstrap must not create or install over a quarantined environment");
+});
+
+test("a runtime check reservation fences package changes until it is provably empty", async (context) => {
+  const { executor, provisionerPath, root, commands } = await fixture(context);
+  const ledger = resolve(root, "runtime-fences.sqlite");
+  const db = new DatabaseSync(ledger);
+  db.exec("CREATE TABLE executions (id TEXT, record TEXT); CREATE TABLE execution_resources (execution TEXT, environment TEXT)");
+  db.close();
+  const store = new EnvironmentStore({
+    allowedChannels: ["conda-forge"], enabled: true, provisionerPath,
+    root: resolve(root, "envs"), runnerVersion: "test", executionLedgerPath: ledger,
+  }, executor);
+  await store.initialize();
+  await store.setupManagedEnvironments();
+  const task = await store.createTask("runtime-check-fence", "python");
+  await store.install(task.id, ["scanpy=1.10"], ["conda-forge"]);
+  assert.equal(store.runtimeCheckBoundary(task.id), undefined);
+
+  // An unproven probe termination is recorded in memory and in the ledger.
+  store.reserveRuntimeCheck(task.id, "unproven");
+  assert.equal(store.runtimeCheckBoundary(task.id), "unproven");
+  const before = commands.length;
+  await assert.rejects(store.install(task.id, ["other=1"]), /execution still owns this environment/);
+  await assert.rejects(store.deleteTask(task.id), /execution still owns this environment/);
+  assert.equal(commands.length, before, "no provisioner write may run behind the fence");
+  assert.ok(store.list().some((environment) => environment.id === task.id), "the runtime is not deleted");
+
+  // A restarted process reads the same row from the ledger; package changes
+  // are still refused before any provisioner call.
+  const restarted = new EnvironmentStore({
+    allowedChannels: ["conda-forge"], enabled: true, provisionerPath,
+    root: resolve(root, "envs"), runnerVersion: "test", executionLedgerPath: ledger,
+  }, executor);
+  await restarted.initialize();
+  assert.equal(restarted.runtimeCheckBoundary(task.id), "unproven");
+  await assert.rejects(restarted.install(task.id, ["other=1"]), /execution still owns this environment/);
+  assert.equal(commands.length, before);
+
+  // Only a proven-empty boundary clears its own row; afterwards the same
+  // operation succeeds, so the fence is not a permanent block.
+  store.releaseRuntimeCheckReservation(task.id);
+  assert.equal(store.runtimeCheckBoundary(task.id), undefined);
+  assert.equal(restarted.runtimeCheckBoundary(task.id), undefined, "the durable row is gone too");
+  const installed = await store.install(task.id, ["other=1"], ["conda-forge"]);
+  assert.ok(installed.packages.some((item) => item.startsWith("other=1")));
+});
+
+test("a corrupt runtime check reservation fails closed and is never deleted", async (context) => {
+  const { executor, provisionerPath, root, commands } = await fixture(context);
+  const ledger = resolve(root, "corrupt-runtime-fences.sqlite");
+  const db = new DatabaseSync(ledger);
+  db.exec("CREATE TABLE executions (id TEXT, record TEXT); CREATE TABLE execution_resources (execution TEXT, environment TEXT)");
+  db.exec("CREATE TABLE runtime_check_reservations (environment TEXT PRIMARY KEY, record TEXT NOT NULL)");
+  db.prepare("INSERT INTO runtime_check_reservations (environment, record) VALUES (?, ?)").run("starter-python", "{");
+  db.close();
+  const store = new EnvironmentStore({
+    allowedChannels: ["conda-forge"], enabled: true, provisionerPath,
+    root: resolve(root, "envs"), runnerVersion: "test", executionLedgerPath: ledger,
+  }, executor);
+  const before = commands.length;
+  await store.initialize();
+  // A malformed row names no safe environment: a fresh bootstrap must not run
+  // a provisioner command, so the starter is never created over it.
+  assert.equal(store.runtimeCheckBoundary("starter-python"), "corrupt");
+  await assert.rejects(store.setupManagedEnvironments(), /execution still owns this environment/);
+  assert.equal(commands.length, before);
+  store.releaseRuntimeCheckReservation("starter-python");
+  assert.equal(store.runtimeCheckBoundary("starter-python"), "corrupt", "a corrupt row is not erased");
+  assert.equal(store.setup.state, "failed");
+});
+
+test("a runtime check reservation that cannot be persisted still fences this process", async (context) => {
+  const { executor, provisionerPath, root, commands } = await fixture(context);
+  // The parent does not exist, so the mutation gate itself allows changes and
+  // the durable write is the part that fails.
+  const unwritableLedger = resolve(root, "missing-ledger-directory", "ledger.sqlite");
+  const store = new EnvironmentStore({
+    allowedChannels: ["conda-forge"], enabled: true, provisionerPath,
+    root: resolve(root, "envs"), runnerVersion: "test", executionLedgerPath: unwritableLedger,
+  }, executor);
+  await store.initialize();
+  await store.setupManagedEnvironments();
+  const task = await store.createTask("runtime-check-persist-failure", "python");
+  await store.install(task.id, ["scanpy=1.10"], ["conda-forge"]);
+  const before = commands.length;
+  assert.throws(() => store.reserveRuntimeCheck(task.id, "unproven"));
+  // The durable write failed, but the in-process fence was installed first.
+  assert.equal(store.runtimeCheckBoundary(task.id), "unproven");
+  await assert.rejects(store.install(task.id, ["other=1"]), /execution still owns this environment/);
+  assert.equal(commands.length, before);
 });
 
 test("scientific environments accept micromamba's package-list envelope", async (context) => {
@@ -900,7 +1019,6 @@ test("managed provisioner selects pinned Linux and macOS releases", async (conte
   assert.deepEqual(requestedUrls, [arm64.url]);
 });
 
-
 test("runtime pip defaults to the configured mirror and explicit sources still win", async (context) => {
   const old = process.env.SCIENCE_AGENT_PYPI_INDEX;
   process.env.SCIENCE_AGENT_PYPI_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple";
@@ -984,4 +1102,57 @@ test("an offline starter-package upgrade failure no longer fails the whole setup
   assert.match(setup.message, /Starter package upgrade skipped: offline cache is missing pysocks/);
   assert.ok(store.capability.available);
   assert.ok(commands.some((command) => command[1] === "install" && command.some((argument) => argument.startsWith("pysocks"))));
+});
+
+test("runtime check environment exclusivity retains an unproven real store gate across binding aliases", async context => {
+  const { executor, provisionerPath, root, commands } = await fixture(context);
+  const ledger = resolve(root, "exclusive-runtime.sqlite");
+  const db = new DatabaseSync(ledger);
+  db.exec("CREATE TABLE executions (id TEXT, record TEXT); CREATE TABLE execution_resources (execution TEXT, environment TEXT)");
+  db.close();
+  const store = new EnvironmentStore({
+    allowedChannels: ["conda-forge"], enabled: true, provisionerPath,
+    root: resolve(root, "envs"), runnerVersion: "test", executionLedgerPath: ledger,
+  }, executor);
+  await store.initialize();
+  await store.setupManagedEnvironments();
+  const task = await store.createTask("exclusive-runtime", "python");
+  const hold = Promise.withResolvers<void>();
+  let leases = 0;
+  const revision = "0".repeat(40);
+  const service = createScienceFlowRuntimeCheckService({
+    config: loadRunnerConfig({
+      SCIENCE_AGENT_DATA_DIR: resolve(root, "probe-data"),
+      SCIENCE_AGENT_SANDBOX_PROVIDER: "bubblewrap",
+      SCIENCE_AGENT_RUNNER_TOKEN: randomBytes(24).toString("hex"),
+    }, root),
+    bindings: { bindingFor: bindingId => ({ bindingId, sourceRoot: root, expectedRevision: revision }) },
+    environmentStore: {
+      runtimeCheckBoundary: id => store.runtimeCheckBoundary(id),
+      withRuntime: (id, _operation) => store.withRuntime(id, async () => {
+        leases++;
+        await hold.promise;
+        // The real store records an unproven boundary before releasing its
+        // reader. We do not pretend a synthetic handle proves a live child.
+        store.reserveRuntimeCheck(id, "unproven");
+        throw new Error("synthetic unproven probe");
+      }),
+    },
+  });
+  const request = (bindingId: string) => ({ schemaVersion: 1 as const, requestId: bindingId, bindingId,
+    environmentId: task.id, expectedEnvironmentRevisionId: task.currentRevisionId, expectedRevision: revision });
+  const first = service.check(request("alias-a"));
+  // Yield until the real reader has entered; other aliases must never enter.
+  for (let i = 0; leases === 0 && i < 100; i++) await new Promise(done => setTimeout(done, 1));
+  const others = [service.check(request("alias-b")), service.check(request("alias-c"))];
+  try { assert.equal(leases, 1); }
+  finally { hold.resolve(); await Promise.all([first, ...others]); }
+  assert.equal(leases, 1);
+  assert.equal(store.runtimeCheckBoundary(task.id), "unproven");
+  const before = commands.length;
+  await assert.rejects(store.install(task.id, ["other=1"]), { code: "ENVIRONMENT_EXECUTION_UNVERIFIED" });
+  await assert.rejects(store.deleteTask(task.id), { code: "ENVIRONMENT_EXECUTION_UNVERIFIED" });
+  assert.equal(commands.length, before);
+  assert.equal((await service.check(request("alias-d"))).outcome, "unavailable");
+  assert.equal(leases, 1, "later aliases must not replace the unresolved owner");
 });

@@ -21,6 +21,10 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { RunnerSkillPackages } from "./skill-packages.js";
+import {
+  RunnerScienceFlowInputBundles,
+  ScienceFlowInputBundleError,
+} from "./scienceflow-input-bundles.js";
 
 import { createOperationalLogger, shortErrorMessage } from "@sciencediscovery/operational-logging";
 // [windows-desktop] Owner-only (0600) semantics go through the platform facade (win32: icacls). See #477.
@@ -33,6 +37,7 @@ import type {
   CreateNpuJobRequest,
   InstallEnvironmentRequest,
   PythonExecutionRequest,
+  RunnerExecutionBoundaryCapability,
   RunnerExecutionStatus,
   RunnerHealth,
   RunnerRuntimeStatus,
@@ -45,6 +50,7 @@ import type {
   ShellExecutionRequest,
   UninstallEnvironmentRequest,
 } from "@sciencediscovery/schema";
+import { SCIENCE_FLOW_INPUT_BUNDLE_LIMITS } from "@sciencediscovery/schema";
 
 import {
   boundedExecutionTimeoutMs,
@@ -81,6 +87,15 @@ import { SessionEnvProfileStore } from "./session-env-profile.js";
 import { ShellSessionManager } from "./shell-session-manager.js";
 import { agentExecutionKey, KeyedTaskQueue, requestAgentExecutionKey } from "./agent-execution.js";
 import { ExecutionManager, ExecutionManagerError } from "./execution-manager.js";
+import {
+  createScienceFlowRuntimeCheckService,
+  parseScienceFlowRuntimeProbeRequest,
+  type ScienceFlowRuntimeCheckService,
+} from "./scienceflow-runtime-check.js";
+import {
+  loadScienceFlowRuntimeBindings,
+  type ScienceFlowRuntimeBindings,
+} from "./scienceflow-runtime-config.js";
 import { committedWorkspaceSnapshot, publishWorkspaceFile, RefStore, streamSnapshotFile, VersionStore, withWorkspaceMutation,
   workspaceSnapshotFiles, type AgentStateRef, type SnapshotFile } from "@sciencediscovery/cas";
 import { HostNpuJobBroker } from "./npu-broker.js";
@@ -108,6 +123,8 @@ export interface RunnerConfig extends ExecutorConfig {
   npuPythonPath?: string;
   npuSmokeScriptPath?: string;
   npuWorkloadConfigPath?: string;
+  /** Admin-trusted ScienceFlow checkout declarations; absent disables checks. */
+  scienceFlowRuntimeBindings?: ScienceFlowRuntimeBindings;
 }
 
 const MAX_BODY_BYTES = 2_000_000;
@@ -132,6 +149,39 @@ const DISABLED_SCIENTIFIC_ENVS: ScientificEnvsCapability = {
   startersReady: false,
   unavailableReason: "Scientific environments are disabled by configuration",
 };
+
+/**
+ * What this Runner can actually promise about the processes one execution
+ * started. Every field is backed by the boundary implementation, never by a
+ * configuration flag: a strong claim is made only on Linux with a usable
+ * Bubblewrap sandbox, where the workload lives in its own PID namespace and the
+ * kernel can be asked whether that namespace is empty.
+ *
+ * An unsupported Runner reports the weak shape explicitly so a client treats
+ * reconnection and cancellation as unavailable rather than assuming them.
+ */
+function executionBoundaryCapability(
+  platform: NodeJS.Platform,
+  sandboxUsable: boolean,
+): RunnerExecutionBoundaryCapability {
+  if (platform === "linux" && sandboxUsable) {
+    return {
+      handle: "pid-namespace",
+      reconnect: "supported",
+      runnerDeathTerminates: "kernel",
+      escapedDescendant: "included",
+      terminationProof: "pid-namespace",
+    };
+  }
+  return {
+    handle: "none",
+    reconnect: "unsupported",
+    runnerDeathTerminates: "unmanaged",
+    escapedDescendant: "excluded",
+    terminationProof: "none",
+    reason: platform === "linux" ? "sandbox-unsupported" : "platform-unsupported",
+  };
+}
 
 function sendJson(response: ServerResponse, statusCode: number, value: unknown): void {
   if (response.destroyed || response.writableEnded) return;
@@ -398,6 +448,8 @@ export function loadRunnerConfig(env: NodeJS.ProcessEnv = process.env, cwd = rep
     scientificPackageCacheDir: env.SCIENCE_AGENT_PACKAGE_CACHE_DIR?.trim()
       ? resolve(cwd, env.SCIENCE_AGENT_PACKAGE_CACHE_DIR.trim())
       : undefined,
+    // Optional and admin-only; a malformed file fails startup.
+    scienceFlowRuntimeBindings: loadScienceFlowRuntimeBindings(env, cwd),
     shellSessionIdleMs,
   };
 }
@@ -433,6 +485,11 @@ export function createRunnerServer(
 ): Server {
   const sandbox = executorSandboxKind(config);
   const skillPackages = new RunnerSkillPackages(config.dataDir);
+  // Input evidence bundles are opaque frozen task files addressed by content.
+  // This server only stores and reports them; a fixed internal research
+  // execution (constructed elsewhere) may verify one and materialize its own
+  // read-only copy. There is still no research start route here.
+  const inputBundles = new RunnerScienceFlowInputBundles(config.dataDir);
   const logger = createOperationalLogger({ category: "runner", dataDir: config.dataDir, service: "runner" });
   const profiles = envProfiles ?? new SessionEnvProfileStore();
   const gateways = egressGateways ?? new EgressGatewayRegistry(config.dataDir, (event, detail) => {
@@ -464,6 +521,18 @@ export function createRunnerServer(
     ...await sandboxLaunchProfile(config.bwrapPath),
   });
   const executorConfig: RunnerConfig = { ...config, npuDeviceProbe: probeRequestedNpuDevices };
+  // The runtime identity check leases the selected environment and reuses the
+  // ordinary sandbox launch. It has no execution record; if a probe cannot be
+  // proven terminated it writes a reservation row into the execution ledger,
+  // which the environment mutation gate reads like an execution resource.
+  const scienceFlowRuntime: ScienceFlowRuntimeCheckService | undefined = environmentStore
+    ? createScienceFlowRuntimeCheckService({
+        config: executorConfig,
+        environmentStore,
+        bindings: config.scienceFlowRuntimeBindings,
+        onDiagnostic: (event, detail) => logger.warn(event, detail),
+      })
+    : undefined;
   const executionQueues = new KeyedTaskQueue();
   const managedExecutions = new ExecutionManager(config.dataDir, detail => {
     logger.warn("execution_resources_quarantined", { ...detail });
@@ -557,14 +626,23 @@ export function createRunnerServer(
           sendJson(response, 200, { status: "ok" });
           return;
         }
+        const executionCapability = await readiness.get();
         sendJson(response, 200, {
-          execution: await readiness.get(),
+          execution: executionCapability,
           cgroupDelegated: false,
           cgroupMode: RESOURCE_LIMIT_MODE,
           cgroupRoot: "",
           executionAuth: "bearer+hmac-sha256",
           ...managedExecutions.identity,
-          capabilities: { executionRecoveryVersion: 1 },
+          capabilities: {
+            // Version 2 adds the durable process boundary: a restarted Runner
+            // can observe and cancel a recorded execution.
+            executionRecoveryVersion: 2,
+            executionBoundary: executionBoundaryCapability(
+              process.platform,
+              executionCapability.sandboxUsable && executionCapability.sandbox === "bubblewrap",
+            ),
+          },
           executionUser,
           executionTimeoutMs: config.execTimeoutMs,
           maxFileBytes: MAX_RUNNER_FILE_BYTES,
@@ -1004,9 +1082,97 @@ export function createRunnerServer(
           return;
         }
         if (request.method === "POST" && managedMatch[2] === "cancel") {
-          sendJson(response, 202, managedExecutions.cancel(id, owner));
+          sendJson(response, 202, await managedExecutions.cancel(id, owner));
           return;
         }
+      }
+      const inputBundleMatch = /^\/scienceflow\/input-bundles\/([a-f0-9]{64})$/.exec(url.pathname);
+      if (request.method === "GET" && inputBundleMatch) {
+        // A read verifies the stored tree again and answers one fixed state:
+        // ready, missing, or corrupt. It publishes nothing and names no path.
+        try {
+          sendJson(response, 200, await inputBundles.status(inputBundleMatch[1]!));
+        } catch {
+          sendJson(response, 500, {
+            error: "ScienceFlow input bundle storage is unavailable",
+            code: "SCIENCEFLOW_INPUT_BUNDLE_UNAVAILABLE",
+          } satisfies ApiError);
+        }
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/scienceflow/input-bundles") {
+        const bytes = await readBytes(request, SCIENCE_FLOW_INPUT_BUNDLE_LIMITS.maxBodyBytes);
+        const body = bytes.toString("utf8");
+        if (!verifyExecutionSignature(config.authToken, request.headers[EXECUTION_TIMESTAMP_HEADER] as string | undefined,
+          body, request.headers[EXECUTION_SIGNATURE_HEADER] as string | undefined)) {
+          sendJson(response, 401, { error: "Invalid or expired execution signature" } satisfies ApiError);
+          return;
+        }
+        let bundle: unknown;
+        try {
+          bundle = JSON.parse(body);
+        } catch {
+          sendJson(response, 400, {
+            error: "ScienceFlow input bundle body is not valid JSON",
+            code: "SCIENCEFLOW_INPUT_BUNDLE_INVALID",
+          } satisfies ApiError);
+          return;
+        }
+        // The store re-derives the digest and every entry's bytes; the sender's
+        // claim is never taken as verification.
+        try {
+          sendJson(response, 200, await abortOnDisconnect(response, (signal) => inputBundles.put(bundle, signal)));
+        } catch (error) {
+          if (!(error instanceof ScienceFlowInputBundleError)) throw error;
+          const answer = {
+            invalid: [400, "ScienceFlow input bundle is invalid", "SCIENCEFLOW_INPUT_BUNDLE_INVALID"],
+            corrupt: [409, "Stored ScienceFlow input bundle is corrupt", "SCIENCEFLOW_INPUT_BUNDLE_CORRUPT"],
+            unavailable: [500, "ScienceFlow input bundle storage is unavailable", "SCIENCEFLOW_INPUT_BUNDLE_UNAVAILABLE"],
+          } as const;
+          const [status, message, code] = answer[error.kind];
+          sendJson(response, status, { error: message, code } satisfies ApiError);
+        }
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/scienceflow/runtime-check") {
+        const body = await readBody(request);
+        if (!verifyExecutionSignature(config.authToken, request.headers[EXECUTION_TIMESTAMP_HEADER] as string | undefined,
+          body, request.headers[EXECUTION_SIGNATURE_HEADER] as string | undefined)) {
+          sendJson(response, 401, { error: "Invalid or expired execution signature" } satisfies ApiError);
+          return;
+        }
+        // The route is off unless an administrator declared bindings; a fixed
+        // code lets the API distinguish "not configured" from a transport fault.
+        if (!scienceFlowRuntime || !config.scienceFlowRuntimeBindings) {
+          sendJson(response, 503, {
+            error: "ScienceFlow runtime identity checks are not configured on this Runner",
+            code: "SCIENCEFLOW_RUNTIME_CHECK_DISABLED",
+          } satisfies ApiError);
+          return;
+        }
+        let bodyValue: unknown;
+        try {
+          bodyValue = JSON.parse(body);
+        } catch {
+          sendJson(response, 400, { error: "ScienceFlow runtime check body is not valid JSON" } satisfies ApiError);
+          return;
+        }
+        const probe = parseScienceFlowRuntimeProbeRequest(bodyValue);
+        if (!probe) {
+          sendJson(response, 400, { error: "Invalid ScienceFlow runtime check request" } satisfies ApiError);
+          return;
+        }
+        // The binding is checked before any environment work; a request for a
+        // binding this Runner does not hold is a uniform 404.
+        if (!scienceFlowRuntime.hasBinding(probe.bindingId)) {
+          sendJson(response, 404, {
+            error: "ScienceFlow runtime binding is not configured on this Runner",
+            code: "SCIENCEFLOW_RUNTIME_BINDING_UNKNOWN",
+          } satisfies ApiError);
+          return;
+        }
+        sendJson(response, 200, await scienceFlowRuntime.check(probe));
+        return;
       }
       if (request.method === "POST" && ["/shell-executions", "/direct-shell-executions"].includes(url.pathname)) {
         const body = await readBody(request);
@@ -1028,14 +1194,14 @@ export function createRunnerServer(
         // resolution in the executor.
         if (!direct) execution.executionTimeoutMs = boundedExecutionTimeoutMs(execution.executionTimeoutMs, config.execTimeoutMs);
         execution.maxOutputBytes ??= config.maxOutputBytes;
-        const accepted = managedExecutions.submit(execution, (signal, log, expectedEnvironmentRevisionId) => direct
+        const accepted = managedExecutions.submit(execution, (signal, log, expectedEnvironmentRevisionId, lifecycle) => direct
           ? executeDirectShell(executorConfig, execution, signal, log)
           : execution.environmentId
           ? environmentStore?.withRuntime(execution.environmentId, (runtime) => {
               if (signal.aborted) throw new Error("Execution cancelled before environment admission");
-              return executeShell(executorConfig, execution, signal, undefined, gateways, runtime, log, environmentStore, expectedEnvironmentRevisionId);
+              return executeShell(executorConfig, execution, signal, undefined, gateways, runtime, log, environmentStore, expectedEnvironmentRevisionId, lifecycle);
             }) ?? Promise.reject(new Error("Scientific environments are unavailable"))
-          : executeShell(executorConfig, execution, signal, undefined, gateways, undefined, log, environmentStore, expectedEnvironmentRevisionId),
+          : executeShell(executorConfig, execution, signal, undefined, gateways, undefined, log, environmentStore, expectedEnvironmentRevisionId, lifecycle),
         direct ? undefined : async () => {
           // Admission-time check: the managed Shell may be repaired while this
           // request waits behind earlier work in the same Workspace queue. A
@@ -1182,6 +1348,7 @@ export async function startRunnerServer(config = loadRunnerConfig()): Promise<Se
   const sandbox = executorSandboxKind(config);
   const logger = createOperationalLogger({ category: "runner", dataDir: config.dataDir, service: "runner" });
   const environmentStore = new EnvironmentStore({
+    executionLedgerPath: resolve(config.dataDir, "runner-executions", "executions.sqlite"),
     allowedChannels: config.scientificAllowedChannels ?? ["conda-forge"],
     enabled: config.scientificEnvsEnabled === true,
     packageCacheDir: config.scientificPackageCacheDir,

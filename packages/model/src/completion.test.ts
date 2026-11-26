@@ -134,7 +134,7 @@ test("Messages rejects malformed canonical tool arguments and missing history ID
   for (const call of [{ id: "c", function: { name: "echo", arguments: "[]" } }, { function: { name: "echo", arguments: "{}" } }]) assert.throws(() => toAnthropicMessages([{ role: "assistant", content: "", tool_calls: [call] }]), /tool|history/i);
 });
 
-for (const protocol of protocols) test(`${protocol} refuses a missing provider tool ID and cancels unary requests`, async () => {
+for (const protocol of protocols) test(`${protocol} handles a missing provider tool ID at its protocol boundary`, async () => {
   const provider = await protocolProvider(protocol, { hang: true });
   try {
     await assert.rejects(completeChatRequest({ apiProtocol: protocol, baseUrl: provider.baseUrl, model: "s", proxy: { mode: "direct" } }, { messages: [{ role: "user", content: "s" }] }, AbortSignal.timeout(30)));
@@ -145,8 +145,24 @@ for (const protocol of protocols) test(`${protocol} refuses a missing provider t
     : { type: "content_block_start", index: 0, content_block: { type: "tool_use", name: "echo", input: {} } };
   const server = createServer(async (req, res) => { for await (const _chunk of req) {} res.writeHead(200, { "content-type": "text/event-stream" }); res.end(`data: ${JSON.stringify(frame)}\n\n`); });
   await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
-  try { await assert.rejects(streamModelTurn({ apiProtocol: protocol, baseUrl: `http://127.0.0.1:${(server.address() as any).port}`, model: "s", proxy: { mode: "direct" } }, "s", [], [], policy, AbortSignal.timeout(1000)), /omitted a tool call ID/); }
-  finally { server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); }
+  const endpoint = { apiProtocol: protocol, baseUrl: `http://127.0.0.1:${(server.address() as any).port}`, model: "s", proxy: { mode: "direct" as const } };
+  try {
+    const turn = await streamModelTurn(endpoint, "s", [], [], policy, AbortSignal.timeout(1000));
+    // Chat Completions mints a correlation id and says so; the other two
+    // protocols treat a missing provider id as unusable evidence.
+    assert.equal(protocol, "openai-chat-completions");
+    assert.equal(turn.toolCalls.length, 1);
+    assert.match(turn.toolCalls[0]!.id, /^call_[0-9a-f-]{36}$/);
+    assert.equal(turn.streamDiagnostics?.toolCallIdsSynthesized, 1);
+    // Replay carries the same id SD just recorded.
+    const wire = Array.isArray(turn.assistantMessage.tool_calls)
+      ? turn.assistantMessage.tool_calls as Array<{ id?: unknown }>
+      : [];
+    assert.equal(wire[0]?.id, turn.toolCalls[0]!.id);
+  } catch (error) {
+    assert.notEqual(protocol, "openai-chat-completions");
+    assert.match((error as Error).message, /omitted a tool call ID/);
+  } finally { server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); }
 });
 
 test("Responses replays observed text when native text-item snapshots are absent", async () => {

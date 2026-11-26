@@ -23,6 +23,7 @@ import { ResearchContinuationContext, ResearchContinuationStatus, useResearchCon
 import { markResearchCopyCreated, ResearchCopyNotice } from "./research-package/ResearchCopyNotice.js";
 import { RuntimeConfigClient } from "./CodexConfigCard.js";
 import { Fragment, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { useMcpReadiness } from "./composer/useMcpReadiness.js";
 import { ExecutionBlockCards } from "./ExecutionReadiness.js";
 import { ComputeNotice, ComputeStatus, useComputeReadiness } from "./ComputeReadiness.js";
@@ -352,6 +353,8 @@ import {
 } from "./session/run-activity.js";
 import { ProcessRecord, WorkspaceFolder } from "./ProcessRecord.js";
 import { ConversationArtifactList } from "./session/ConversationArtifactList.js";
+import { ResearchOperationPanel } from "./session/ResearchOperationPanel.js";
+import type { ResearchArtifactRef } from "./api/research-operations.js";
 import { anchorArtifactOutputs, groupArtifactOutputsByRun } from "./session/run-artifacts.js";
 import {
   clearSessionTimeline,
@@ -1459,6 +1462,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
   const [scopedSettingsErrors, setScopedSettingsErrors] = useState<string[]>([]);
   const [dragActive, setDragActive] = useState(false);
   const [isFollowingOutput, setIsFollowingOutput] = useState(true);
+  const [researchPanelTarget, setResearchPanelTarget] = useState<HTMLDivElement | null>(null);
   const [workspaceCollapsed, setWorkspaceCollapsed] = useState(() => initialView.workspaceOpen !== undefined
     ? !initialView.workspaceOpen
     : readRenamedStorageItem(localStorage, WORKSPACE_COLLAPSED_STORAGE_KEY) === "1");
@@ -2476,6 +2480,22 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
   async function refreshArtifactOutputs(sessionId: string): Promise<void> {
     const outputs = await client.listArtifactOutputs(sessionId);
     if (shouldApplySessionScopedUpdate(sessionId, activeSessionIdRef.current)) setArtifactOutputs(outputs);
+  }
+
+  /**
+   * A research run delivers after the conversation run that started it may have
+   * ended, so its artifacts can exist without a run event. The status card calls
+   * this when it observes delivery, keeping the existing artifact surfaces
+   * current without a manual reload.
+   */
+  async function refreshResearchOutputs(sessionId: string): Promise<void> {
+    const [outputs, catalog] = await Promise.all([
+      client.listArtifactOutputs(sessionId),
+      client.listArtifacts(sessionId),
+    ]);
+    if (!shouldApplySessionScopedUpdate(sessionId, activeSessionIdRef.current)) return;
+    setArtifactOutputs(outputs);
+    setArtifacts(catalog);
   }
 
   // Reviewer tasks persist independently from Agent runs. Poll only their
@@ -4483,6 +4503,30 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
     setArtifactModalName(artifact.name);
   }
 
+  /** Open a research-delivered artifact version by the business ids the card shows. */
+  function openResearchArtifact(ref: ResearchArtifactRef): void {
+    const artifact = artifacts.find((item) => item.id === ref.artifactId);
+    setArtifactModalVersion(ref.version);
+    setArtifactModalSessionId(session?.id);
+    setArtifactModalName(artifact?.name ?? ref.logicalName);
+  }
+
+  /**
+   * Prefill only. The user reviews and sends the ordinary composer request; no
+   * experiment starts from clicking a result.
+   */
+  function prefillResearchRequest(text: string): void {
+    // Never discard an unsent draft: an empty composer gets the whole request,
+    // otherwise the continuation is appended for the user to edit.
+    setMessage((current) => current.trim() ? `${current}\n\n${text}` : text);
+    requestAnimationFrame(() => {
+      const textarea = composerTextarea.current;
+      textarea?.focus();
+      const end = textarea?.value.length ?? 0;
+      textarea?.setSelectionRange(end, end);
+    });
+  }
+
   async function deleteArtifact(artifact: ScientificArtifact): Promise<void> {
     if (!activeProjectId) return;
     await client.deleteProjectArtifact(activeProjectId, artifact.id);
@@ -5684,6 +5728,16 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
                   </div> : null}
                 </div>
                 {!isFollowingOutput ? <div className="follow-output-dock"><button className="follow-output-button" type="button" onClick={scrollToLatest}>{t("app.latestActivity")} <ChevronDownIcon size={15} /></button></div> : null}
+                <ResearchOperationPanel
+                  client={client}
+                  isRunning={isRunning}
+                  onDelivered={() => { void refreshResearchOutputs(session.id).catch(() => undefined); }}
+                  onOpenArtifact={openResearchArtifact}
+                  onPrefill={prefillResearchRequest}
+                  readOnly={sessionReadOnly}
+                  renderPanel={(panel) => researchPanelTarget ? createPortal(panel, researchPanelTarget) : null}
+                  sessionId={session.id}
+                />
                 <form className={isRunning ? "composer composer-compact" : "composer"} onSubmit={(event) => void submitMessage(event)}>
                   {composerTrigger ? <ComposerReferenceMenu trigger={composerTrigger} suggestions={composerSuggestions} onSelect={selectComposerSuggestion} /> : null}
                   {evolveCommandBlocked ? <EvolveSetup client={client} status={evolveStatus} onStatus={setEvolveStatus} /> : null}
@@ -5849,6 +5903,8 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
                 <button aria-label={t("app.hideWorkspace")} className="icon-button workspace-collapse-button" onClick={() => setWorkspaceCollapsed(true)} title={t("app.hideWorkspace")} type="button"><PanelRightIcon size={15} /></button>
               </div>
             </div>
+            {/* Keep observation mounted in the conversation even when this rail is hidden. */}
+            <div ref={setResearchPanelTarget} />
 <WorkspaceFolder key={`files:${activeSessionId}`} name="files" label={t("record.files")}>
             {activeSessionId && !sessionReadOnly ? (
               <label className={dragActive ? "drop-zone active" : "drop-zone"} onDragEnter={() => setDragActive(true)} onDragLeave={() => setDragActive(false)} onDragOver={(event) => event.preventDefault()} onDrop={(event) => {

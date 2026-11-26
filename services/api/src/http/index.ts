@@ -394,6 +394,12 @@ import { configurationFramework } from "../configuration/framework.js";
 import { handleConfigurationHttp } from "../configuration/http.js";
 import { prepareNativeConnectorActivation } from "../configuration/native-activation.js";
 import { digest as configurationDigest } from "../configuration/validation.js";
+import { handleScienceFlowRunSnapshotRequest } from "../scienceflow/http.js";
+import { handleScienceFlowRegistrationRequest } from "../scienceflow/registration-http.js";
+import { handleScienceFlowExecutionPlanRequest } from "../scienceflow/execution-plan-http.js";
+import { handleScienceFlowRuntimeCheckRequest } from "../scienceflow/runtime-check-http.js";
+import { handleScienceFlowPreparedInputsRequest } from "../scienceflow/prepared-inputs-http.js";
+import { handleScienceFlowLocalResearchRequest } from "../scienceflow/local-research-http.js";
 import {
   createPlatformServices,
   initializePlatformServices,
@@ -681,6 +687,12 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
     provenanceRecorder,
     remoteCompute,
     runnerClient,
+    scienceFlowExecutionPlans,
+    scienceFlowLocalResearch,
+    scienceFlowPreparedInputs,
+    scienceFlowRegistrations,
+    scienceFlowRunSnapshot,
+    scienceFlowRuntimeChecks,
     skillCatalog,
     store,
     webBroker,
@@ -1440,6 +1452,24 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         sendError(response, 401, "Unauthorized");
         return;
       }
+      // Read-only ScienceFlow snapshot, behind the same Bearer gate as every
+      // other /api/ route and never able to widen the trusted bindings.
+      if (await handleScienceFlowRunSnapshotRequest(request, response, url, scienceFlowRunSnapshot)) return;
+      // Registrations of existing runs: metadata create/list/detail plus a
+      // snapshot read that reuses the run-snapshot route above.
+      if (await handleScienceFlowRegistrationRequest(request, response, url, scienceFlowRegistrations, scienceFlowRunSnapshot)) return;
+      // Immutable execution plans: a frozen contract, a static preflight, and
+      // stored metadata. Nothing here starts ScienceFlow or authorizes a start.
+      if (await handleScienceFlowExecutionPlanRequest(request, response, url, scienceFlowExecutionPlans)) return;
+      // Explicit input preparation: the selected Runner verifies and holds the
+      // plan's enumerated file bytes. This records evidence, not a start.
+      if (await handleScienceFlowPreparedInputsRequest(request, response, url, scienceFlowPreparedInputs)) return;
+      // Explicit runtime identity check: one plan, one administrator binding,
+      // one Runner probe. Never starts ScienceFlow and never a start gate.
+      if (await handleScienceFlowRuntimeCheckRequest(request, response, url, scienceFlowRuntimeChecks)) return;
+      // Session-scoped research status/stop for the conversation UI. It reads
+      // the same service the Agent tools use and never starts a run.
+      if (await handleScienceFlowLocalResearchRequest(request, response, url, scienceFlowLocalResearch, store)) return;
       if (request.method === "GET" && url.pathname === "/api/error-diagnostics") {
         const ids = diagnosticIds(url.searchParams);
         if (!ids) { sendError(response, 400, "Invalid diagnostic correlation id"); return; }

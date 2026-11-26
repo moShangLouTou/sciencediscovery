@@ -48,6 +48,14 @@ import {
   revisionDirectoryName,
   windowsLongPathsEnabled,
 } from "./environment-paths.js";
+import {
+  assertEnvironmentMutationAllowed,
+  deleteRuntimeCheckReservation,
+  environmentExecutionUnverifiedError,
+  readRuntimeCheckReservation,
+  writeRuntimeCheckReservation,
+  type RuntimeCheckBoundary,
+} from "./execution-resource-fences.js";
 // [windows-desktop] win-64 binary name (.exe), conda interpreter layout
 // and rename retry live in the platform adaptation layer ().
 import { environmentInterpreterPath, environmentShellPath, environmentShellUtilityPath, micromambaBinaryName, packageInstallGuidance, renameReplace, starterPackages } from "./platform/index.js";
@@ -103,6 +111,8 @@ export type ProvisionerExecutor = (
 export type ProvisionerInstaller = (destination: string) => Promise<void>;
 
 export interface EnvironmentStoreConfig {
+  /** Runner-private ledger whose resource fences also guard startup repairs. */
+  executionLedgerPath?: string;
   allowedChannels: string[];
   enabled: boolean;
   packageCacheDir?: string;
@@ -368,7 +378,11 @@ export class EnvironmentStore {
   private setupComponents: ScientificEnvironmentSetup["components"];
   private setupPromise?: Promise<ScientificEnvironmentSetup>;
   private mutationTail: Promise<void> = Promise.resolve();
-  private readonly runtimeAccess = new EnvironmentAccess();
+  private readonly runtimeAccess: EnvironmentAccess;
+  private readonly runtimeCheckReservations = new Map<string, {
+    readonly reservation: { readonly id: string; readonly boundary: RuntimeCheckBoundary };
+    record: string | null;
+  }>();
   private lastSetupError?: string;
   private starterUpgradeNotice?: string;
   private readonly proxyContext = new AsyncLocalStorage<NetworkProxy>();
@@ -384,6 +398,7 @@ export class EnvironmentStore {
     provisioner?: ProvisionerExecutor,
     provisionerInstaller?: ProvisionerInstaller,
   ) {
+    this.runtimeAccess = new EnvironmentAccess(id => this.assertMutationAllowed(id));
     this.catalogPath = resolve(config.root, "catalog.json");
     this.revisionsRoot = resolve(config.root, "revisions");
     this.snapshotsRoot = resolve(config.root, "snapshots");
@@ -953,8 +968,64 @@ export class EnvironmentStore {
     return result;
   }
 
+  private assertMutationAllowed(id: string): void {
+    // A runtime probe whose boundary is unverified fences its environment in
+    // this process even when persisting the reservation failed, so a broken
+    // ledger can only widen the gap across a Runner restart, never within it.
+    if (this.runtimeCheckReservations.has(id)) throw environmentExecutionUnverifiedError();
+    if (this.config.executionLedgerPath) assertEnvironmentMutationAllowed(this.config.executionLedgerPath, id);
+  }
+
+  /**
+   * Record that a ScienceFlow runtime probe could not prove its sandbox ended.
+   *
+   * The in-memory entry is installed first: it is what the mutation gate checks,
+   * and it must exist before the durable write can fail. The ledger row is the
+   * part a Runner restart still sees; a failed write is reported to the caller,
+   * which keeps this process fenced either way.
+   */
+  reserveRuntimeCheck(environmentId: string, boundary: RuntimeCheckBoundary): void {
+    const reservation = { boundary, id: randomUUID() };
+    const entry = { record: null as string | null, reservation };
+    this.runtimeCheckReservations.set(environmentId, entry);
+    if (!this.config.executionLedgerPath) return;
+    const written = writeRuntimeCheckReservation(this.config.executionLedgerPath, environmentId, reservation);
+    if (this.runtimeCheckReservations.get(environmentId) === entry) entry.record = written.record;
+  }
+
+  /**
+   * The boundary currently fencing one environment, from this process or from
+   * the ledger. `"corrupt"` means a row exists but cannot say which boundary it
+   * names; it still blocks, because the process may still be alive.
+   */
+  runtimeCheckBoundary(environmentId: string): RuntimeCheckBoundary | "corrupt" | undefined {
+    const local = this.runtimeCheckReservations.get(environmentId);
+    if (local) return local.reservation.boundary;
+    if (!this.config.executionLedgerPath) return undefined;
+    const stored = readRuntimeCheckReservation(this.config.executionLedgerPath, environmentId);
+    if (stored === undefined || stored === "corrupt") return stored;
+    return stored.reservation.boundary;
+  }
+
+  /**
+   * Release this environment's reservation. The caller only calls this after
+   * the boundary it read was proven empty; a row this process did not write (or
+   * could not persist) is left untouched, and a corrupt row is never deleted
+   * blindly.
+   */
+  releaseRuntimeCheckReservation(environmentId: string): void {
+    const local = this.runtimeCheckReservations.get(environmentId);
+    this.runtimeCheckReservations.delete(environmentId);
+    if (!this.config.executionLedgerPath) return;
+    const stored = readRuntimeCheckReservation(this.config.executionLedgerPath, environmentId);
+    if (stored === undefined || stored === "corrupt") return;
+    if (local && local.record !== stored.record) return;
+    deleteRuntimeCheckReservation(this.config.executionLedgerPath, environmentId, stored.record);
+  }
+
   private async bootstrapStarter(language: ScientificLanguage): Promise<void> {
     const id = `starter-${language}`;
+    this.assertMutationAllowed(id);
     const revisionId = `rev-${randomUUID()}`;
     const prefix = this.revisionPath(id, revisionId);
     const previousCatalog = structuredClone(this.catalog);
@@ -1338,6 +1409,7 @@ export class EnvironmentStore {
    * marking it failed when the upgrade cannot run (see the caller). */
   private async upgradeStarterPackages(language: ScientificLanguage, bestEffort = false): Promise<void> {
     const environment = this.requiredEnvironment(`starter-${language}`);
+    this.assertMutationAllowed(environment.id);
     const previousRevision = this.currentRevision(environment.id);
     const installedNames = new Set(previousRevision.packages
       .filter((value) => !value.includes(":"))
@@ -1391,6 +1463,10 @@ export class EnvironmentStore {
    * error is surfaced as the setup message instead and startup continues.
    * validateStarter below still gates on a prefix that cannot run Python. */
   private async upgradeStarterPackagesBestEffort(language: ScientificLanguage): Promise<void> {
+    // An unverified execution is an ownership boundary, not a transient
+    // package-download failure. Refuse before the best-effort catch so startup
+    // cannot advertise a quarantined starter as usable.
+    this.assertMutationAllowed(`starter-${language}`);
     try {
       await this.upgradeStarterPackages(language, true);
       this.starterUpgradeNotice = undefined;

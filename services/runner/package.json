@@ -19,7 +19,8 @@
     "@sciencediscovery/cas": "workspace:*",
     "@sciencediscovery/operational-logging": "workspace:*",
     "@sciencediscovery/sandbox-capability": "workspace:*",
-    "@sciencediscovery/schema": "workspace:*"
+    "@sciencediscovery/schema": "workspace:*",
+    "@sciencediscovery/scienceflow-reader": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "26.1.1",

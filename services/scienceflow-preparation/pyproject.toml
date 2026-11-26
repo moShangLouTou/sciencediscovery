@@ -1,0 +1,12 @@
+[project]
+name = "sciencediscovery-scienceflow-preparation"
+version = "0.1.0"
+description = "Narrow task-intake adapter to a ScienceFlow engine checkout."
+requires-python = ">=3.10"
+dependencies = []
+
+# Pure adapter library: no service entry point of its own. The engine and its
+# dependencies come from the administrator's pinned checkout at run time, so it
+# is intentionally NOT a member of the root uv workspace.
+[tool.uv]
+package = false

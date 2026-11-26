@@ -67,6 +67,29 @@ import { NativeWebProviderClient, WebBroker } from "@sciencediscovery/data-sourc
 import { nativeConfigurationChoiceRecord } from "../configuration/native-choices.js";
 import type { ServerConfig } from "./config.js";
 import type { PackageCapacity } from "../research-package-preflight.js";
+import {
+  createScienceFlowRunSnapshotQuery,
+  type ScienceFlowRunSnapshotService,
+} from "../scienceflow/run-snapshot.js";
+import {
+  createScienceFlowRegistrationService,
+  type ScienceFlowRegistrationService,
+} from "../scienceflow/registration.js";
+import {
+  createScienceFlowExecutionPlanService,
+  type ScienceFlowExecutionPlanService,
+} from "../scienceflow/execution-plan.js";
+import {
+  createScienceFlowRuntimeCheckService,
+  type ScienceFlowRuntimeCheckService,
+} from "../scienceflow/runtime-check.js";
+import {
+  createScienceFlowPrepareInputsService,
+  type ScienceFlowPrepareInputsService,
+} from "../scienceflow/prepared-inputs.js";
+import { createScienceFlowContractBuilder } from "../scienceflow/execution-contract.js";
+import { createLocalResearchService } from "../scienceflow/local-research.js";
+import { setLocalResearchService } from "../scienceflow/local-research-runtime.js";
 
 export interface ApiServerDependencies {
   /** Embedding/test seam: exercise governed Web tools without contacting a live search engine. */
@@ -581,6 +604,144 @@ export function createPlatformServices(
     }),
   });
 
+  const scienceFlowReader = config.scienceFlowReader;
+  // Read-only ScienceFlow access is off unless an administrator supplied a
+  // trusted binding table. Constructing the query touches no file and starts
+  // no process; a request still re-reads the Session and binding each time.
+  const scienceFlowRunSnapshot: ScienceFlowRunSnapshotService = scienceFlowReader
+    ? {
+        enabled: true,
+        query: createScienceFlowRunSnapshotQuery({
+          identities: {
+            getProject: (projectId) => store.getProject(projectId),
+            getSession: (sessionId) => store.getSession(sessionId),
+          },
+          resolveBinding: scienceFlowReader.bindingFor,
+          readerConfig: scienceFlowReader.reader,
+        }),
+      }
+    : { enabled: false };
+
+  // Registrations are control-plane metadata. The repository is read lazily
+  // because the SQLite database only opens when `initializePlatformServices`
+  // loads the store. Without a reader config `resolveBinding` is undefined, so
+  // create answers disabled while list/detail keep serving persisted metadata.
+  const scienceFlowRegistrations: ScienceFlowRegistrationService =
+    createScienceFlowRegistrationService({
+      identities: {
+        getProject: (projectId) => store.getProject(projectId),
+        getSession: (sessionId) => store.getSession(sessionId),
+      },
+      requireWritable: (sessionId) => store.assertSessionWritable(sessionId),
+      resolveBinding: scienceFlowReader?.bindingFor,
+      store: () => store.scienceFlowRegistrations,
+    });
+
+  // Execution plans are control-plane metadata too: the contract is frozen from
+  // administrator profiles and stored, but nothing is started. Without a
+  // profile config create and preflight answer disabled while list/detail keep
+  // serving persisted plans. The builder only reads bounded files.
+  const scienceFlowExecutionPlans: ScienceFlowExecutionPlanService =
+    createScienceFlowExecutionPlanService({
+      identities: {
+        getProject: (projectId) => store.getProject(projectId),
+        getSession: (sessionId) => store.getSession(sessionId),
+      },
+      requireWritable: (sessionId) => store.assertSessionWritable(sessionId),
+      profiles: config.scienceFlowExecution,
+      store: () => store.scienceFlowExecutionPlans,
+      buildContract: createScienceFlowContractBuilder(),
+    });
+
+  // Credentials and trusted host keys live in the store, so the compute client
+  // asks for them per machine instead of inheriting an ambient SSH agent or the
+  // user's known_hosts. Constructed here because the runtime identity check
+  // selects a Runner through the same client.
+  const remoteCompute = dependencies.remoteCompute ?? new RemoteComputeClient(
+    config.sshConfigPath,
+    async (hostId) => store.remoteHostSshAccess(hostId),
+    {
+      logger: apiLog,
+      // Machines on an isolated network cannot fetch the environment
+      // provisioner themselves; this installation keeps one per architecture
+      // and hands it over when it deploys their Runner.
+      provisionerCacheDir: resolve(config.dataDir, "provisioners"),
+      // A loopback proxy belongs to this host and cannot be forwarded to a remote Runner.
+      environmentProxy: () => {
+        const proxy = store.resolveProxy();
+        if (proxy.mode === "url" && isLoopback(proxy.url)) {
+          throw new Error("The global proxy uses localhost on this machine and cannot be forwarded to a remote Runner. Point the proxy at an address the remote machine can reach, or choose environment mode so the Runner uses its own proxy settings.");
+        }
+        return proxy;
+      },
+    },
+  );
+
+  // The runtime identity check is an explicit control-plane action. It asks the
+  // binding's Runner to resolve ScienceFlow from the selected environment's own
+  // interpreter and reports fixed codes. Without either administrator file the
+  // action answers disabled while stored results stay readable.
+  const scienceFlowRuntimeChecks: ScienceFlowRuntimeCheckService =
+    createScienceFlowRuntimeCheckService({
+      identities: {
+        getProject: (projectId) => store.getProject(projectId),
+        getSession: (sessionId) => store.getSession(sessionId),
+      },
+      requireWritable: (sessionId) => store.assertSessionWritable(sessionId),
+      runnerAllowed: (sessionId, runnerId) => {
+        try {
+          store.assertSessionAllowsRunner(sessionId, runnerId);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      profiles: config.scienceFlowExecution,
+      runtime: config.scienceFlowRuntime,
+      plans: () => store.scienceFlowExecutionPlans,
+      store: () => store.scienceFlowRuntimeChecks,
+      runnerFor: (runnerId) =>
+        runnerId === "local" ? runnerClient : remoteCompute.runnerClient(runnerId),
+    });
+
+  // Input preparation is the next explicit control-plane step after a plan is
+  // frozen: the selected Runner verifies and holds exactly the enumerated file
+  // bytes. It shares the same trusted profile/binding table and the same gate
+  // helper as the runtime identity check, and never starts the engine.
+  const scienceFlowPreparedInputs: ScienceFlowPrepareInputsService =
+    createScienceFlowPrepareInputsService({
+      identities: {
+        getProject: (projectId) => store.getProject(projectId),
+        getSession: (sessionId) => store.getSession(sessionId),
+      },
+      requireWritable: (sessionId) => store.assertSessionWritable(sessionId),
+      runnerAllowed: (sessionId, runnerId) => {
+        try {
+          store.assertSessionAllowsRunner(sessionId, runnerId);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      profiles: config.scienceFlowExecution,
+      runtime: config.scienceFlowRuntime,
+      plans: () => store.scienceFlowExecutionPlans,
+      store: () => store.scienceFlowPreparedInputs,
+      buildContract: createScienceFlowContractBuilder(),
+      runnerFor: (runnerId) =>
+        runnerId === "local" ? runnerClient : remoteCompute.runnerClient(runnerId),
+    });
+
+  // Experimental local research: opt-in deployment configuration, one service
+  // per process. Constructing it starts nothing; the conversation tool assembly
+  // and the Session cancel path read it through the module slot. When the mode
+  // is off the slot is cleared, so an earlier composition cannot leave a tool
+  // behind in a shared process.
+  const scienceFlowLocalResearch = config.scienceFlowLocalResearch
+    ? createLocalResearchService({ store, settings: config.scienceFlowLocalResearch })
+    : undefined;
+  setLocalResearchService(scienceFlowLocalResearch);
+
   return {
     connectorPlugins,
     artifactManager,
@@ -605,31 +766,14 @@ export function createPlatformServices(
     paperService,
     permissionDecisions: new PermissionDecisionQueue(),
     provenanceRecorder,
-    // Credentials and trusted host keys live in the store, so the compute
-    // client asks for them per machine instead of inheriting an ambient SSH
-    // agent or the user's known_hosts.
-    remoteCompute: dependencies.remoteCompute ?? new RemoteComputeClient(
-      config.sshConfigPath,
-      async (hostId) => store.remoteHostSshAccess(hostId),
-      {
-        logger: apiLog,
-        // Machines on an isolated network cannot fetch the environment
-        // provisioner themselves; this installation keeps one per architecture
-        // and hands it over when it deploys their Runner.
-        provisionerCacheDir: resolve(config.dataDir, "provisioners"),
-        // The Runner cannot reach a proxy that lives on this machine only: forwarded as-is
-        // it would aim every outbound request at itself. A loopback proxy stays local to
-        // the API process and the remote Runner keeps its own environment instead.
-        environmentProxy: () => {
-          const proxy = store.resolveProxy();
-          if (proxy.mode === "url" && isLoopback(proxy.url)) {
-            throw new Error("The global proxy uses localhost on this machine and cannot be forwarded to a remote Runner. Point the proxy at an address the remote machine can reach, or choose environment mode so the Runner uses its own proxy settings.");
-          }
-          return proxy;
-        },
-      },
-    ),
+    remoteCompute,
     runnerClient,
+    scienceFlowExecutionPlans,
+    scienceFlowLocalResearch,
+    scienceFlowPreparedInputs,
+    scienceFlowRegistrations,
+    scienceFlowRunSnapshot,
+    scienceFlowRuntimeChecks,
     skillCatalog,
     store,
     webBroker,

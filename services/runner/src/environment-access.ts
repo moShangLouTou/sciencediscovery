@@ -3,6 +3,7 @@
 
 /** FIFO readers/writer gate. A waiting update closes admission to new executions. */
 export class EnvironmentAccess {
+  constructor(private readonly beforeWrite: (id: string) => void = () => {}) {}
   private readonly states = new Map<string, {
     readers: number;
     writer: boolean;
@@ -11,7 +12,10 @@ export class EnvironmentAccess {
 
   async run<T>(id: string, write: boolean, operation: () => Promise<T>): Promise<T> {
     const release = await this.acquire(id, write);
-    try { return await operation(); } finally { release(); }
+    try {
+      if (write) this.beforeWrite(id);
+      return await operation();
+    } finally { release(); }
   }
 
   private acquire(id: string, write: boolean): Promise<() => void> {

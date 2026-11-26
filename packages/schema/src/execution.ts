@@ -3,6 +3,7 @@
 
 import type { ExecutionRecovery, RecoveryContext } from "./recovery.js";
 import type { ShellExecutionResult } from "./environment.js";
+import type { ResearchRunStatus } from "./research-run.js";
 
 export interface ExecutionOwner { sessionId: string; agentId: string }
 
@@ -39,6 +40,26 @@ export interface ExecutionObservation {
     cause?: string };
 }
 
+/**
+ * What the Runner could verify about the process boundary that owns this
+ * execution. Additive and observation-only: it never carries a host pid, path
+ * or command line, and it never changes the execution's state by itself.
+ *
+ * `not-recorded` means no durable handle exists for this record — an older
+ * ledger, a Runner that crashed between spawn and persistence, or a platform
+ * without `/proc`. It is never evidence that nothing is running.
+ */
+export interface ExecutionBoundaryStatus {
+  observedAt: string;
+  state: "alive" | "gone" | "unverifiable" | "boot-changed" | "not-recorded" | "unsupported";
+  /** True only when the whole recorded boundary was proven gone in this boot. */
+  terminationConfirmed: boolean;
+  /** Set when a cancellation was accepted and its intent was persisted. */
+  stopRequestedAt?: string;
+  reason?: "no-handle" | "handle-invalid" | "kernel-unreadable" | "identity-mismatch" | "namespace-unverified"
+    | "namespace-own" | "boot-mismatch" | "sandbox-unsupported" | "signal-refused";
+}
+
 export interface ManagedExecution extends ExecutionOwner {
   receipt?: ExecutionReceipt;
   evidence?: ExecutionEvidence;
@@ -46,10 +67,19 @@ export interface ManagedExecution extends ExecutionOwner {
   workspaceKey?: string;
   npuDevices?: number[];
   id: string;
+  /**
+   * Which workload this record owns. Absent means a shell execution, which is
+   * how every record written before research runs existed is read.
+   */
+  workload?: "shell" | "research";
+  /** Additive research projection; only a research record carries it. */
+  research?: ResearchRunStatus;
   state: "queued" | "running" | "completed" | "failed" | "cancelled" | "unknown";
   queuedAt: string;
   recovery?: ExecutionRecovery;
   recoveryContext?: RecoveryContext;
+  /** Last verified process-boundary observation; never an inferred outcome. */
+  boundary?: ExecutionBoundaryStatus;
   startedAt?: string;
   finishedAt?: string;
   result?: ShellExecutionResult;

@@ -28,6 +28,11 @@ import type {
 } from "@sciencediscovery/schema";
 
 import { EvolveApiClient } from "./evolve.js";
+import type {
+  ResearchOperation,
+  ResearchOperationsResponse,
+  ResearchStopResponse,
+} from "./research-operations.js";
 
 export class WebApiClient extends EvolveApiClient {
   startMcpAuthorization(id: string, redirectUrl: string): Promise<McpAuthorizationStart> {
@@ -91,5 +96,22 @@ export class WebApiClient extends EvolveApiClient {
 
   listConnectors(): Promise<ConnectorManifest[]> {
     return this.request("/api/connectors");
+  }
+
+  /** This Session's experimental local research operations, oldest first. */
+  listResearchOperations(sessionId: string): Promise<ResearchOperationsResponse> {
+    return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/research-operations`);
+  }
+
+  getResearchOperation(sessionId: string, operationId: string): Promise<ResearchOperation> {
+    return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/research-operations/${encodeURIComponent(operationId)}`);
+  }
+
+  stopResearchOperation(sessionId: string, operationId: string): Promise<ResearchStopResponse> {
+    return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/research-operations/${encodeURIComponent(operationId)}/stop`, { method: "POST" });
+  }
+
+  retryResearchDelivery(sessionId: string, operationId: string): Promise<ResearchOperation> {
+    return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/research-operations/${encodeURIComponent(operationId)}/delivery-retry`, { method: "POST" });
   }
 }

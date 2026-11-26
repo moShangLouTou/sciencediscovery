@@ -1,0 +1,149 @@
+From e1347021eaa497d2dc138d9e66ce36e09260568a Mon Sep 17 00:00:00 2001
+From: liyuan <liyuan390@huawei.com>
+Date: Sun, 15 Nov 2026 01:37:24 +0800
+Subject: [PATCH] feat(execution): run the engine's own child entries with a
+ safe path
+
+The prep worker, the research task worker and the report child are started
+with `-P` before `-m`, so `cwd` is never prepended to `sys.path`. A host that
+mounts the engine and names it on `PYTHONPATH` therefore gets that source; a
+`scienceflow` package left in the attempt's writable workspace cannot replace
+the entry of a process the engine started.
+
+The flag exists in every supported interpreter (`>=3.11`) and the engine's own
+command classifier already parses it. Arbitrary research shell subprocesses
+keep their current import behaviour: they are untrusted research code, not an
+engine entry point.
+---
+ .../parallel/control/reporting/__init__.py    |  4 +++
+ .../runtime/parallel/execution/subprocess.py  | 12 ++++++--
+ tests/test_managed_lifecycle.py               | 30 +++++++++++++++++++
+ tests/test_parallel_runner_prep.py            |  7 +++--
+ 4 files changed, 48 insertions(+), 5 deletions(-)
+
+diff --git a/scienceflow/runtime/parallel/control/reporting/__init__.py b/scienceflow/runtime/parallel/control/reporting/__init__.py
+index 6bbe89d..e05abf6 100644
+--- a/scienceflow/runtime/parallel/control/reporting/__init__.py
++++ b/scienceflow/runtime/parallel/control/reporting/__init__.py
+@@ -43,8 +43,12 @@ async def finalize_reports(
+     supervisor state.
+     """
+     budget = report_budget(record.get("manifest_payload") or {})
++    # ``-P`` keeps ``cwd`` out of ``sys.path``, exactly as the prep and task
++    # children do: the engine entry of this process must not be replaceable by a
++    # ``scienceflow`` package in the attempt's writable workspace.
+     process = await spawn_report_process(
+         sys.executable,
++        "-P",
+         "-m",
+         __name__,
+         record["run_id"],
+diff --git a/scienceflow/runtime/parallel/execution/subprocess.py b/scienceflow/runtime/parallel/execution/subprocess.py
+index 36121c1..b2652cf 100644
+--- a/scienceflow/runtime/parallel/execution/subprocess.py
++++ b/scienceflow/runtime/parallel/execution/subprocess.py
+@@ -22,10 +22,17 @@ from scienceflow.runtime.parallel.state.subprocess_runtime import (
+ 
+ @staticmethod
+ def child_cli_argv(spec: TaskSpec) -> list[str]:
+-    """Build child argv without exposing worker execution as a public command."""
++    """Build child argv without exposing worker execution as a public command.
++
++    ``-P`` runs the child with a safe path: ``cwd`` is not prepended to
++    ``sys.path``, so a ``scienceflow`` package left in the writable workspace
++    cannot replace the engine entry a host mounted on ``PYTHONPATH``. The flag
++    exists in every supported Python (``>=3.11``) and the engine's own command
++    classifier already understands it.
++    """
+     child_python, _child_bin = resolve_project_python()
+     if spec.phase == "prep":
+-        argv: list[str] = [child_python, "-m", "scienceflow.interfaces.cli"]
++        argv: list[str] = [child_python, "-P", "-m", "scienceflow.interfaces.cli"]
+         argv.extend(
+             [
+                 "prep",
+@@ -42,6 +49,7 @@ def child_cli_argv(spec: TaskSpec) -> list[str]:
+     else:
+         argv = [
+             child_python,
++            "-P",
+             "-m",
+             "scienceflow.runtime.parallel.execution.task_worker",
+         ]
+diff --git a/tests/test_managed_lifecycle.py b/tests/test_managed_lifecycle.py
+index ec93f81..867fb88 100644
+--- a/tests/test_managed_lifecycle.py
++++ b/tests/test_managed_lifecycle.py
+@@ -318,6 +318,36 @@ class ManagedLifecycleTest(unittest.IsolatedAsyncioTestCase):
+         self.assertEqual(record["research_status"], "stopped")
+         self.assertEqual(record["phase"], "finished")
+ 
++    async def test_the_report_child_is_launched_with_a_safe_path(self) -> None:
++        """EC6: the report child's argv starts with ``-P`` before ``-m``.
++
++        ``-P`` keeps ``cwd`` out of ``sys.path``, so a ``scienceflow`` package in
++        the attempt's writable workspace cannot become the entry of the report
++        process. The spawn is the only thing replaced here; the argv is the
++        production one.
++        """
++        from scienceflow.runtime.parallel.control import reporting
++
++        recorded: list[tuple] = []
++
++        class _Recorded(Exception):
++            pass
++
++        async def fake_spawn(*args, **_kwargs):
++            recorded.append(args)
++            raise _Recorded()
++
++        with mock.patch.object(reporting, "spawn_report_process", fake_spawn):
++            with self.assertRaises(_Recorded):
++                await reporting.finalize_reports(
++                    {"launch_token": "token", "manifest_payload": {}, "run_id": "report-argv"},
++                )
++        self.assertEqual(len(recorded), 1)
++        executable, *argv = recorded[0]
++        self.assertEqual(executable, sys.executable)
++        self.assertEqual(argv[:2], ["-P", "-m"])
++        self.assertEqual(argv[2], "scienceflow.runtime.parallel.control.reporting")
++
+     async def test_a_real_report_stop_is_incomplete_not_a_failure(self) -> None:
+         """E4 over the real finalizer: a stop keeps completed research.
+ 
+diff --git a/tests/test_parallel_runner_prep.py b/tests/test_parallel_runner_prep.py
+index d9683a5..0a502bd 100644
+--- a/tests/test_parallel_runner_prep.py
++++ b/tests/test_parallel_runner_prep.py
+@@ -834,7 +834,7 @@ def test_parallel_child_cli_argv_lnr_run_type(tmp_path) -> None:
+     assert "--resume" not in argv
+     assert "--task" not in argv
+     assert "run" not in argv
+-    assert argv[2] == "scienceflow.runtime.parallel.execution.task_worker"
++    assert argv[1:4] == ["-P", "-m", "scienceflow.runtime.parallel.execution.task_worker"]
+ 
+ 
+ def test_parallel_child_cli_uses_resolved_project_python(monkeypatch, tmp_path) -> None:
+@@ -853,8 +853,9 @@ def test_parallel_child_cli_uses_resolved_project_python(monkeypatch, tmp_path)
+         phase="run",
+     )
+     argv = ParallelRunner.child_cli_argv(spec)
+-    assert argv[:3] == [
++    assert argv[:4] == [
+         str(child_python),
++        "-P",
+         "-m",
+         "scienceflow.runtime.parallel.execution.task_worker",
+     ]
+@@ -873,7 +874,7 @@ def test_parallel_prep_keeps_the_distinct_prep_task_option(tmp_path) -> None:
+         phase="prep",
+     )
+     argv = ParallelRunner.child_cli_argv(spec)
+-    assert argv[1:4] == ["-m", "scienceflow.interfaces.cli", "prep"]
++    assert argv[1:5] == ["-P", "-m", "scienceflow.interfaces.cli", "prep"]
+     assert argv[argv.index("--task") + 1] == "prepare objective"
+ 
+ 
+-- 
+2.34.1
+

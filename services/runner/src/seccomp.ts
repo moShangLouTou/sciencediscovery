@@ -17,6 +17,7 @@ import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 const BPF_LD_W_ABS = 0x20;
+const BPF_ALU_AND_K = 0x54;
 const BPF_JMP_JEQ_K = 0x15;
 const BPF_RET_K = 0x06;
 const AUDIT_ARCH_X86_64 = 0xc000003e;
@@ -27,6 +28,39 @@ const SECCOMP_RET_KILL_PROCESS = 0x80000000;
 export const SECCOMP_BASELINE_VERSION = "multiarch-v1-profile-aware";
 /** Variant used when the Permission Epoch grants `domain-allowlist` network access. */
 export const SECCOMP_NETWORK_VERSION = "multiarch-v1-egress-gateway";
+/**
+ * Variant for the research workload: the baseline filter plus one syscall,
+ * `socketpair`, and only for `AF_UNIX`.
+ *
+ * A real `asyncio` event loop creates its self-pipe with `socket.socketpair()`,
+ * which the baseline refuses like every other socket-family call. The research
+ * workload needs that local primitive and nothing more, so the filter allows
+ * exactly that syscall, checked against its first argument: `AF_INET` and
+ * `AF_INET6` socketpairs, `socket()`, `connect()`, `bind()`, `listen()` and
+ * `accept4()` stay refused. The network variant is not used, the network
+ * namespace is still unshared, and no egress bridge is bound.
+ */
+export const SECCOMP_RESEARCH_VERSION = "multiarch-v1-research-local";
+
+/**
+ * Variant for the research workload that also needs a local TCP client and the
+ * one loopback listener of the model-gateway relay.
+ *
+ * It is the baseline profile minus the socket-family calls a loopback client
+ * needs, with the two calls that can name a *peer* checked by their scalar
+ * arguments before they are allowed:
+ *
+ * - `socket()` only for `AF_INET` + `SOCK_STREAM` (the type is masked, so
+ *   `SOCK_CLOEXEC`/`SOCK_NONBLOCK` are still accepted while datagram, raw,
+ *   `AF_UNIX`, `AF_INET6`, `AF_NETLINK` and `AF_PACKET` are refused);
+ * - `socketpair()` only for `AF_UNIX` + `SOCK_STREAM` + protocol 0.
+ *
+ * `connect`, `bind`, `listen`, `accept` and `accept4` stay allowed but
+ * unchecked: their arguments are pointers, so a filter cannot see the address.
+ * That is why the namespace is still unshared and no other interface exists —
+ * see the design note for the argument this variant depends on.
+ */
+export const SECCOMP_RESEARCH_GATEWAY_VERSION = "multiarch-v1-research-gateway";
 
 /**
  * Socket-family syscalls. The baseline denies them outright (`networkPolicy`
@@ -82,6 +116,28 @@ function instruction(code: number, jumpTrue: number, jumpFalse: number, value: n
 
 type SupportedSeccompArchitecture = keyof typeof SECCOMP_PROFILES;
 
+/**
+ * The instructions after a `JEQ <syscall>` that already matched: every
+ * argument test falls through to `EPERM` when it fails, and the block ends with
+ * `ALLOW` only when all of them passed. `mask` is applied to the loaded word so
+ * a single compare can ignore `SOCK_CLOEXEC`/`SOCK_NONBLOCK`.
+ */
+function argumentCheckBlock(
+  checks: readonly { offset: number; mask?: number; value: number }[],
+): Buffer[] {
+  const block: Buffer[] = [];
+  for (const check of checks) {
+    block.push(instruction(BPF_LD_W_ABS, 0, 0, check.offset));
+    if (check.mask !== undefined) block.push(instruction(BPF_ALU_AND_K, 0, 0, check.mask));
+    // Equal → jump over the `EPERM` and test the next argument; different →
+    // fall through into it.
+    block.push(instruction(BPF_JMP_JEQ_K, 1, 0, check.value));
+    block.push(instruction(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO_EPERM));
+  }
+  block.push(instruction(BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW));
+  return block;
+}
+
 function seccompProfile(architecture: string) {
   const profile = SECCOMP_PROFILES[architecture as SupportedSeccompArchitecture];
   if (!profile) {
@@ -94,12 +150,96 @@ function seccompProfile(architecture: string) {
  * `network` allows socket-family syscalls for the audited egress bridge.
  * `npu` allows the same calls for CANN/TE Python-module initialization, but the
  * sandbox keeps its private network namespace and receives no egress bridge.
+ * `research` allows `socketpair` for `AF_UNIX` only; see `SECCOMP_RESEARCH_VERSION`.
+ * `research-gateway` additionally allows an `AF_INET`/`SOCK_STREAM` `socket()`
+ * and `connect`/`bind`/`listen`/`accept`; see `SECCOMP_RESEARCH_GATEWAY_VERSION`.
  */
-export type SeccompVariant = "baseline" | "network" | "npu";
+export type SeccompVariant = "baseline" | "network" | "npu" | "research" | "research-gateway";
+
+/**
+ * The one syscall the research variant restores, per architecture, and the
+ * only domain it may be used with. The argument is `args[0]`, i.e. the word at
+ * offset 16 of `struct seccomp_data`.
+ */
+const RESEARCH_LOCAL_SOCKETPAIR = { arm64: 199, x64: 53 } as const;
+const AUDIT_AF_UNIX = 1;
+const AUDIT_AF_INET = 2;
+const SOCK_STREAM = 1;
+/** Low nibble of `socket(domain, type, …)`; the high bits are `SOCK_CLOEXEC`/`SOCK_NONBLOCK`. */
+const SOCK_TYPE_MASK = 0x0f;
+const SEE_DATA_ARG0 = 16;
+const SEE_DATA_ARG1 = 24;
+const SEE_DATA_ARG2 = 32;
+
+/**
+ * The two calls the research-gateway variant allows only for the pairs of
+ * arguments a loopback client and a self-connected stream pair need. Each entry
+ * states, per argument, the word offset in `struct seccomp_data` and the value
+ * the argument must equal (`mask` selects the bits compared).
+ *
+ * The order matters only in that a non-matching syscall has to reach the deny
+ * list below: every check either jumps over the whole block for a different
+ * syscall number, or falls through to `EPERM` for a matching number with a
+ * wrong argument, never to the block that follows.
+ */
+const RESEARCH_GATEWAY_ARGUMENT_CHECKS: Record<SupportedSeccompArchitecture, readonly {
+  syscall: number;
+  checks: readonly { offset: number; mask?: number; value: number }[];
+}[]> = {
+  arm64: [
+    { syscall: 198, checks: [{ offset: SEE_DATA_ARG0, value: AUDIT_AF_INET }, { offset: SEE_DATA_ARG1, mask: SOCK_TYPE_MASK, value: SOCK_STREAM }] },
+    {
+      syscall: 199,
+      checks: [
+        { offset: SEE_DATA_ARG0, value: AUDIT_AF_UNIX },
+        { offset: SEE_DATA_ARG1, mask: SOCK_TYPE_MASK, value: SOCK_STREAM },
+        { offset: SEE_DATA_ARG2, value: 0 },
+      ],
+    },
+  ],
+  x64: [
+    { syscall: 41, checks: [{ offset: SEE_DATA_ARG0, value: AUDIT_AF_INET }, { offset: SEE_DATA_ARG1, mask: SOCK_TYPE_MASK, value: SOCK_STREAM }] },
+    {
+      syscall: 53,
+      checks: [
+        { offset: SEE_DATA_ARG0, value: AUDIT_AF_UNIX },
+        { offset: SEE_DATA_ARG1, mask: SOCK_TYPE_MASK, value: SOCK_STREAM },
+        { offset: SEE_DATA_ARG2, value: 0 },
+      ],
+    },
+  ],
+};
+
+/**
+ * Calls whose arguments are pointers, so the filter cannot see where they
+ * point. They are allowed so a loopback client works, and the no-bypass argument
+ * rests on the namespace having no route and on no socket being able to name a
+ * host Unix peer (see `seccomp.ts` header and the gateway design).
+ */
+const RESEARCH_GATEWAY_ALLOWED_UNCHECKED = {
+  arm64: [200, 201, 202, 203, 242],
+  x64: [42, 43, 49, 50, 288],
+} as const;
 
 function deniedSyscalls(architecture: string, variant: SeccompVariant): readonly number[] {
   const profile = seccompProfile(architecture);
   if (variant === "baseline") return profile.deniedSyscalls;
+  if (variant === "research") {
+    // The research filter is the baseline minus exactly one syscall. It must
+    // never take the network list: that would open the whole socket family.
+    const local = RESEARCH_LOCAL_SOCKETPAIR[architecture as SupportedSeccompArchitecture];
+    return profile.deniedSyscalls.filter((syscall) => syscall !== local);
+  }
+  if (variant === "research-gateway") {
+    // Every call this variant re-admits is either argument-checked in its own
+    // block or is one of the unchecked loopback calls above.
+    const architectureKey = architecture as SupportedSeccompArchitecture;
+    const readmitted = new Set<number>([
+      ...RESEARCH_GATEWAY_ARGUMENT_CHECKS[architectureKey].map((entry) => entry.syscall),
+      ...RESEARCH_GATEWAY_ALLOWED_UNCHECKED[architectureKey],
+    ]);
+    return profile.deniedSyscalls.filter((syscall) => !readmitted.has(syscall));
+  }
   const allowed = new Set<number>(NETWORK_SYSCALLS[architecture as SupportedSeccompArchitecture]);
   return profile.deniedSyscalls.filter((syscall) => !allowed.has(syscall));
 }
@@ -115,6 +255,30 @@ export function baselineSeccompFilter(
     instruction(BPF_RET_K, 0, 0, SECCOMP_RET_KILL_PROCESS),
     instruction(BPF_LD_W_ABS, 0, 0, 0),
   ];
+  if (variant === "research") {
+    // Allow `socketpair` and nothing else in the socket family, and only when
+    // its domain argument is `AF_UNIX`. The four-instruction block is skipped
+    // wholesale for every other syscall, so the argument load only runs for
+    // the one syscall it describes. A non-`AF_UNIX` domain falls through to
+    // the same `EPERM` the baseline always returned.
+    instructions.push(
+      instruction(BPF_JMP_JEQ_K, 0, 4, RESEARCH_LOCAL_SOCKETPAIR[architecture as SupportedSeccompArchitecture]),
+      instruction(BPF_LD_W_ABS, 0, 0, SEE_DATA_ARG0),
+      instruction(BPF_JMP_JEQ_K, 0, 1, AUDIT_AF_UNIX),
+      instruction(BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW),
+      instruction(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO_EPERM),
+    );
+  }
+  if (variant === "research-gateway") {
+    // `socket()` and the argument-checked `socketpair()`. Both blocks come
+    // before the deny list, and each one's first instruction jumps over the
+    // whole block for any other syscall number, so a syscall that does not
+    // match falls through to the same denials (or the final `ALLOW`) as before.
+    for (const entry of RESEARCH_GATEWAY_ARGUMENT_CHECKS[architecture as SupportedSeccompArchitecture]) {
+      const block = argumentCheckBlock(entry.checks);
+      instructions.push(instruction(BPF_JMP_JEQ_K, 0, block.length, entry.syscall), ...block);
+    }
+  }
   for (const syscall of deniedSyscalls(architecture, variant)) {
     instructions.push(
       instruction(BPF_JMP_JEQ_K, 0, 1, syscall),

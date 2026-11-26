@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "engine": "scienceflow",
+  "baseRevision": "0ef229de1ae126ea04387ce74ae94ffacc437df6",
+  "patchedRevision": "e1347021eaa497d2dc138d9e66ce36e09260568a",
+  "patchedTree": "f1f1567e17946e7d3d1c5fefe66ef811e24b7078",
+  "patches": [
+    {
+      "path": "0001-feat-control-prepare-a-managed-run-without-spawning-.patch",
+      "sha256": "02eafdbb1eb34a066ce8e5a54aeb265fe90d14b7bef24174bb84bed00556ae30"
+    },
+    {
+      "path": "0002-test-control-cover-prepare-only-arming-adoption-stop.patch",
+      "sha256": "df1fe154d974e4c499c46c4d2d774c3da75f1b063050071fd10cb254d6148580"
+    },
+    {
+      "path": "0003-fix-control-tell-a-reporting-stop-apart-from-a-repor.patch",
+      "sha256": "35f3445df67c24e9cfbbe6a1ace6e58492322e7a530db19d89135cc450f84728"
+    },
+    {
+      "path": "0004-feat-execution-run-the-engine-s-own-child-entries-with.patch",
+      "sha256": "b0330a17e9e0e42c0d194755f0c70122eb44e2154585ae826844bf8a9cf4938e"
+    }
+  ]
+}

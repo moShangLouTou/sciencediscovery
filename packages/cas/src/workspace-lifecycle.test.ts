@@ -10,7 +10,34 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { VersionStore } from "./versioning.js";
 import { withWorkspaceMutation } from "./workspace-lease.js";
-import { withWorkspaceAdmission, withWorkspaceRetirement } from "./workspace-lifecycle.js";
+import { fenceWorkspaceExecution, releaseWorkspaceExecutionFence, withWorkspaceAdmission, withWorkspaceRetirement } from "./workspace-lifecycle.js";
+
+test("execution fences survive lease release and refuse mutation and parent retirement", async t => {
+  const data = await mkdtemp(join(tmpdir(), "execution-fence-"));
+  t.after(() => rm(data, { recursive: true, force: true }));
+  const root = join(data, "session", "workspace");
+  await mkdir(root, { recursive: true });
+  const versions = new VersionStore(data);
+  await withWorkspaceAdmission(versions, root, async () => {
+    await fenceWorkspaceExecution(versions, root, "execution");
+    await withWorkspaceAdmission(versions, root, async () => {});
+  });
+  const reopened = new VersionStore(data);
+  await assert.rejects(withWorkspaceMutation(reopened, root, async () => assert.fail("unverified writer admitted"),
+    { kind: "upload" }), { code: "WORKSPACE_EXECUTION_UNVERIFIED" });
+  await releaseWorkspaceExecutionFence(reopened, root, "another-owner");
+  await assert.rejects(withWorkspaceAdmission(reopened, root, async () => {}), { code: "WORKSPACE_EXECUTION_UNVERIFIED" });
+  await releaseWorkspaceExecutionFence(reopened, root, "execution");
+  await withWorkspaceAdmission(reopened, root, async () => {});
+  await fenceWorkspaceExecution(reopened, root, "execution");
+  await assert.rejects(withWorkspaceRetirement(reopened, [join(data, "session")], "delete", async () => {
+    assert.fail("unverified workspace deleted");
+  }), { code: "WORKSPACE_EXECUTION_UNVERIFIED" });
+  await assert.rejects(withWorkspaceAdmission(reopened, root, async () => {}), { code: "WORKSPACE_EXECUTION_UNVERIFIED" });
+  await releaseWorkspaceExecutionFence(reopened, root, "execution");
+  // A refused deletion did not leave an unrelated retirement fence behind.
+  await withWorkspaceAdmission(reopened, root, async () => {});
+});
 
 test("retirement drains admitted writes, rejects queued/new writes and keeps unrelated roots parallel", async (t) => {
   const data = await mkdtemp(join(tmpdir(), "lifecycle-"));

@@ -33,6 +33,23 @@ import {
   DEFAULT_WORKSPACE_UPLOAD_MAX_REQUEST_BYTES,
   type WorkspaceUploadLimits,
 } from "../workspace-upload.js";
+import {
+  loadScienceFlowReaderConfig,
+  type ScienceFlowReaderSettings,
+} from "../scienceflow/config.js";
+import {
+  loadScienceFlowExecutionConfig,
+  type ScienceFlowExecutionSettings,
+} from "../scienceflow/execution-config.js";
+import {
+  loadScienceFlowRuntimeConfig,
+  SCIENCE_FLOW_RUNTIME_CONFIG_ENV,
+  type ScienceFlowRuntimeSettings,
+} from "../scienceflow/runtime-config.js";
+import {
+  loadScienceFlowLocalResearchConfig,
+  type ScienceFlowLocalResearchSettings,
+} from "../scienceflow/local-research-config.js";
 
 export interface ServerConfig {
   authToken: string;
@@ -89,6 +106,30 @@ export interface ServerConfig {
    * what a config built by hand — every test config — wants.
    */
   sampleSession?: boolean;
+  /**
+   * Admin-trusted binding table for the read-only ScienceFlow snapshot route.
+   * Absent when `SCIENCE_AGENT_SCIENCEFLOW_READER_CONFIG_PATH` is unset; the
+   * route then answers 503 without reading anything.
+   */
+  scienceFlowReader?: ScienceFlowReaderSettings;
+  /**
+   * Admin-trusted execution profiles for the plan routes. Absent when
+   * `SCIENCE_AGENT_SCIENCEFLOW_EXECUTION_CONFIG_PATH` is unset; create and
+   * preflight then answer 503 while stored plans stay readable.
+   */
+  scienceFlowExecution?: ScienceFlowExecutionSettings;
+  /**
+   * Admin-trusted runtime bindings for the explicit ScienceFlow identity check.
+   * Absent when `SCIENCE_AGENT_SCIENCEFLOW_RUNTIME_CONFIG_PATH` is unset; the
+   * check then answers 503 while stored results stay readable.
+   */
+  scienceFlowRuntime?: ScienceFlowRuntimeSettings;
+  /**
+   * Admin-trusted profile for the experimental local research mode. Absent when
+   * `SCIENCE_AGENT_SCIENCEFLOW_LOCAL_RESEARCH_CONFIG_PATH` is unset or the file
+   * is disabled; no research tool is then exposed and no engine run can start.
+   */
+  scienceFlowLocalResearch?: ScienceFlowLocalResearchSettings;
   usageExchangeRates?: {
     enabled: boolean;
     sourceUrl: string;
@@ -140,6 +181,28 @@ function parseBooleanFlag(value: string | undefined, fallback: boolean): boolean
   if (["1", "true", "yes", "on"].includes(normalized)) return true;
   if (["0", "false", "no", "off"].includes(normalized)) return false;
   throw new Error("Boolean environment flags must be one of true/false, yes/no, on/off, or 1/0");
+}
+
+/**
+ * Every profile that opts into the runtime identity check must name a binding
+ * the runtime configuration actually defines. The message is static: it names
+ * the file, never a profile or a binding id.
+ */
+function assertRuntimeBindingsExist(
+  execution: ScienceFlowExecutionSettings | undefined,
+  runtime: ScienceFlowRuntimeSettings | undefined,
+): void {
+  if (execution === undefined) return;
+  const missing = execution.profiles.some(
+    (profile) =>
+      profile.runtimeBindingId !== undefined &&
+      runtime?.has(profile.runtimeBindingId) !== true,
+  );
+  if (missing) {
+    throw new Error(
+      `${SCIENCE_FLOW_RUNTIME_CONFIG_ENV}: every profile runtimeBindingId must name a configured binding`,
+    );
+  }
 }
 
 export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
@@ -220,6 +283,22 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
   // installation generated on its first start", never a value an attacker could
   // guess from the source tree.
   const authToken = resolveBootstrapToken(dataDir, AUTH_TOKEN_FILE, env.SCIENCE_AGENT_AUTH_TOKEN);
+  // Loaded once at construction: an invalid file stops the server instead of
+  // leaving a partially trusted binding table in service. Unset means off.
+  const scienceFlowReader = loadScienceFlowReaderConfig(env, repositoryRoot);
+  // Independent of the reader: a server may serve plans, existing-run
+  // snapshots, both, or neither. Also loaded once, so a change needs a restart.
+  const scienceFlowExecution = loadScienceFlowExecutionConfig(env, repositoryRoot);
+  // The runtime binding table is separate from the execution profiles: a profile
+  // opts into the identity check by naming one binding. A profile that names a
+  // binding this file does not define is a configuration error for the whole
+  // server, never a silently unchecked plan.
+  const scienceFlowRuntime = loadScienceFlowRuntimeConfig(env, repositoryRoot);
+  assertRuntimeBindingsExist(scienceFlowExecution, scienceFlowRuntime);
+  // The experimental local research mode is opt-in and independent of the
+  // read-only/planning configuration above. Unset or `"enabled": false` exposes
+  // no research tool and can start no engine process from a conversation.
+  const scienceFlowLocalResearch = loadScienceFlowLocalResearchConfig(env, repositoryRoot);
   return {
     authToken: authToken.token,
     authTokenSource: authToken.source,
@@ -246,6 +325,10 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
     runnerToken: env.SCIENCE_AGENT_RUNNER_TOKEN?.trim() || "sciencediscovery-runner-local",
     runnerUrl: env.SCIENCE_AGENT_RUNNER_URL?.trim().replace(/\/$/, "") || "http://127.0.0.1:4311",
     sampleSession: parseBooleanFlag(env.SCIENCE_AGENT_SAMPLE_SESSION, true),
+    ...(scienceFlowReader === undefined ? {} : { scienceFlowReader }),
+    ...(scienceFlowExecution === undefined ? {} : { scienceFlowExecution }),
+    ...(scienceFlowRuntime === undefined ? {} : { scienceFlowRuntime }),
+    ...(scienceFlowLocalResearch === undefined ? {} : { scienceFlowLocalResearch }),
     sshConfigPath: resolve(env.SCIENCE_AGENT_SSH_CONFIG_PATH?.trim() || resolve(homedir(), ".ssh/config")),
     staticDir: resolve(repositoryRoot, env.SCIENCE_AGENT_WEB_DIR?.trim() || "apps/web/dist"),
     workspaceUpload: {

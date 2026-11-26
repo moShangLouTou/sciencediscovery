@@ -31,8 +31,34 @@ async function registry(versions: VersionStore) {
   const db = new DatabaseSync(toNamespacedPath(join(directory, "registry.sqlite")));
   db.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;
     CREATE TABLE IF NOT EXISTS roots (path TEXT PRIMARY KEY);
-    CREATE TABLE IF NOT EXISTS fences (scope TEXT PRIMARY KEY, owner TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending');`);
+    CREATE TABLE IF NOT EXISTS fences (scope TEXT PRIMARY KEY, owner TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending');
+    CREATE TABLE IF NOT EXISTS execution_fences (path TEXT NOT NULL, owner TEXT NOT NULL, PRIMARY KEY(path, owner));`);
   return { db, directory };
+}
+
+function assertExecutionOpen(db: DatabaseSync, paths: string[]) {
+  if (db.prepare("SELECT path FROM execution_fences").all().some(row =>
+    paths.some(path => within(path, String(row.path)) || within(String(row.path), path)))) {
+    throw Object.assign(new Error("Workspace has unverified process state; recover its execution before writing or deleting"),
+      { code: "WORKSPACE_EXECUTION_UNVERIFIED" });
+  }
+}
+
+/** Install before spawn while holding admission. This survives both process
+ * loss and normal lease release; it is distinct from deletion or CAS failure. */
+export async function fenceWorkspaceExecution(versions: VersionStore, root: string, owner: string): Promise<void> {
+  const path = await canonicalWorkspacePath(root);
+  const { db } = await registry(versions);
+  try { db.prepare("INSERT OR IGNORE INTO execution_fences VALUES (?, ?)").run(path, owner); }
+  finally { db.close(); }
+}
+
+/** Only the publisher which proved process termination may release its fence. */
+export async function releaseWorkspaceExecutionFence(versions: VersionStore, root: string, owner: string): Promise<void> {
+  const path = await canonicalWorkspacePath(root);
+  const { db } = await registry(versions);
+  try { db.prepare("DELETE FROM execution_fences WHERE path = ? AND owner = ?").run(path, owner); }
+  finally { db.close(); }
 }
 
 function assertOpen(db: DatabaseSync, path: string) {
@@ -85,6 +111,7 @@ export async function withWorkspaceAdmission<T>(versions: VersionStore, root: st
     return await locked(directory, path, async () => {
       // Deletion may have closed admission while this writer was queued.
       assertOpen(db, path);
+      assertExecutionOpen(db, [path]);
       return action();
     }, signal, onBusy);
   } finally { db.close(); }
@@ -109,13 +136,16 @@ export async function withWorkspaceRetirement<T>(versions: VersionStore, scopes:
     return await locked(directory, `retirement:${owner}`, async () => {
       db.exec("BEGIN IMMEDIATE");
       let roots: string[];
+      const addedFences: string[] = [];
       try {
         const fences = db.prepare("SELECT scope, owner, state FROM fences").all();
         if (fences.some((row) => row.owner !== owner && row.state !== "retired"
           && paths.some((path) => within(path, String(row.scope)) || within(String(row.scope), path)))) {
           throw new Error("An overlapping Workspace deletion is already in progress");
         }
-        for (const path of paths) db.prepare("INSERT OR IGNORE INTO fences (scope, owner) VALUES (?, ?)").run(path, owner);
+        for (const path of paths) {
+          if (db.prepare("INSERT OR IGNORE INTO fences (scope, owner) VALUES (?, ?)").run(path, owner).changes) addedFences.push(path);
+        }
         roots = db.prepare("SELECT path FROM roots ORDER BY path").all().map((row) => String(row.path))
           .filter((root) => paths.some((scope) => within(root, scope)));
         db.exec("COMMIT");
@@ -128,8 +158,17 @@ export async function withWorkspaceRetirement<T>(versions: VersionStore, scopes:
         roots = [...new Set([...roots, ...discovered])].sort();
       }
       let reopen = false;
-      const enter = (index: number): Promise<T> => index === roots.length
-        ? action(roots, () => { reopen = true; }) : locked(directory, roots[index]!, () => enter(index + 1));
+      const enter = (index: number): Promise<T> => {
+        if (index < roots.length) return locked(directory, roots[index]!, () => enter(index + 1));
+        try { assertExecutionOpen(db, paths); }
+        catch (error) {
+          // No deletion action began. Undo only fences installed by this call,
+          // never an older recovery journal's pending retirement.
+          for (const path of addedFences) db.prepare("DELETE FROM fences WHERE scope = ? AND owner = ?").run(path, owner);
+          throw error;
+        }
+        return action(roots, () => { reopen = true; });
+      };
       try {
         const result = await enter(0);
         if (!reopen) db.prepare("UPDATE fences SET state = 'retired' WHERE owner = ?").run(owner);
