@@ -262,4 +262,3 @@ async function settled(
   // means the kernel never named the boundary: neither is a proof.
   return { handle: "unproven", status: "termination-unverified" };
 }
-
