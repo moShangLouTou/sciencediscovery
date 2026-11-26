@@ -535,14 +535,15 @@ test("a start under an already cancelled conversation creates nothing", async (c
 test("cancellation between acceptance and the worker records a stop instead of launching", async (context) => {
   const target = await fixture(context);
   const calls = { count: 0 };
-  let statusChecks = 0;
   const service = serviceFor(target, {
     launch: completedLaunch(context, calls),
     // The start sees a live conversation; by the time the background worker
     // re-checks, the user has cancelled it.
     ownerRunStatus: async () => {
-      statusChecks += 1;
-      return statusChecks === 1 ? "running" : "cancelled";
+      // Cancellation occurs after the operation is durably accepted, regardless
+      // of how many admission checks run before the worker.
+      return target.store.scienceFlowResearchOperations.listForSession(target.projectId, target.sessionId).length === 0
+        ? "running" : "cancelled";
     },
   });
   await service.start({

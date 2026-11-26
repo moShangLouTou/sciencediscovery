@@ -322,12 +322,13 @@ test("a fake non-ScienceFlow adapter runs the shared lifecycle", async (context)
 test("a cancelled conversation stops before the fake engine launches", async (context) => {
   const target = await fixture(context);
   const { adapter, calls } = fakeEngine();
-  let checks = 0;
   const service = serviceFor(target, adapter, {
     // The start sees a live conversation; the background worker sees a cancel.
     ownerRunStatus: async () => {
-      checks += 1;
-      return checks === 1 ? "running" : "cancelled";
+      // Cancellation occurs after the operation is durably accepted, regardless
+      // of how many admission checks run before the worker.
+      return target.store.scienceFlowResearchOperations.listForSession(target.projectId, target.sessionId).length === 0
+        ? "running" : "cancelled";
     },
   });
   await service.start(startInput(target));

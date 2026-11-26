@@ -1016,54 +1016,65 @@ test("observation records the evaluator package the engine actually registered",
   });
 });
 
-test("slow preparation tightens the launch grant to the line deadline instead of crossing it", async (context) => {
-  const target = await fixture(context);
-  const plan = await publishArtifact(target, "experiment_plan.md", Buffer.from("# plan\n", "utf8"), "other", "text/markdown");
-  await mkdir(join(target.root, "seed"), { recursive: true });
-  let clock = Date.parse("2026-11-16T10:00:00.000Z");
-  let reads = 0;
-  const launches: Array<{ totalAllowanceSec: number }> = [];
-  const settings = {
-    ...settingsFor(target, { maxChildRuns: 5, totalAllowanceSec: 1_000 }),
-    defaults: { ...settingsFor(target).defaults, reportBudgetSec: 60, researchBudgetSec: 240, totalAllowanceSec: 900 },
-    dynamicInputs: { incumbent: "start_solution.json", incumbentOptional: true, plan: "experiment_plan.md" },
-    inputMode: "dynamic" as const,
-    taskTemplate: "Read {{plan_file}} ({{plan_version_id}}). Intent: {{research_intent}}",
-  };
-  const service = createLocalResearchService({ settings, store: target.store }, {
-    deliver: async () => ({ outcome: { failedStep: "readback", message: "stub", status: "failed" } } as unknown as ScienceFlowResultDeliveryRecord),
-    launch: async (input) => {
-      launches.push({ totalAllowanceSec: input.totalAllowanceSec });
-      return completedLaunch({ count: 0 })(input);
-    },
-    now: () => new Date(clock).toISOString(),
-    readArtifactBytes: async (hash) => {
-      const bytes = await new CasStore(target.store.dataDir).read(hash);
-      reads += 1;
-      // The first read verifies the named plan at start; the second is the
-      // asynchronous staging copy, where a real preparation delay occurs.
-      if (reads === 2) clock += 150_000;
-      return bytes;
-    },
-    readEngineIdentity: async () => ({ dirty: false, revision: ENGINE_REVISION, statusDigest: "s".repeat(64) }),
-    readExecutionEnvironment: async () => ({ arch: "x86_64", fingerprint: "e".repeat(64), platform: "linux", python: "3.12.12" }),
+for (const delaySec of [150, 950, 1001]) {
+  test(`preparation taking ${delaySec}s respects shared allowance and SF minimums`, async (context) => {
+    const target = await fixture(context);
+    const plan = await publishArtifact(target, "experiment_plan.md", Buffer.from("# plan\n", "utf8"), "other", "text/markdown");
+    await mkdir(join(target.root, "seed"), { recursive: true });
+    let clock = Date.parse("2026-11-16T10:00:00.000Z");
+    let reads = 0;
+    const launches: Array<{ totalAllowanceSec: number }> = [];
+    const settings = {
+      ...settingsFor(target, { maxChildRuns: 5, totalAllowanceSec: 1_000 }),
+      defaults: { ...settingsFor(target).defaults, reportBudgetSec: 60, researchBudgetSec: 240, totalAllowanceSec: 900 },
+      dynamicInputs: { incumbent: "start_solution.json", incumbentOptional: true, plan: "experiment_plan.md" },
+      inputMode: "dynamic" as const,
+      taskTemplate: "Read {{plan_file}} ({{plan_version_id}}). Intent: {{research_intent}}",
+    };
+    const service = createLocalResearchService({ settings, store: target.store }, {
+      deliver: async () => ({ outcome: { failedStep: "readback", message: "stub", status: "failed" } } as unknown as ScienceFlowResultDeliveryRecord),
+      launch: async (input) => {
+        launches.push({ totalAllowanceSec: input.totalAllowanceSec });
+        return completedLaunch({ count: 0 })(input);
+      },
+      now: () => new Date(clock).toISOString(),
+      readArtifactBytes: async (hash) => {
+        const bytes = await new CasStore(target.store.dataDir).read(hash);
+        reads += 1;
+        // The first read verifies the named plan at start; the second is the
+        // asynchronous staging copy, where a real preparation delay occurs.
+        if (reads === 2) clock += delaySec * 1_000;
+        return bytes;
+      },
+      readEngineIdentity: async () => ({ dirty: false, revision: ENGINE_REVISION, statusDigest: "s".repeat(64) }),
+      readExecutionEnvironment: async () => ({ arch: "x86_64", fingerprint: "e".repeat(64), platform: "linux", python: "3.12.12" }),
+    });
+    const started = await service.start({
+      intent: "A bounded run whose preparation is slow.",
+      ownerRunId: "conversation-run-1",
+      planVersionId: plan.versionId,
+      projectId: target.projectId,
+      sessionId: target.sessionId,
+    });
+    const deadline = Date.now() + 3_000;
+    while (launches.length === 0
+      && target.store.scienceFlowResearchOperations.get(started.operation.operationId)?.state !== "failed"
+      && Date.now() < deadline) {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+    }
+    const record = target.store.scienceFlowResearchOperations.get(started.operation.operationId)!;
+    if (delaySec === 150) {
+      assert.equal(launches.length, 1, JSON.stringify({ error: record.error, state: record.state }));
+      assert.equal(launches[0]!.totalAllowanceSec, 850);
+      assert.equal(record.launch.grant.totalAllowanceSec, 850);
+    } else {
+      assert.equal(launches.length, 0);
+      assert.equal(record.state, "failed");
+      assert.equal(record.error?.step, "budget");
+      assert.match(record.error?.message ?? "", delaySec === 950 ? /at least 60s/ : /exhausted during preparation/);
+    }
   });
-  const started = await service.start({
-    intent: "A bounded run whose preparation is slow.",
-    ownerRunId: "conversation-run-1",
-    planVersionId: plan.versionId,
-    projectId: target.projectId,
-    sessionId: target.sessionId,
-  });
-  const deadline = Date.now() + 3_000;
-  while (launches.length === 0 && Date.now() < deadline) {
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
-  }
-  const record = target.store.scienceFlowResearchOperations.get(started.operation.operationId)!;
-  assert.equal(launches.length, 1, JSON.stringify({ error: record.error, state: record.state }));
-  assert.equal(launches[0]!.totalAllowanceSec, 850);
-  assert.equal(record.launch.grant.totalAllowanceSec, 850);
-});
+}
 
 test("a stop recorded during preparation prevents the launch and leaves the run stopped", async (context) => {
   const target = await fixture(context);

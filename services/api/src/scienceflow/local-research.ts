@@ -63,10 +63,7 @@ import {
   type ResearchStartPlan,
 } from "../research/task-service.js";
 import type { ResearchBudgetLine } from "../research/budget.js";
-import {
-  createScienceFlowEngineAdapter,
-  type ScienceFlowDeadlineVerdict,
-} from "./engine-adapter.js";
+import { createScienceFlowEngineAdapter } from "./engine-adapter.js";
 import {
   deliverScienceFlowResult,
   type ScienceFlowResultDeliveryRecord,
@@ -688,63 +685,6 @@ export function createLocalResearchService(input: {
     }
   };
 
-  /**
-   * The last check before a launch. Staging and task materialisation are
-   * asynchronous, so the reservation that fit at `start` may no longer fit
-   * before the line's deadline. This either passes, tightens the frozen grant
-   * to the remaining wall clock, or refuses the launch.
-   */
-  const lineDeadlineVerdict = (
-    record: ScienceFlowLocalResearchOperation,
-  ): ScienceFlowDeadlineVerdict => {
-    const groupId = researchGroupId(record);
-    const projected = projectResearchParent({
-      contract: researchContractIdentity(record),
-      existing: parents().get(record.identity.projectId, record.identity.sessionId, groupId),
-      groupId,
-      identity: record.identity,
-      limits: settings.parentBudget,
-      now: now(),
-      operations: groupOperations(record.identity.projectId, record.identity.sessionId, groupId),
-    });
-    if (projected.limits === null) return { kind: "ok" };
-    const deadlineMs = Date.parse(projected.limits.deadlineAt);
-    const nowMs = Date.parse(now());
-    const remainingSec = Number.isFinite(deadlineMs) && Number.isFinite(nowMs)
-      ? (deadlineMs - nowMs) / 1_000
-      : 0;
-    if (remainingSec <= 0) {
-      return {
-        kind: "refused",
-        message: `The research line deadline (${projected.limits.deadlineAt}) passed while this run was preparing; it was not launched`,
-      };
-    }
-    const grant = record.launch.grant;
-    if (remainingSec >= grant.totalAllowanceSec) return { kind: "ok" };
-    const totalAllowanceSec = Math.floor(remainingSec);
-    // The pilot's own floor is 60s total, 30s research and 10s report. Below
-    // those it cannot start a meaningful run at all, so refuse instead of
-    // silently granting a different budget.
-    if (totalAllowanceSec < 60) {
-      return {
-        kind: "refused",
-        message: `The research line has ${totalAllowanceSec}s before its deadline; a launch needs at least 60s`,
-      };
-    }
-    const reportBudgetSec = Math.min(grant.reportBudgetSec, Math.max(10, totalAllowanceSec - 30));
-    const researchBudgetSec = Math.min(grant.researchBudgetSec, totalAllowanceSec - reportBudgetSec);
-    if (researchBudgetSec < 30) {
-      return {
-        kind: "refused",
-        message: `The research line has ${totalAllowanceSec}s before its deadline; the engine's research/report minimums do not fit`,
-      };
-    }
-    return {
-      grant: { ...grant, reportBudgetSec, researchBudgetSec, totalAllowanceSec },
-      kind: "tighten",
-    };
-  };
-
   const parentViewFor = (
     record: ScienceFlowLocalResearchOperation,
     contract: Parameters<typeof projectResearchParent>[0]["contract"],
@@ -783,17 +723,7 @@ export function createLocalResearchService(input: {
 
   /** The absolute parent-line deadline, when this deployment configured one. */
   const lineDeadlineFor = (record: ScienceFlowLocalResearchOperation): string | undefined => {
-    const groupId = researchGroupId(record);
-    const projected = projectResearchParent({
-      contract: researchContractIdentity(record),
-      existing: parents().get(record.identity.projectId, record.identity.sessionId, groupId),
-      groupId,
-      identity: record.identity,
-      limits: settings.parentBudget,
-      now: now(),
-      operations: groupOperations(record.identity.projectId, record.identity.sessionId, groupId),
-    });
-    return projected.limits?.deadlineAt;
+    return parents().get(record.identity.projectId, record.identity.sessionId, researchGroupId(record))?.limits?.deadlineAt;
   };
 
   const nextInstruction = (record: ScienceFlowLocalResearchOperation): string => {
@@ -1069,22 +999,13 @@ export function createLocalResearchService(input: {
   };
 
   // ScienceFlow is one concrete engine behind the shared operation lifecycle.
-  // The adapter owns every engine call; this service owns acceptance, task
-  // contracts, result comparison and research-line budgets.
+  // The adapter owns engine calls and domain minimums. Product hooks supply
+  // task contracts and comparisons to the shared task/budget service.
   const engineAdapter = dependencies.adapter ?? createScienceFlowEngineAdapter({
     deadlineFor: lineDeadlineFor,
-    deadlineVerdict: lineDeadlineVerdict,
     deliver,
     now,
     ownerStopped,
-    persistLineAfterTighten: (record) => {
-      persistParent(
-        researchContractIdentity(record),
-        researchGroupId(record),
-        record.identity,
-        groupOperations(record.identity.projectId, record.identity.sessionId, researchGroupId(record)),
-      );
-    },
     readArtifactBytes,
     ...(dependencies.launch ? { launch: dependencies.launch } : {}),
     ...(dependencies.readSnapshot ? { readSnapshot: dependencies.readSnapshot } : {}),

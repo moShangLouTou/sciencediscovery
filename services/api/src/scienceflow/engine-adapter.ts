@@ -46,6 +46,7 @@ import type {
   ResearchEngineBeforeLaunch,
   ResearchEngineInspection,
   ResearchEngineLaunch,
+  ResearchEngineLaunchBudget,
   ResearchEngineObservation,
   ResearchEnginePreparation,
   ResearchLifecycleTransitions,
@@ -70,7 +71,6 @@ import {
   type ScienceFlowLocalResearchArtifactRef,
   type ScienceFlowLocalResearchDelivery,
   type ScienceFlowLocalResearchEngineFacts,
-  type ScienceFlowLocalResearchGrant,
   type ScienceFlowLocalResearchOperation,
   type ScienceFlowLocalResearchStage,
   type ScienceFlowLocalResearchState,
@@ -104,12 +104,6 @@ export type ScienceFlowResultDelivery = (
   dependencies: { readonly now?: () => string },
 ) => Promise<ScienceFlowResultDeliveryRecord>;
 
-/** The research-line budget verdict the lifecycle asks for before a launch. */
-export type ScienceFlowDeadlineVerdict =
-  | { readonly kind: "ok" }
-  | { readonly kind: "refused"; readonly message: string }
-  | { readonly kind: "tighten"; readonly grant: ScienceFlowLocalResearchGrant };
-
 export interface ScienceFlowEngineAdapterInput {
   readonly store: LocalResearchServiceStore;
   readonly settings: ScienceFlowLocalResearchSettings;
@@ -120,10 +114,6 @@ export interface ScienceFlowEngineAdapterInput {
   readonly ownerStopped: (sessionId: string, runId: string) => Promise<boolean>;
   /** The absolute research-line deadline for this operation, when configured. */
   readonly deadlineFor: (record: ScienceFlowLocalResearchOperation) => string | undefined;
-  /** The last budget verdict before a launch; SF research-line policy stays outside. */
-  readonly deadlineVerdict: (record: ScienceFlowLocalResearchOperation) => ScienceFlowDeadlineVerdict;
-  /** Persist the line projection after the grant was tightened to its deadline. */
-  readonly persistLineAfterTighten: (record: ScienceFlowLocalResearchOperation) => void;
   /** The real detached-supervisor launcher; tests substitute one. */
   readonly launch?: ResearchPilotLauncher;
   /** Passed to the existing snapshot query during readback; tests substitute one. */
@@ -691,20 +681,25 @@ export function createScienceFlowEngineAdapter(
     beforeLaunch(
       record: ScienceFlowLocalResearchOperation,
       writer: ResearchOperationWriter<ScienceFlowLocalResearchOperation>,
+      budget?: ResearchEngineLaunchBudget,
     ): ResearchEngineBeforeLaunch<ScienceFlowLocalResearchOperation> {
-      const verdict = input.deadlineVerdict(record);
-      if (verdict.kind === "refused") {
-        return { record, refusal: { message: verdict.message, step: "budget" } };
+      const grant = record.launch.grant;
+      const totalAllowanceSec = budget?.allowanceSec ?? grant.totalAllowanceSec;
+      if (totalAllowanceSec >= grant.totalAllowanceSec) {
+        return { record, appliedAllowanceSec: grant.totalAllowanceSec };
       }
-      if (verdict.kind === "tighten") {
-        const tightened = writer.mutate(record.operationId, (current) => ({
-          ...current,
-          launch: { ...current.launch, grant: verdict.grant },
-        }));
-        input.persistLineAfterTighten(tightened);
-        return { record: tightened };
-      }
-      return { record };
+      // Only the engine-specific minimums and research/report split belong here.
+      // The shared service computes the line's deadline and remaining allowance.
+      if (totalAllowanceSec < 60) return { record, refusal: { step: "budget",
+        message: `The research line has ${totalAllowanceSec}s before its deadline; a launch needs at least 60s` } };
+      const reportBudgetSec = Math.min(grant.reportBudgetSec, Math.max(10, totalAllowanceSec - 30));
+      const researchBudgetSec = Math.min(grant.researchBudgetSec, totalAllowanceSec - reportBudgetSec);
+      if (researchBudgetSec < 30) return { record, refusal: { step: "budget",
+        message: `The research line has ${totalAllowanceSec}s before its deadline; the engine's research/report minimums do not fit` } };
+      const tightened = writer.mutate(record.operationId, (current) => ({ ...current,
+        launch: { ...current.launch, grant: { ...grant, reportBudgetSec, researchBudgetSec, totalAllowanceSec } },
+      }));
+      return { record: tightened, appliedAllowanceSec: totalAllowanceSec };
     },
 
     async launch(

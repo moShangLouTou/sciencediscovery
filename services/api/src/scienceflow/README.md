@@ -143,8 +143,10 @@ Session's SD model, validates the profile, task and input versions, builds the
 proposal and lease, and returns the record; `lineFactsFor` supplies the frozen
 contract group. Task catalog/preparation, proposals, evaluator identity,
 comparison groups, best/selected candidates and continuation rules stay in
-`local-research.ts`. Budget/deadline callbacks connect that policy to the
-adapter and lifecycle, while the reservation mechanism itself is shared.
+`local-research.ts`. The shared service refreshes admission facts after planning
+and recomputes the remaining allowance/deadline after preparation. The SF
+adapter applies that cap to its frozen grant, keeping only its 60-second total
+minimum and research/report split. It does not compute platform budget policy.
 
 `engine-adapter.ts` owns dynamic input staging, prepared-task assets, the model
 freeze check, Python pilot launch, receipt and engine-record reads, stop calls
