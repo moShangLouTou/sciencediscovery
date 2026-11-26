@@ -176,11 +176,13 @@ read path). Wire them as follows:
 The shared service does not provide engine installation, credential
 distribution, model selection, a sandbox, remote authentication, a proof-signing
 system, or a general model proxy. Those stay with the product or its execution
-boundary. The worker, preparation-abort and delivery locks are process-local; a
-deployment with several API processes needs additional coordination in its
-scheduler or store. The session cancel path must call `cancelOwnerRun`; the
-service does not observe conversation state by itself unless the product
-supplies an `ownerStopped` reader.
+boundary. The worker, preparation-abort, delivery locks and the budget
+reservation are process-local: reservations are checked and written without an
+intervening await, which is atomic within one API process, but a deployment with
+several API processes must serialize starts for a line in its store or
+scheduler. The session cancel path must call `cancelOwnerRun`; the service does
+not observe conversation state by itself unless the product supplies an
+`ownerStopped` reader.
 
 ## Verify an integration
 
