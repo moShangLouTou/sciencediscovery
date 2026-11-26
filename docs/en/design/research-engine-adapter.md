@@ -31,6 +31,80 @@ code, configuration, model profile or data layout. A product that has no
 ScienceFlow code can use them directly; the repository keeps that boundary
 under test (`research/architecture.test.ts`).
 
+## Shared Runner execution path
+
+Runner is part of the shared execution platform. A product using a local
+sandboxed program does not implement its own execution manager, input store,
+process supervisor, recovery ledger, phase scheduler or result transport.
+
+`createRunnerServer({ ...config, researchWorkloads: [...] })` registers trusted
+`ResearchRunWiring` definitions. A fixed program uses `workloadId` and `program`;
+a program needing engine preparation supplies a `ResearchWorkloadAdapter`.
+The registry rejects duplicate workload IDs and refuses unregistered IDs before
+creating an execution. Registrations are trusted host configuration: an API
+request cannot supply a program, arbitrary mount or executable configuration.
+
+The signed Runner protocol is:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /research/input-bundles` | Validate and atomically store immutable input bytes |
+| `GET /research/input-bundles/:digest` | Read verified input manifest identity |
+| `POST /research-executions` | Submit a registered workload using a durable execution ID |
+| `GET /research-executions/:id` | Observe the managed execution |
+| `POST /research-executions/:id/cancel` | Request termination through the execution manager |
+| `GET /research-executions/:id/files?path=...` | Read verified bytes from the committed result snapshot |
+
+Requests use the existing Runner MAC and owner checks. The existing
+`shell-executions` observation/cancel aliases access the same managed ledger;
+the SDK can use those aliases for research executions. Files are read from
+`execution.result.workspaceSnapshot`, never from the mutable live workspace.
+
+`RunnerClient.prepareResearchInputBundle`, `submitResearchExecution` and
+`readResearchExecutionFile` implement this protocol. API products can use
+`research/runner-engine-adapter.ts:createRunnerTaskEngine` rather than writing
+the transport themselves. Its `RunnerTaskRecord` freezes the request, exact
+Session input artifact versions and intended outputs. The adapter verifies CAS
+bytes before upload, persists the execution handle before submission, maps the
+remaining budget into Runner's phase schedule, observes termination, and
+publishes committed outputs using the shared artifact publisher. A lost launch
+response leaves an observable handle; delivery retry reuses that execution.
+The joint `runner-task-service.test.ts` exercises this path with an ordinary
+fact file and a fixed proof program, without an external research product.
+
+`research-input-bundle.ts` defines product-neutral file roles and integrity
+limits. Products may impose stricter role policies through an injected
+`ResearchInputBundleProtocol`. Shared Runner code owns descriptor-safe storage,
+private copy, sandbox mounts, phase/stop supervision, termination evidence,
+resource fences, recovery and CAS snapshot publication. An engine adapter owns
+engine checkout verification, engine-specific arguments and evidence parsing.
+Engine evidence can use an `engineId` and `engineRunId` without fabricating
+another product's revision metadata. Legacy evidence records remain readable.
+
+## Shared persistence and preparation
+
+`ResearchBudgetRepository` provides a concrete validated SQLite budget store.
+`ResearchScopeRepository` and `ResearchEventRepository` supply durable scoped
+records and append-only preparation/usage events with product codecs. Their
+table and legacy column configuration lets existing integrations retain their
+stored JSON and identities. `observeResearchPreparation` records timing and
+failure with unknown duration kept distinct from measured zero. Plan version
+publication is in `research/plan-publication.ts`, separate from output-content
+reuse because publishing against a stale plan head must fail.
+
+`research/execution-instance-backend.ts` and `execution-instance-store.ts`
+provide the explicit host-process boundary and its durable records. This is a
+separate execution choice with host-level isolation; selecting the sandboxed
+Runner never silently falls back to it. Moving this implementation into the
+shared directory does not change an existing product's runtime selection.
+
+The task service checks and reserves deadlines before launch; Runner's phase
+clock begins when the sandbox process starts. This is not an absolute deadline
+watchdog across distributed preparation and transport. Token hard caps require
+engine support; a reservation alone does not enforce token consumption. Budget
+reservation remains serialized within one task-service process, not a distributed
+multi-writer transaction.
+
 ## Request admission and deduplication
 
 The shared service performs these steps in order, and a product cannot skip
