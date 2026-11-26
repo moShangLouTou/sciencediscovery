@@ -16,7 +16,7 @@ import { randomUUID } from "node:crypto";
 import { hostname, userInfo } from "node:os";
 import { constants } from "node:fs/promises";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import type { Readable } from "node:stream";
+import type { Readable, Stream } from "node:stream";
 import { access, mkdir, mkdtemp, open, readdir, realpath, rm, stat, writeFile, type FileHandle } from "node:fs/promises";
 import { dirname, delimiter, isAbsolute, relative, resolve, sep } from "node:path";
 
@@ -25,6 +25,15 @@ import {
   procMountArguments,
   type SandboxProcMode,
 } from "@sciencediscovery/sandbox-capability";
+import {
+  DEFAULT_BOUNDARY_KILL_GRACE_MS,
+  DEFAULT_BOUNDARY_TERM_GRACE_MS,
+  captureExecutionBoundaryOutcome,
+  terminateExecutionBoundary,
+  type ExecutionLifecycle,
+} from "./execution-boundary.js";
+import { cleanupExecutionResource, ProcessTerminationUnverifiedError } from "./termination-resources.js";
+export { ProcessTerminationUnverifiedError } from "./termination-resources.js";
 import {
   SANDBOX_SKILL_EXTENSIONS_ROOT,
   SANDBOX_SKILL_PACKAGES_ROOT,
@@ -123,6 +132,11 @@ export interface SandboxRuntimeConfig {
   /** macOS Seatbelt launcher. */
   seatbeltPath?: string;
   dataDir: string;
+  /**
+   * Bound on observing a process's terminal event after its own exit or after
+   * a kill. Tests shorten it; production uses DEFAULT_TERMINATION_GRACE_MS.
+   */
+  terminationGraceMs?: number;
 }
 
 export interface ExecutorConfig extends SandboxRuntimeConfig {
@@ -141,11 +155,6 @@ export interface ExecutorConfig extends SandboxRuntimeConfig {
   maxWorkspaceBytes: number;
   /** Combined stdout+stderr retain budget; 0 disables truncation. */
   maxOutputBytes: number;
-  /**
-   * Bound on observing a process's terminal event after its own exit or after
-   * a kill. Tests shorten it; production uses DEFAULT_TERMINATION_GRACE_MS.
-   */
-  terminationGraceMs?: number;
   /**
    * [windows-desktop] operator-authorized workspace roots (in addition to
    * the data dir's projects/remote-workspaces) accepted by the workspace
@@ -629,16 +638,7 @@ function localPythonPackageBindArguments(packagePath: string | undefined): strin
  * still be writing to the workspace, so its terminal state cannot be claimed:
  * callers must quarantine the workspace instead of publishing a snapshot.
  */
-export class ProcessTerminationUnverifiedError extends Error {
-  readonly code = "PROCESS_TERMINATION_UNVERIFIED";
-
-  constructor(message: string) {
-    super(message);
-    this.name = "ProcessTerminationUnverifiedError";
-  }
-}
-
-async function runSandboxed(
+export async function runSandboxed(
   config: ExecutorConfig,
   launch: SandboxLaunch,
   commandArguments: string[],
@@ -651,8 +651,17 @@ async function runSandboxed(
   maxOutputBytes: number,
   seccompVariant: SeccompVariant = "baseline",
   onOutput?: (stream: "stdout" | "stderr", chunk: Buffer) => void,
-  spawnProcess = () => spawnSandboxProcess(config, launch, commandArguments, seccompVariant, config.closeSeccompFilter),
+  /**
+   * Receives the just-spawned monitor synchronously, inside the spawn call —
+   * before the first await — so a durable identity can be captured in the only
+   * window where the process is guaranteed to still be the one that was
+   * created. A custom `spawnProcess` may decline to call it; callers must then
+   * treat the execution as having no durable handle.
+   */
+  onSpawned?: (child: ChildProcessWithoutNullStreams, sandbox: SandboxKind) => void,
+  spawnProcess = () => spawnSandboxProcess(config, launch, commandArguments, seccompVariant, config.closeSeccompFilter, onSpawned),
 ): Promise<{ exitCode: number; stderr: string; stdout: string }> {
+  let failure: unknown;
   try {
     return await new Promise<{ exitCode: number; stderr: string; stdout: string }>((resolveRun, reject) => {
       let child: ChildProcessWithoutNullStreams | undefined;
@@ -698,7 +707,8 @@ async function runSandboxed(
           if (settled) return;
           if (child && (child.exitCode !== null || child.signalCode !== null)) settleExited();
           else finish(new ProcessTerminationUnverifiedError(
-            `${timeoutLabel} could not be verified as terminated after cancellation`));
+            `${timeoutLabel} could not be verified as terminated after cancellation`,
+            child ? { termination: sandboxTerminationProof(child, launch.sandbox ?? executorSandboxKind(config)) } : undefined));
         }, graceMs);
       };
       // Do not release a writer or clean up its mounts until the process has exited.
@@ -786,8 +796,11 @@ async function runSandboxed(
         child.stdin.end(stdin);
       }).catch((error: Error) => finish(error));
     });
+  } catch (error) {
+    failure = error;
+    throw error;
   } finally {
-    await launch.cleanup?.().catch(() => undefined);
+    await cleanupSandboxLaunch(launch, failure);
   }
 }
 
@@ -826,6 +839,52 @@ export interface SandboxEgress {
   env: Record<string, string>;
   /** Seatbelt permits only this runner-owned loopback port. */
   proxyPort?: number;
+}
+
+/** Fixed sandbox path the research workload's engine source is mounted at. */
+export const RESEARCH_ENGINE_MOUNT = "/research-engine";
+/**
+ * The checkout's own `.venv`, when the host has one. It is masked by an empty
+ * tmpfs so `resolve_project_python()` cannot pick a source-side interpreter.
+ */
+export const RESEARCH_ENGINE_VENV_MASK = `${RESEARCH_ENGINE_MOUNT}/.venv`;
+
+/**
+ * The research source layout: the trusted checkout at a fixed sandbox path,
+ * with the checkout's `.venv` optionally masked. Internal and test-facing; no
+ * request, environment profile or product route selects it. It exists so the
+ * research-layout proof can mount exactly what a managed run would.
+ */
+export interface SandboxResearchEngine {
+  /** Host path of the trusted checkout; absolute and never the root. */
+  readonly sourceRoot: string;
+  /** Trusted product mount; never read from a request. */
+  readonly mountPath?: string;
+  /**
+   * Mask `<sourceRoot>/.venv` with an empty tmpfs so the interpreter walk in
+   * `resolve_project_python()` cannot pick a source-side interpreter.
+   *
+   * The mask is applied **only when the host checkout really has a `.venv`
+   * directory**. That is a measured constraint, not a preference: bubblewrap
+   * refuses to create the mount point of a `--tmpfs` inside a read-only bind —
+   * `bwrap: Can't create file /research-engine/.venv: Read-only file
+   * system` — so masking an absent directory would fail the whole launch. A
+   * checkout without `.venv` needs no mask, because the walk already falls back
+   * to `sys.executable`; a `.venv` that is not a directory is refused rather
+   * than approximated.
+   */
+  readonly maskVirtualEnv?: boolean;
+}
+
+/**
+ * Everything a launch needs when a fixed relay process runs as the sandbox
+ * entrypoint and executes the real argv as its own child. The binds are host
+ * paths at fixed sandbox locations; the prefix never contains a caller-chosen
+ * program.
+ */
+export interface SandboxTunnel {
+  bindArgs: string[];
+  commandPrefix: string[];
 }
 
 /**
@@ -923,11 +982,39 @@ export function buildSandboxLaunch(options: {
   pathEnv: string;
   procMode: SandboxProcMode;
   pythonPathEnv?: string;
+  /**
+   * Extra host paths bound read-only at their own location. Only an internal
+   * caller may pass one (the product runtime check binds the trusted
+   * checkout this way); it is never derived from a request field.
+   */
+  readOnlyHostBinds?: readonly string[];
+  /** Research source layout; see `SandboxResearchEngine`. */
+  researchEngine?: SandboxResearchEngine;
   skillRoots?: SandboxSkillRoots;
+  /**
+   * The fixed entry prefix and its read-only mounts when the launch runs a
+   * relay that then executes the real argv as its child. Internal and
+   * test-facing in this round: the research model tunnel is its only caller and
+   * no request can select it. A launch that also uses the egress bridge is
+   * refused, because two entry prefixes would both have to fork the workload.
+   */
+  tunnel?: SandboxTunnel;
   workspaceBindArgs: string[];
 }): SandboxLaunch {
+  if (options.tunnel && options.egress) {
+    // Both would be an entry prefix that forks the workload; only one process
+    // can be the sandbox entrypoint that execs the real argv.
+    throw new Error("A sandbox launch cannot run both the egress bridge and the model tunnel relay");
+  }
   // Runner-owned baseline first; profile variables never override it
   // (profileKeyAllowed re-checks the reserved/blocked policy defensively).
+  if (options.researchEngine) {
+    const { sourceRoot, mountPath } = options.researchEngine;
+    if (mountPath !== undefined && !/^\/[A-Za-z0-9_-]+$/.test(mountPath)) throw new TypeError("Invalid engine mount");
+    if (!isAbsolute(sourceRoot) || sourceRoot.includes("\0") || sourceRoot === "/") {
+      throw new TypeError("researchEngine.sourceRoot must be an absolute non-root path");
+    }
+  }
   // Ascend host tools such as npu-smi ship in /usr/local/bin, which `/usr` is
   // bound into the sandbox but the ordinary PATH omits; expose it only when
   // the launch carries NPUs so non-NPU sandboxes stay byte-for-byte unchanged.
@@ -977,7 +1064,20 @@ export function buildSandboxLaunch(options: {
       ...options.hostInterpreterMasks,
       "--tmpfs", "/tmp",
       ...options.environmentBinds,
+      // Extra read-only host paths (this round: the trusted product
+      // checkout only). Mounted at their own path so an interpreter inside the
+      // sandbox resolves exactly the `sys.path` a future execution would see.
+      ...(options.readOnlyHostBinds ?? []).flatMap((path) => ["--ro-bind", path, path]),
+      ...(options.researchEngine
+        ? [
+            "--ro-bind", options.researchEngine.sourceRoot, options.researchEngine.mountPath ?? RESEARCH_ENGINE_MOUNT,
+            // An empty tmpfs over the checkout's `.venv`: the host directory is
+            // not exposed, and the interpreter walk cannot resolve into it.
+            ...(options.researchEngine.maskVirtualEnv ? ["--tmpfs", `${options.researchEngine.mountPath ?? RESEARCH_ENGINE_MOUNT}/.venv`] : []),
+          ]
+        : []),
       ...(options.egress?.bindArgs ?? []),
+      ...(options.tunnel?.bindArgs ?? []),
       ...options.workspaceBindArgs,
       ...(options.skillRoots ? [
         "--ro-bind", options.skillRoots.packagesRoot, SANDBOX_SKILL_PACKAGES_ROOT,
@@ -989,7 +1089,7 @@ export function buildSandboxLaunch(options: {
       "--seccomp", "3",
     ],
     chdir: options.chdir,
-    commandPrefix: options.egress?.commandPrefix ?? [],
+    commandPrefix: options.tunnel?.commandPrefix ?? options.egress?.commandPrefix ?? [],
     env,
     sandbox: "bubblewrap",
   };
@@ -1093,8 +1193,14 @@ export interface PreparedSandboxOptions {
   npu?: SandboxNpu;
   pathEnv: string;
   pythonPathEnv?: string;
+  /** Extra read-only host paths; see `buildSandboxLaunch`. */
+  readOnlyHostBinds?: readonly string[];
+  /** Research source layout; see `SandboxResearchEngine`. */
+  researchEngine?: SandboxResearchEngine;
   readOnlyWorkspaceRoot?: string;
   skillRoots?: SandboxSkillRoots;
+  /** See `buildSandboxLaunch`; bubblewrap only. */
+  tunnel?: SandboxTunnel;
   workspaceBindArgs: string[];
   workspaceRoot: string;
 }
@@ -1157,16 +1263,73 @@ function buildDirectLaunch(options: {
   };
 }
 
+/**
+ * Decide, against the host, whether the `.venv` mask can and must be applied.
+ *
+ * bubblewrap cannot create a mount point inside the read-only source bind, so a
+ * `--tmpfs` whose target is absent fails the launch with `Read-only file
+ * system`. The mask is therefore emitted only when the checkout really carries a
+ * `.venv` directory; anything else at that path, or an unreadable one, is a
+ * refusal rather than a silently different interpreter.
+ */
+async function resolvedResearchEngine(
+  engine: SandboxResearchEngine,
+): Promise<SandboxResearchEngine> {
+  const { sourceRoot } = engine;
+  let kind: "absent" | "directory" | "other";
+  try {
+    kind = (await stat(resolve(sourceRoot, ".venv"))).isDirectory() ? "directory" : "other";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    kind = "absent";
+  }
+  if (kind === "other") {
+    throw new Error("The research checkout's .venv is not a directory and cannot be masked");
+  }
+  return {
+    maskVirtualEnv: engine.maskVirtualEnv === true && kind === "directory",
+    sourceRoot,
+    ...(engine.mountPath === undefined ? {} : { mountPath: engine.mountPath }),
+  };
+}
+
 /** Build one platform-neutral launch used by ephemeral and persistent tools. */
 export async function prepareSandboxLaunch(
   config: SandboxRuntimeConfig,
   options: PreparedSandboxOptions,
 ): Promise<SandboxLaunch> {
-  if (executorSandboxKind(config) === "seatbelt") {
-    return await buildSeatbeltLaunch(config, { ...options, readPaths: options.environmentPaths });
+  // Internal option, but still refuse something that cannot be a safe mount
+  // source: the root would shadow the whole sandbox, and /workspace or the
+  // environment prefix are mounts this launcher already owns.
+  for (const path of options.readOnlyHostBinds ?? []) {
+    if (typeof path !== "string" || !isAbsolute(path) || path.includes("\0") || path === "/"
+      || path === "/workspace") {
+      throw new TypeError("readOnlyHostBinds must be absolute non-root paths");
+    }
   }
+  if (executorSandboxKind(config) === "seatbelt") {
+    if (options.tunnel) {
+      // The tunnel is a bubblewrap descriptor hand-off; Seatbelt has no proven
+      // analogue, and silently dropping the entry prefix would run the workload
+      // without its transport.
+      throw new Error("A model tunnel relay launch requires the bubblewrap sandbox");
+    }
+    if (options.researchEngine) {
+      // The fixed research mount path is a bubblewrap mount; Seatbelt maps host
+      // paths instead and has no equivalent, so refuse rather than approximate.
+      throw new Error("A research source layout requires the bubblewrap sandbox");
+    }
+    return await buildSeatbeltLaunch(config, {
+      ...options,
+      readPaths: [...options.environmentPaths, ...(options.readOnlyHostBinds ?? [])],
+    });
+  }
+  const researchEngine = options.researchEngine
+    ? await resolvedResearchEngine(options.researchEngine)
+    : undefined;
   const launch = buildSandboxLaunch({
     ...options,
+    researchEngine,
     ...await sandboxLaunchProfile(config.bwrapPath),
   });
   launch.executable = config.bwrapPath;
@@ -1270,6 +1433,115 @@ export function killSandboxProcess(child: ChildProcessWithoutNullStreams): boole
   }
 }
 
+/** Wait, bounded, for a killed process to emit its terminal event. */
+const childTerminals = new WeakMap<ChildProcessWithoutNullStreams, Promise<void>>();
+
+/** Subscribe in the spawn turn, including to error: supervision can fail
+ * before the ordinary executor has received the child and installed handlers. */
+function ownSandboxChild(child: ChildProcessWithoutNullStreams): void {
+  childTerminals.set(child, new Promise<void>(done => {
+    child.once("exit", () => done());
+    child.once("close", () => done());
+    child.on("error", () => { if (!child.pid) done(); });
+  }));
+}
+
+async function sandboxTerminationProof(child: ChildProcessWithoutNullStreams, sandbox: SandboxKind): Promise<void> {
+  if (child.exitCode === null && child.signalCode === null) {
+    const terminal = childTerminals.get(child);
+    if (!terminal) throw new Error("The sandbox terminal event is not owned");
+    await terminal;
+  }
+  if (sandbox === "bubblewrap" && child.pid) {
+    // An owned terminal event plus a kernel read proving this monitor ended
+    // has the same namespace-init teardown guarantee as ended-at-spawn.
+    const outcome = captureExecutionBoundaryOutcome(`joined:${child.pid}`,
+      { pid: child.pid, kind: "pid-namespace", sandbox });
+    if (outcome.status !== "ended") throw new Error("The joined sandbox boundary is still unverified");
+  }
+}
+
+const launchCleanups = new WeakMap<SandboxLaunch, () => Promise<void>>();
+async function cleanupSandboxLaunch(launch: SandboxLaunch, error: unknown): Promise<void> {
+  if (!launch.cleanup) return;
+  let cleanup = launchCleanups.get(launch);
+  if (!cleanup) {
+    const action = launch.cleanup;
+    let result: Promise<void> | undefined;
+    cleanup = () => result ??= Promise.resolve().then(action);
+    launchCleanups.set(launch, cleanup);
+  }
+  await cleanupExecutionResource(error, cleanup, "sandbox-launch");
+}
+
+async function waitForSandboxExit(child: ChildProcessWithoutNullStreams, graceMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return true;
+  return await new Promise<boolean>((resolveExit) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.off("exit", onExit);
+      child.off("close", onExit);
+    };
+    const onExit = () => { cleanup(); resolveExit(true); };
+    const timer = setTimeout(() => { cleanup(); resolveExit(false); }, graceMs);
+    child.once("exit", onExit);
+    child.once("close", onExit);
+  });
+}
+
+/**
+ * Stop a process whose spawn turn failed, and say whether its whole tree is
+ * provably gone.
+ *
+ * The caller was holding a live child and then lost the record that would have
+ * supervised it, so "kill it" alone is not enough: the sandbox's own bound has
+ * to be checked. A bubblewrap tree is bounded by its PID namespace, which a
+ * descendant can keep alive after leaving the group via setsid(); only an
+ * empty namespace proves it ended. A "none" process has no such namespace, so
+ * its own exit is the proof. Any doubt returns false, and the caller must
+ * report an unverified termination rather than release the workspace.
+ */
+async function stopUnrecordedSandbox(
+  child: ChildProcessWithoutNullStreams,
+  sandbox: SandboxKind,
+  graceMs: number,
+): Promise<boolean> {
+  if (sandbox === "bubblewrap" && child.pid) {
+    // Capture on the same turn path the normal flow uses; the id here is only
+    // a label, never persisted.
+    const outcome = captureExecutionBoundaryOutcome(`unrecorded:${child.pid}`,
+      { pid: child.pid, kind: "pid-namespace", sandbox: "bubblewrap" });
+    if (outcome.status === "ended") return await waitForSandboxExit(child, graceMs);
+    if (outcome.status === "captured") {
+      const stopped = await terminateExecutionBoundary(outcome.handle, {
+        termGraceMs: Math.max(0, Math.min(graceMs, DEFAULT_BOUNDARY_TERM_GRACE_MS)),
+        killGraceMs: Math.max(0, Math.min(graceMs, DEFAULT_BOUNDARY_KILL_GRACE_MS)),
+      });
+      if (stopped.confirmed) return await waitForSandboxExit(child, graceMs);
+    }
+  }
+  // Group kill is still worth attempting: it stops the monitor even when the
+  // namespace could not be read. It is not, by itself, proof of termination.
+  killSandboxProcess(child);
+  const joined = await waitForSandboxExit(child, graceMs);
+  return (!child.pid || sandbox !== "bubblewrap") && joined;
+}
+
+/**
+ * One already-connected stream the sandbox payload must receive on a fixed
+ * descriptor. The Runner keeps the other end; only the sandbox's end is handed
+ * over here, and it is never named on the filesystem or mounted.
+ */
+export interface SandboxInheritedDescriptor {
+  /**
+   * stdio index inside the child. `3` is reserved by `--seccomp 3`, so the
+   * model tunnel uses `4`; nothing else may claim either one.
+   */
+  readonly index: number;
+  /** Connected duplex stream whose descriptor the payload adopts. */
+  readonly stream: Stream;
+}
+
 /** Spawn through the selected sandbox and attach Linux seccomp when applicable. */
 export async function spawnSandboxProcess(
   config: SandboxRuntimeConfig,
@@ -1277,21 +1549,65 @@ export async function spawnSandboxProcess(
   commandArguments: string[],
   seccompVariant: SeccompVariant,
   closeFilter: (handle: FileHandle) => Promise<void> = (handle) => handle.close(),
+  onSpawned?: (child: ChildProcessWithoutNullStreams, sandbox: SandboxKind) => void,
+  /**
+   * Optional extra descriptor for the payload. Absent for every caller today;
+   * only a launch that has proven the descriptor path may pass one, because a
+   * descriptor that never arrives must fail the launch rather than degrade.
+   */
+  inherited?: SandboxInheritedDescriptor,
 ): Promise<ChildProcessWithoutNullStreams> {
   const kind = launch.sandbox ?? executorSandboxKind(config);
+  const graceMs = config.terminationGraceMs ?? DEFAULT_TERMINATION_GRACE_MS;
+  if (inherited) {
+    // Refuse instead of silently dropping the descriptor: a payload that
+    // expects a tunnel but is spawned without one would start a research
+    // workload with no transport, which is the failure this parameter exists
+    // to make loud. Only bubblewrap has a proven descriptor path.
+    if (kind !== "bubblewrap") {
+      throw new Error("Inherited descriptors are supported only by the bubblewrap sandbox");
+    }
+    if (!Number.isSafeInteger(inherited.index) || inherited.index < 4) {
+      throw new Error("An inherited descriptor index must be an integer of at least 4");
+    }
+  }
+  // The record callback runs after the process exists but before anyone else
+  // can hear about it. If it fails (an unreadable identity, or the ledger
+  // refusing the row), the child is still ours and still running: stop it and
+  // say whether that could be proven, so a caller never receives an
+  // unsupervised process and never claims a termination it did not verify.
+  const record = async (child: ChildProcessWithoutNullStreams, sandbox: SandboxKind): Promise<void> => {
+    try {
+      onSpawned?.(child, sandbox);
+    } catch (error) {
+      let stopped = false;
+      try {
+        stopped = await stopUnrecordedSandbox(child, sandbox, graceMs);
+      } catch {
+        // A failed kill leaves the same doubt as an unconfirmed one.
+      }
+      if (stopped) throw error;
+      throw new ProcessTerminationUnverifiedError(
+        `Sandbox supervision failed after the process started, and its termination could not be verified: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error, termination: sandboxTerminationProof(child, sandbox) });
+    }
+  };
   if (kind === "none") {
     // [windows-desktop] no namespace init, no seccomp — spawn the
     // interpreter directly. killSandboxProcess routes this through
     // terminateTree (taskkill /T on win32), so timeout/abort still work.
     try {
-      return spawn(launch.executable!, [...launch.commandPrefix, ...commandArguments], {
+      const direct = spawn(launch.executable!, [...launch.commandPrefix, ...commandArguments], {
         cwd: launch.hostCwd,
         env: launch.env,
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
       }) as ChildProcessWithoutNullStreams;
+      ownSandboxChild(direct);
+      await record(direct, "none");
+      return direct;
     } catch (error) {
-      await launch.cleanup?.().catch(() => undefined);
+      await cleanupSandboxLaunch(launch, error);
       throw error;
     }
   }
@@ -1301,6 +1617,13 @@ export async function spawnSandboxProcess(
       filter = await open(await ensureSeccompFilter(config.dataDir, seccompVariant), "r");
     }
     const processGroup = kind === "bubblewrap";
+    const stdio: Array<"pipe" | Stream | number> = filter
+      ? ["pipe", "pipe", "pipe", filter.fd]
+      : ["pipe", "pipe", "pipe"];
+    if (inherited) {
+      while (stdio.length < inherited.index) stdio.push("pipe");
+      stdio[inherited.index] = inherited.stream;
+    }
     const child = spawn(launch.executable ?? config.bwrapPath, [
       // Node establishes a new session before exec. Keep bwrap's namespace init
       // in that group: --new-session would move it out of reach of group kill.
@@ -1311,12 +1634,16 @@ export async function spawnSandboxProcess(
       detached: processGroup,
       ...(launch.hostCwd ? { cwd: launch.hostCwd } : {}),
       env: launch.sandbox === "seatbelt" ? launch.env : undefined,
-      stdio: filter ? ["pipe", "pipe", "pipe", filter.fd] : ["pipe", "pipe", "pipe"],
+      stdio,
     }) as ChildProcessWithoutNullStreams;
+    ownSandboxChild(child);
     if (processGroup) {
       sandboxProcessGroups.add(child);
       child.once("close", () => sandboxProcessGroups.delete(child));
     }
+    // No await may precede this call: identity has to be read from the kernel
+    // while the pid provably still names the process that was just created.
+    await record(child, kind);
     // Do not await this close. A missing device node makes bwrap exit in the
     // same turn, and that close event is delivered while the fd close is in
     // flight. Waiting here returns the child only after the caller can no
@@ -1326,7 +1653,7 @@ export async function spawnSandboxProcess(
     return child;
   } catch (error) {
     await filter?.close().catch(() => undefined);
-    await launch.cleanup?.().catch(() => undefined);
+    await cleanupSandboxLaunch(launch, error);
     throw error;
   }
 }
@@ -1349,6 +1676,7 @@ export async function executePython(
   const networkAccess = baseNetworkAccess.mode === "none" ? baseNetworkAccess : {
     ...baseNetworkAccess, revision: `${baseNetworkAccess.revision}:execution:${randomUUID()}`,
   };
+  let failure: unknown;
   try {
   if (request.permissionEpoch.mounts.length !== 1
     || request.permissionEpoch.mounts[0]?.source !== "workspace"
@@ -1501,8 +1829,12 @@ export async function executePython(
     startedAt,
     workingDirectory: launch.chdir,
   };
+  } catch (error) {
+    failure = error;
+    throw error;
   } finally {
-    if (networkAccess.mode !== "none") await gateways?.release(networkAccess.revision);
+    if (networkAccess.mode !== "none" && gateways) await cleanupExecutionResource(failure,
+      () => gateways.release(networkAccess.revision), "execution-gateway");
   }
 }
 
@@ -1516,6 +1848,8 @@ export async function executeShell(
   onOutput?: (stream: "stdout" | "stderr", chunk: Buffer) => void,
   environmentStore?: Pick<EnvironmentStore, "capability" | "resolveRuntime">,
   expectedEnvironmentRevisionId?: string,
+  /** Receives the spawned monitor synchronously so the ledger can capture its identity. */
+  lifecycle?: ExecutionLifecycle,
 ): Promise<ShellExecutionResult> {
   if (!request.code.trim()) throw new Error("Shell code is required");
   if (!request.executionId?.trim()) throw new Error("Execution ID is required");
@@ -1524,6 +1858,11 @@ export async function executeShell(
   const networkAccess = baseNetworkAccess.mode === "none" ? baseNetworkAccess : {
     ...baseNetworkAccess, revision: `${baseNetworkAccess.revision}:execution:${randomUUID()}`,
   };
+  let failure: unknown;
+  const retainResource = lifecycle?.retainResource;
+  if (retainResource && networkAccess.mode !== "none" && gateways) {
+    retainResource(() => gateways.release(networkAccess.revision), "execution-gateway");
+  }
   try {
   if (request.permissionEpoch.mounts.length !== 1
     || request.permissionEpoch.mounts[0]?.source !== "workspace"
@@ -1571,7 +1910,7 @@ export async function executeShell(
   }
   const npu = await resolveExecutionNpu(config, request.npuDevices,
     async () => await sandboxLaunchProfile(config.bwrapPath));
-  const launch = await prepareSandboxLaunch(config, {
+  const preparedLaunch = await prepareSandboxLaunch(config, {
     npu,
     chdir,
     egress: await prepareSandboxEgress(config.dataDir, networkAccess, gateways, sandbox, request.sandboxEgressProxy),
@@ -1592,6 +1931,8 @@ export async function executeShell(
     workspaceBindArgs: workspaceBinds.args,
     workspaceRoot,
   });
+  if (retainResource && preparedLaunch.cleanup) retainResource(preparedLaunch.cleanup, "sandbox-launch");
+  const launch = retainResource ? { ...preparedLaunch, cleanup: undefined } : preparedLaunch;
   await assertSandboxWorkspaceLinks(config, launch, workspaceRoot, readOnlyWorkspaceRoot, signal);
   const commandArguments = [
     sandboxCommandPath(launch, "/usr/bin/bash", "/bin/bash"),
@@ -1615,6 +1956,13 @@ export async function executeShell(
     maxOutputBytes,
     seccompVariantFor(networkAccess, Boolean(npu)),
     onOutput,
+    lifecycle
+      ? (child, sandbox) => lifecycle.spawned({
+          pid: child.pid ?? 0,
+          kind: sandbox === "bubblewrap" ? "pid-namespace" : "process",
+          sandbox,
+        })
+      : undefined,
   );
   await assertWorkspaceWithinQuota(workspaceRoot, maxWorkspaceBytes);
 
@@ -1645,8 +1993,12 @@ export async function executeShell(
     startedAt,
     workingDirectory: launch.chdir,
   };
+  } catch (error) {
+    failure = error;
+    throw error;
   } finally {
-    if (networkAccess.mode !== "none") await gateways?.release(networkAccess.revision);
+    if (!retainResource && networkAccess.mode !== "none" && gateways) await cleanupExecutionResource(failure,
+      () => gateways.release(networkAccess.revision), "execution-gateway");
   }
 }
 

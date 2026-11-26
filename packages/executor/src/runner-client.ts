@@ -20,6 +20,15 @@ import {
   EXECUTION_SIGNATURE_HEADER,
   EXECUTION_TIMESTAMP_HEADER,
 } from "@sciencediscovery/runner";
+import {
+  canonicalResearchInputBundleManifest,
+  RESEARCH_INPUT_BUNDLE_VERSION,
+  type ResearchRunRequest,
+  type ResearchInputBundleManifest,
+  type ResearchInputBundlePublication,
+  type ResearchInputBundleRequest,
+  type ResearchInputBundleStatusDto,
+} from "@sciencediscovery/schema";
 import type {
   CreateEnvironmentRequest,
   Environment,
@@ -65,6 +74,11 @@ const RUNNER_ERROR_CODE_MESSAGES: Readonly<Record<string, string>> = {
   RESULT_DIGEST_MISMATCH: "Runner execution result digest mismatch",
   EXECUTION_RESULT_CONFLICT: "Runner execution result conflict",
   EXECUTION_ID_CONFLICT: "Runner execution identity conflict",
+  RESEARCH_INPUT_BUNDLE_INVALID: "Research input bundle was refused by the Runner",
+  RESEARCH_INPUT_BUNDLE_CORRUPT: "Stored research input bundle on the Runner is corrupt",
+  RESEARCH_INPUT_BUNDLE_UNAVAILABLE: "Research input bundle storage on the Runner is unavailable",
+  RESEARCH_WORKLOAD_UNKNOWN: "Research workload is not registered on the Runner",
+  RESEARCH_RUN_NOT_CONFIGURED: "Research execution is not configured on the Runner",
 };
 
 export class RunnerHttpError extends Error {
@@ -188,6 +202,105 @@ export class RunnerClient {
       throw new Error(`Remote Skill preparation failed: ${(error as Error).message}`, { cause: error });
     }
   }
+
+  /**
+   * Make this Runner hold one frozen research input bundle.
+   *
+   * The identity is derived here from the manifest, so a request whose claimed
+   * digest does not describe its own entries is refused before anything is
+   * sent. The Runner is asked by digest first: a bundle it already verified is
+   * reused without shipping a byte, while `missing` uploads and `corrupt`
+   * fails instead of overwriting content the Runner did not write. The returned
+   * publication must echo this exact identity; anything else is a protocol
+   * difference, never a success.
+   */
+  async prepareResearchInputBundle(request: ResearchInputBundleRequest, signal?: AbortSignal): Promise<ResearchInputBundlePublication> {
+    return this.prepareInputBundle(request, "/research/input-bundles", signal);
+  }
+
+  private async prepareInputBundle(
+    request: ResearchInputBundleRequest,
+    prefix: string,
+    signal?: AbortSignal,
+    label = "Research",
+  ): Promise<ResearchInputBundlePublication> {
+    const manifest: ResearchInputBundleManifest = {
+      schemaVersion: request.schemaVersion,
+      contractDigest: request.contractDigest,
+      files: request.entries.map(({ content: _content, ...file }) => file),
+    };
+    const digest = createHash("sha256")
+      .update(canonicalResearchInputBundleManifest(manifest), "utf8")
+      .digest("hex");
+    const totalBytes = manifest.files.reduce(
+      (total, file) => total + file.size,
+      0,
+    );
+    if (digest !== request.bundleDigest) {
+      throw new Error(`${label} input bundle identity does not match its manifest`);
+    }
+
+    const status = await this.request<ResearchInputBundleStatusDto>(
+      `${prefix}/${digest}`,
+      { signal },
+    );
+    if (status.status === "ready") {
+      if (
+        status.bundleDigest !== digest ||
+        status.contractDigest !== request.contractDigest ||
+        status.fileCount !== manifest.files.length ||
+        status.totalBytes !== totalBytes
+      ) {
+        throw new Error(`Runner answered for a different ${label} input bundle`);
+      }
+      return {
+        schemaVersion: RESEARCH_INPUT_BUNDLE_VERSION,
+        bundleDigest: digest,
+        contractDigest: request.contractDigest,
+        status: "ready",
+        fileCount: manifest.files.length,
+        totalBytes,
+      };
+    }
+    if (status.status === "corrupt") {
+      throw new Error(
+        `Stored ${label} input bundle on the Runner is corrupt`,
+      );
+    }
+
+    const body = JSON.stringify(request);
+    const timestamp = this.signingTimestamp();
+    const answer = await this.request<ResearchInputBundlePublication>(
+      prefix,
+      {
+        method: "POST",
+        body,
+        signal,
+        headers: {
+          [EXECUTION_SIGNATURE_HEADER]: createExecutionSignature(
+            this.token,
+            timestamp,
+            body,
+          ),
+          [EXECUTION_TIMESTAMP_HEADER]: timestamp,
+        },
+      },
+    );
+    if (
+      answer === null ||
+      typeof answer !== "object" ||
+      answer.schemaVersion !== RESEARCH_INPUT_BUNDLE_VERSION ||
+      answer.bundleDigest !== digest ||
+      answer.contractDigest !== request.contractDigest ||
+      answer.status !== "ready" ||
+      answer.fileCount !== manifest.files.length ||
+      answer.totalBytes !== totalBytes
+    ) {
+      throw new Error(`Runner did not confirm ${label} input bundle publication`);
+    }
+    return answer;
+  }
+
 
   async health(): Promise<RunnerHealth> {
     // The health check is the first thing a connection does, so this is where
@@ -538,6 +651,30 @@ export class RunnerClient {
     }));
   }
 
+  async submitResearchExecution(request: ResearchRunRequest, signal?: AbortSignal): Promise<ManagedExecution> {
+    const timestamp = this.signingTimestamp();
+    const body = JSON.stringify(request);
+    return this.managedExecutionTimes(await this.request<ManagedExecution>("/research-executions", {
+      method: "POST", body, signal, headers: {
+        [EXECUTION_SIGNATURE_HEADER]: createExecutionSignature(this.token, timestamp, body),
+        [EXECUTION_TIMESTAMP_HEADER]: timestamp,
+      },
+    }));
+  }
+
+  /** Read committed execution output, never the mutable live Workspace. */
+  async readResearchExecutionFile(id: string, owner: ExecutionOwner, path: string, signal?: AbortSignal): Promise<Buffer> {
+    const query = new URLSearchParams({ ...owner, path });
+    const response = await fetch(`${this.baseUrl}/research-executions/${encodeURIComponent(id)}/files?${query}`, {
+      headers: { authorization: `Bearer ${this.token}` }, signal,
+    });
+    if (!response.ok) throw new Error(`Execution output read failed (${response.status})`);
+    const bytes = Buffer.from(await response.arrayBuffer());
+    const digest = response.headers.get("x-content-sha256");
+    if (!digest || createHash("sha256").update(bytes).digest("hex") !== digest) throw new Error("Execution output integrity failure");
+    return bytes;
+  }
+
   async getShellExecution(id: string, owner: ExecutionOwner, signal?: AbortSignal): Promise<ManagedExecution> {
     return this.managedExecutionTimes(
       await this.request<ManagedExecution>(`/shell-executions/${encodeURIComponent(id)}?${new URLSearchParams({ ...owner })}`, { signal }),
@@ -551,4 +688,5 @@ export class RunnerClient {
   async cancelShellExecution(id: string, owner: ExecutionOwner, signal?: AbortSignal): Promise<ManagedExecution> {
     return this.request(`/shell-executions/${encodeURIComponent(id)}/cancel?${new URLSearchParams({ ...owner })}`, { method: "POST", signal });
   }
+
 }

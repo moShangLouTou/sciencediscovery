@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import { createResearchWorkloadRegistry, parseResearchRunRequest, ResearchRunError, type ResearchRunWiring } from "./research-run.js";
+import { RunnerResearchInputBundles } from "./research-input-bundles.js";
+import { handleResearchInputBundles } from "./research-input-bundles-http.js";
 import { createReadStream, rmSync } from "node:fs";
 import { chmod, link, lstat, mkdir, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -33,7 +36,9 @@ import type {
   CreateNpuJobRequest,
   InstallEnvironmentRequest,
   PythonExecutionRequest,
+  RunnerExecutionBoundaryCapability,
   RunnerExecutionStatus,
+  ResearchRunRequest,
   RunnerHealth,
   RunnerRuntimeStatus,
   RemoteWorkspaceFile,
@@ -87,6 +92,8 @@ import { HostNpuJobBroker } from "./npu-broker.js";
 
 
 export interface RunnerConfig extends ExecutorConfig {
+  /** Trusted code registrations; never loaded from a request or environment variable. */
+  researchWorkloads?: readonly Omit<ResearchRunWiring, "config" | "environmentStore">[];
   authToken: string;
   host: string;
   port: number;
@@ -132,6 +139,39 @@ const DISABLED_SCIENTIFIC_ENVS: ScientificEnvsCapability = {
   startersReady: false,
   unavailableReason: "Scientific environments are disabled by configuration",
 };
+
+/**
+ * What this Runner can actually promise about the processes one execution
+ * started. Every field is backed by the boundary implementation, never by a
+ * configuration flag: a strong claim is made only on Linux with a usable
+ * Bubblewrap sandbox, where the workload lives in its own PID namespace and the
+ * kernel can be asked whether that namespace is empty.
+ *
+ * An unsupported Runner reports the weak shape explicitly so a client treats
+ * reconnection and cancellation as unavailable rather than assuming them.
+ */
+function executionBoundaryCapability(
+  platform: NodeJS.Platform,
+  sandboxUsable: boolean,
+): RunnerExecutionBoundaryCapability {
+  if (platform === "linux" && sandboxUsable) {
+    return {
+      handle: "pid-namespace",
+      reconnect: "supported",
+      runnerDeathTerminates: "kernel",
+      escapedDescendant: "included",
+      terminationProof: "pid-namespace",
+    };
+  }
+  return {
+    handle: "none",
+    reconnect: "unsupported",
+    runnerDeathTerminates: "unmanaged",
+    escapedDescendant: "excluded",
+    terminationProof: "none",
+    reason: platform === "linux" ? "sandbox-unsupported" : "platform-unsupported",
+  };
+}
 
 function sendJson(response: ServerResponse, statusCode: number, value: unknown): void {
   if (response.destroyed || response.writableEnded) return;
@@ -398,6 +438,7 @@ export function loadRunnerConfig(env: NodeJS.ProcessEnv = process.env, cwd = rep
     scientificPackageCacheDir: env.SCIENCE_AGENT_PACKAGE_CACHE_DIR?.trim()
       ? resolve(cwd, env.SCIENCE_AGENT_PACKAGE_CACHE_DIR.trim())
       : undefined,
+    // Optional and admin-only; a malformed file fails startup.
     shellSessionIdleMs,
   };
 }
@@ -433,6 +474,10 @@ export function createRunnerServer(
 ): Server {
   const sandbox = executorSandboxKind(config);
   const skillPackages = new RunnerSkillPackages(config.dataDir);
+  // Input evidence bundles are opaque frozen task files addressed by content.
+  // Registered trusted workloads consume private read-only copies through
+  // the signed research execution route; requests cannot supply programs.
+  const researchInputBundles = new RunnerResearchInputBundles(config.dataDir);
   const logger = createOperationalLogger({ category: "runner", dataDir: config.dataDir, service: "runner" });
   const profiles = envProfiles ?? new SessionEnvProfileStore();
   const gateways = egressGateways ?? new EgressGatewayRegistry(config.dataDir, (event, detail) => {
@@ -467,7 +512,10 @@ export function createRunnerServer(
   const executionQueues = new KeyedTaskQueue();
   const managedExecutions = new ExecutionManager(config.dataDir, detail => {
     logger.warn("execution_resources_quarantined", { ...detail });
-  });
+  }, { research: config.researchWorkloads === undefined ? undefined : createResearchWorkloadRegistry(
+    config.researchWorkloads.map((definition) => ({ ...definition, config: executorConfig, environmentStore,
+      inputBundles: definition.inputBundles ?? researchInputBundles })),
+  ) });
   const workspaceVersions = new VersionStore(config.dataDir);
   const seenExecutions = new Map<string, number>();
   const activeExecutions = new Map<string, RunnerExecutionStatus>();
@@ -557,14 +605,23 @@ export function createRunnerServer(
           sendJson(response, 200, { status: "ok" });
           return;
         }
+        const executionCapability = await readiness.get();
         sendJson(response, 200, {
-          execution: await readiness.get(),
+          execution: executionCapability,
           cgroupDelegated: false,
           cgroupMode: RESOURCE_LIMIT_MODE,
           cgroupRoot: "",
           executionAuth: "bearer+hmac-sha256",
           ...managedExecutions.identity,
-          capabilities: { executionRecoveryVersion: 1 },
+          capabilities: {
+            // Version 2 adds the durable process boundary: a restarted Runner
+            // can observe and cancel a recorded execution.
+            executionRecoveryVersion: 2,
+            executionBoundary: executionBoundaryCapability(
+              process.platform,
+              executionCapability.sandboxUsable && executionCapability.sandbox === "bubblewrap",
+            ),
+          },
           executionUser,
           executionTimeoutMs: config.execTimeoutMs,
           maxFileBytes: MAX_RUNNER_FILE_BYTES,
@@ -607,7 +664,7 @@ export function createRunnerServer(
       }
       // Before accepting an execution, not before management/read/cancel calls.
       // A rejected request has not consumed its execution identity or run code.
-      if (request.method === "POST" && ["/execute", "/execute-shell", "/shell-executions"].includes(url.pathname)) {
+      if (request.method === "POST" && ["/execute", "/execute-shell", "/shell-executions", "/research-executions"].includes(url.pathname)) {
         const capability = await readiness.get();
         if (!capability.ready) {
           sendJson(response, 503, { error: capability.detail ?? capability.reason, code: "EXECUTION_UNAVAILABLE", capability });
@@ -991,7 +1048,7 @@ export function createRunnerServer(
         sendJson(response, 201, revision);
         return;
       }
-      const managedMatch = url.pathname.match(/^\/shell-executions\/([^/]+)(?:\/(logs|cancel))?$/);
+      const managedMatch = url.pathname.match(/^\/(?:shell|research)-executions\/([^/]+)(?:\/(logs|cancel|files))?$/);
       if (managedMatch) {
         const id = decodeURIComponent(managedMatch[1]!);
         const owner = { sessionId: url.searchParams.get("sessionId") ?? "", agentId: url.searchParams.get("agentId") ?? "" };
@@ -999,14 +1056,54 @@ export function createRunnerServer(
           sendJson(response, 200, managedExecutions.logs(id, owner, Number(url.searchParams.get("cursor") ?? "0")));
           return;
         }
+        if (request.method === "GET" && managedMatch[2] === "files") {
+          const execution = managedExecutions.get(id, owner);
+          const snapshot = execution.result?.workspaceSnapshot;
+          if (!execution.version || !snapshot) {
+            sendJson(response, 409, { error: "Execution has no committed output", code: "EXECUTION_OUTPUT_PENDING" });
+            return;
+          }
+          const pathValue = url.searchParams.get("path");
+          const path = pathValue === null ? undefined : validateRelativeWorkspacePath(pathValue);
+          const files = await workspaceSnapshotFiles(workspaceVersions, snapshot, path === undefined ? undefined : [path]);
+          if (path === undefined) { sendJson(response, 200, { executionId: id, version: execution.version, files }); return; }
+          const file = files.find((entry) => entry.path === path);
+          if (!file) { sendJson(response, 404, { error: "File is absent from this execution's committed output" }); return; }
+          response.writeHead(200, { "content-type": "application/octet-stream", "cache-control": "no-store",
+            "content-length": file.content.size, "x-content-sha256": file.content.digest.slice("sha256:".length) });
+          await pipeline(streamSnapshotFile(workspaceVersions, file.content), response);
+          return;
+        }
         if (request.method === "GET" && !managedMatch[2]) {
           sendJson(response, 200, managedExecutions.get(id, owner));
           return;
         }
         if (request.method === "POST" && managedMatch[2] === "cancel") {
-          sendJson(response, 202, managedExecutions.cancel(id, owner));
+          sendJson(response, 202, await managedExecutions.cancel(id, owner));
           return;
         }
+      }
+      const bundleHttp = { authToken: config.authToken, readBytes, sendJson, abortOnDisconnect };
+      if (await handleResearchInputBundles(request, response, url, { ...bundleHttp, store: researchInputBundles })) return;
+      if (request.method === "POST" && url.pathname === "/research-executions") {
+        const body = await readBody(request);
+        if (!verifyExecutionSignature(config.authToken, request.headers[EXECUTION_TIMESTAMP_HEADER] as string | undefined,
+          body, request.headers[EXECUTION_SIGNATURE_HEADER] as string | undefined)) {
+          sendJson(response, 401, { error: "Invalid or expired execution signature" });
+          return;
+        }
+        let execution: ResearchRunRequest;
+        try { execution = parseResearchRunRequest(JSON.parse(body)); }
+        catch (error) {
+          if (error instanceof ResearchRunError) { sendJson(response, 400, { error: error.message, code: error.code }); return; }
+          throw error;
+        }
+        const root = execution.runnerWorkspaceKey
+          ? await remoteWorkspaceRoot(config.dataDir, execution.runnerWorkspaceKey) : execution.workspaceRoot;
+        const workspaceRoot = await validatedWorkspace(config.dataDir, root, config.extraWorkspaceRoots);
+        const accepted = managedExecutions.submitResearch({ ...execution, workspaceRoot });
+        sendJson(response, accepted.accepted ? 202 : 200, accepted.execution);
+        return;
       }
       if (request.method === "POST" && ["/shell-executions", "/direct-shell-executions"].includes(url.pathname)) {
         const body = await readBody(request);
@@ -1028,14 +1125,14 @@ export function createRunnerServer(
         // resolution in the executor.
         if (!direct) execution.executionTimeoutMs = boundedExecutionTimeoutMs(execution.executionTimeoutMs, config.execTimeoutMs);
         execution.maxOutputBytes ??= config.maxOutputBytes;
-        const accepted = managedExecutions.submit(execution, (signal, log, expectedEnvironmentRevisionId) => direct
+        const accepted = managedExecutions.submit(execution, (signal, log, expectedEnvironmentRevisionId, lifecycle) => direct
           ? executeDirectShell(executorConfig, execution, signal, log)
           : execution.environmentId
           ? environmentStore?.withRuntime(execution.environmentId, (runtime) => {
               if (signal.aborted) throw new Error("Execution cancelled before environment admission");
-              return executeShell(executorConfig, execution, signal, undefined, gateways, runtime, log, environmentStore, expectedEnvironmentRevisionId);
+              return executeShell(executorConfig, execution, signal, undefined, gateways, runtime, log, environmentStore, expectedEnvironmentRevisionId, lifecycle);
             }) ?? Promise.reject(new Error("Scientific environments are unavailable"))
-          : executeShell(executorConfig, execution, signal, undefined, gateways, undefined, log, environmentStore, expectedEnvironmentRevisionId),
+          : executeShell(executorConfig, execution, signal, undefined, gateways, undefined, log, environmentStore, expectedEnvironmentRevisionId, lifecycle),
         direct ? undefined : async () => {
           // Admission-time check: the managed Shell may be repaired while this
           // request waits behind earlier work in the same Workspace queue. A
@@ -1182,6 +1279,7 @@ export async function startRunnerServer(config = loadRunnerConfig()): Promise<Se
   const sandbox = executorSandboxKind(config);
   const logger = createOperationalLogger({ category: "runner", dataDir: config.dataDir, service: "runner" });
   const environmentStore = new EnvironmentStore({
+    executionLedgerPath: resolve(config.dataDir, "runner-executions", "executions.sqlite"),
     allowedChannels: config.scientificAllowedChannels ?? ["conda-forge"],
     enabled: config.scientificEnvsEnabled === true,
     packageCacheDir: config.scientificPackageCacheDir,

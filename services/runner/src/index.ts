@@ -55,3 +55,10 @@ export {
 } from "./server.js";
 export { skillBundleIdentity, skillBundleManifest, verifySkillBundle } from "./skill-packages.js";
 export { prepareSpecialistLauncher } from "./specialist-launch.js";
+
+export { ExecutionManager, ExecutionManagerError } from "./execution-manager.js";
+export { createResearchRunExecutor, createResearchWorkloadRegistry, type ResearchRunExecutor,
+  type ResearchRunWiring, type ResearchWorkloadAdapter, type ResearchWorkloadContext,
+  type ResearchWorkloadPreparation } from "./research-run.js";
+export { RunnerResearchInputBundles, ResearchInputBundleError, researchInputBundleDigest,
+  type ResearchInputSnapshot } from "./research-input-bundles.js";

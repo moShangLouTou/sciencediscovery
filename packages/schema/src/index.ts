@@ -55,3 +55,7 @@ export * from "./web.js";
 export * from "./proxy.js";
 export * from "./tool-graph-registry.js";
 export * from "@sciencediscovery/external-urls";
+
+export * from "./research-run.js";
+
+export * from "./research-input-bundle.js";
