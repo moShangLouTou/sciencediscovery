@@ -5,7 +5,7 @@ const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:linux",
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 const modules = ["research-run", "research-input-bundles", "research-input-bundles-http", "research-tunnel",
-  "execution-manager", "execution-boundary", "execution-resource-fences", "termination-resources"];
+  "execution-manager", "execution-boundary", "execution-resource-fences", "termination-resources", "runtime-probe"];
 test("shared Runner execution modules have no product imports or fixed product workload", async () => {
   for (const name of modules) {
     const source = await readFile(new URL(`./${name}.ts`, import.meta.url), "utf8");

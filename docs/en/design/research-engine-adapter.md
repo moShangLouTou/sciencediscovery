@@ -357,6 +357,33 @@ Wire them as follows:
    existing engine task. It never resubmits a paid task.
 6. `retryDelivery` publishes only terminal tasks. Active tasks stay pending and never call the publisher. It never launches.
 
+## Latest observations and runtime probes
+
+`ResearchGenerationRepository<T>` stores the latest observation for an owned
+key. Call `allocate(projectId, sessionId, key)` before external work, then `save`
+with the issued generation. Only a strictly newer generation replaces the row;
+a slower writer receives the persisted winner. Allocation, conditional writes
+and owner deletion use SQLite write transactions, so a late response cannot
+recreate a deleted row after its allocation was removed. Products supply
+`encode`/`decode`, a corruption error, and optional legacy table/column names.
+The codec reduces private data before persistence and validates reduced records
+on writes and reads. This differs from `ResearchVersionRepository`, which owns
+immutable evidence rather than replaceable observations.
+
+The Runner's `createRuntimeProbeService` leases an environment through
+`withEnvironment({ scopeKey, environmentId }, operation)`. The scope and
+environment are exclusive within that service instance; after acquiring the
+lease the service rechecks durable termination reservations. The operation
+receives the leased environment and a `run` method for a trusted Python program,
+interpreter flags, read-only inputs, timeout and output limit. This is an
+internal adapter port, never a route for user-supplied programs or host paths.
+Programs run through the ordinary bubblewrap sandbox with the selected prefix.
+The service captures termination evidence, retains unproven boundaries behind
+the environment mutation gate, and removes temporary workspaces only after
+termination is proven (or no process started). Product modules own protocol
+parsing, source identity rules, and the order of probe phases. Missing durable
+reservation ports provide only an in-process fence, suitable for test doubles.
+
 ## Integration limits
 
 The shared service does not provide engine installation, credential
