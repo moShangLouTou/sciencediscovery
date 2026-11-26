@@ -12,181 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/**
- * ScienceFlow as the first concrete research engine adapter.
- *
- * Everything engine-specific about one operation lives here: staging the frozen
- * input bytes, materialising a prepared task's evaluator, refusing a model that
- * changed after acceptance, invoking the Python pilot, reading the engine's
- * control record / stage ledger / provider usage, stopping the managed run and
- * publishing its result through `result-delivery`. The shared lifecycle in
- * `../research/operation-lifecycle.ts` decides when each of these may run.
- *
- * What stays in `local-research.ts`: the SF domain on top of the adapter —
- * accepted-request validation, task catalog/preparation, experiment proposals,
- * result groups, best/selected relations and research-line budgets. The budget
- * verdict is passed in as a callback so this module does not own ranking or
- * continuation semantics.
- *
- * The adapter keeps the engine's original behaviour unchanged: the same record
- * shapes, the same Python stop program, the same receipt semantics and the same
- * "an unreadable run is unknown, never relaunched" rule.
- */
 import { spawn } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-
-import type {
-  ReadScienceFlowRunSnapshotOptions,
-  ScienceFlowSnapshotReadResult,
-} from "@sciencediscovery/scienceflow-reader";
-
-import type {
-  ResearchEngineAdapter,
-  ResearchEngineBeforeLaunch,
-  ResearchEngineInspection,
-  ResearchEngineLaunch,
-  ResearchEngineLaunchBudget,
-  ResearchEngineObservation,
-  ResearchEnginePreparation,
-  ResearchLifecycleTransitions,
-  ResearchOperationWriter,
-} from "../research/engine-adapter.js";
-import {
-  writeDeliveryRecord,
-  type ScienceFlowResultDeliveryRecord,
-  type ScienceFlowResultDeliveryRequest,
-} from "./result-delivery.js";
+import type { ResearchExecutionTransport } from "../research/engine-service.js";
+import type { ResearchEngineInspection, ResearchEngineLaunch, ResearchEngineObservation, ResearchOperationWriter } from "../research/engine-adapter.js";
 import type { ScienceFlowLocalResearchSettings } from "./local-research-config.js";
-import {
-  InputPreparationRefusal,
-  sha256,
-  stageResearchOperationInputs,
-  type StagedDataSelection,
-  type StagedInputSelection,
-} from "./local-research-inputs.js";
-import { materializePreparedTaskAssets } from "./local-research-task-service.js";
-import {
-  isTerminalResearchState,
-  type ScienceFlowLocalResearchArtifactRef,
-  type ScienceFlowLocalResearchDelivery,
-  type ScienceFlowLocalResearchEngineFacts,
-  type ScienceFlowLocalResearchOperation,
-  type ScienceFlowLocalResearchStage,
-  type ScienceFlowLocalResearchState,
-  type ScienceFlowLocalResearchUsage,
-} from "./local-research-record.js";
-import {
-  readStageRows,
-  readUsage,
-  resolveResearchPilotModel,
-  ResearchPilotRefusal,
-  runResearchPilot,
-  type ResearchPilotLauncher,
-  type ResearchPilotReceipt,
-} from "./research-pilot.js";
-import type { LocalResearchServiceStore } from "./local-research.js";
-
-/** Engine lifecycle states after which a run never continues on its own. */
+import type { ScienceFlowLocalResearchOperation, ScienceFlowLocalResearchEngineFacts, ScienceFlowLocalResearchState,
+  ScienceFlowLocalResearchStage, ScienceFlowLocalResearchUsage, ScienceFlowLocalResearchDelivery } from "./local-research-record.js";
+import { readStageRows, readUsage, runResearchPilotEngine, type ResearchPilotLauncher, type ResearchPilotReceipt, type ResearchPilotSessionStore } from "./research-pilot.js";
 const TERMINAL_ENGINE_STATUSES = new Set(["completed", "failed", "stopped", "interrupted"]);
-
-/** A bounded wait polls the engine record at this interval. */
 const OBSERVE_POLL_MS = 2_000;
-/** How long one stop request waits for the engine to record termination. */
 const STOP_CONFIRM_TIMEOUT_MS = 30_000;
-/** The engine's own stop call deadline; the confirmation poll outlasts it. */
 const ENGINE_STOP_TIMEOUT_SEC = 20;
-
-/** The delivery callable the service already substitutes in tests. */
-export type ScienceFlowResultDelivery = (
-  store: LocalResearchServiceStore,
-  request: ScienceFlowResultDeliveryRequest,
-  dependencies: { readonly now?: () => string },
-) => Promise<ScienceFlowResultDeliveryRecord>;
-
-export interface ScienceFlowEngineAdapterInput {
-  readonly store: LocalResearchServiceStore;
-  readonly settings: ScienceFlowLocalResearchSettings;
+export interface ScienceFlowExecutionTransportInput {
+  readonly store: ResearchPilotSessionStore;
+  readonly settings: Pick<ScienceFlowLocalResearchSettings, "taskDescription">;
   readonly now: () => string;
   readonly sleep: (ms: number) => Promise<void>;
-  readonly readArtifactBytes: (hash: string) => Promise<Buffer>;
-  readonly deliver: ScienceFlowResultDelivery;
-  readonly ownerStopped: (sessionId: string, runId: string) => Promise<boolean>;
-  /** The absolute research-line deadline for this operation, when configured. */
   readonly deadlineFor: (record: ScienceFlowLocalResearchOperation) => string | undefined;
-  /** The real detached-supervisor launcher; tests substitute one. */
   readonly launch?: ResearchPilotLauncher;
-  /** Passed to the existing snapshot query during readback; tests substitute one. */
-  readonly readSnapshot?: (
-    options: ReadScienceFlowRunSnapshotOptions,
-  ) => Promise<ScienceFlowSnapshotReadResult>;
 }
-
-/** Build the ScienceFlow adapter over the service's existing helpers. */
-export function createScienceFlowEngineAdapter(
-  input: ScienceFlowEngineAdapterInput,
-): ResearchEngineAdapter<ScienceFlowLocalResearchOperation, ScienceFlowLocalResearchDelivery> {
+/** Communicate with the managed engine and convert its receipts, states and progress. */
+export function createScienceFlowExecutionTransport(input: ScienceFlowExecutionTransportInput):
+  ResearchExecutionTransport<ScienceFlowLocalResearchOperation, ScienceFlowLocalResearchDelivery> {
   const { store, settings, now, sleep } = input;
-  const { readArtifactBytes, deliver } = input;
-
-  const transitions: ResearchLifecycleTransitions<ScienceFlowLocalResearchOperation> = {
-    deliveryFailed(record, message) {
-      return {
-        ...record,
-        delivery: {
-          attempts: record.delivery.attempts + 1,
-          message,
-          reason: "publication-failed",
-          state: "failed",
-          updatedAt: now(),
-        },
-      };
-    },
-    failed(record, step, message) {
-      return { ...record, state: "failed", error: { message, step } };
-    },
-    stopped(record) {
-      return { ...record, state: "stopped" };
-    },
-    stoppedByConversation(record, at) {
-      return {
-        ...record,
-        state: "stopped",
-        stop: record.stop.requestedAt
-          ? record.stop
-          : { ...record.stop, requestedAt: at, requestedBy: "conversation-cancel" },
-      };
-    },
-    stopping(record, at, requestedBy) {
-      return {
-        ...record,
-        state: record.state === "completed" || record.state === "failed" ? record.state : "stopping",
-        stop: { ...record.stop, requestedAt: at, requestedBy },
-      };
-    },
-    stopRequestedByConversation(record, at) {
-      return {
-        ...record,
-        stop: { ...record.stop, requestedAt: at, requestedBy: "conversation-cancel" },
-      };
-    },
-    stopResult(record, at, result) {
-      return {
-        ...record,
-        state: result.confirmed ? "stopped" : record.state,
-        engine: { ...record.engine, ...(result.confirmed ? { status: "stopped" } : {}) },
-        stop: {
-          ...record.stop,
-          ...(result.confirmed ? { confirmedAt: at, engineStatus: "stopped" } : {}),
-          ...(result.error ? { lastError: result.error } : {}),
-        },
-      };
-    },
-    unknown(record) {
-      return { ...record, state: "unknown" };
-    },
-  };
-
   const pilotRequest = (record: ScienceFlowLocalResearchOperation) => {
     const deadlineAt = input.deadlineFor(record);
     return {
@@ -422,286 +272,8 @@ export function createScienceFlowEngineAdapter(
     };
   };
 
-  const deliveryState = (
-    record: ScienceFlowLocalResearchOperation,
-    delivered: ScienceFlowResultDeliveryRecord,
-  ): ScienceFlowLocalResearchDelivery => {
-    const previous = record.delivery;
-    const attempts = previous.attempts + 1;
-    if (delivered.outcome.status === "delivered" && delivered.selected) {
-      const solution = delivered.artifacts.solution
-        ? artifactRef(delivered.artifacts.solution, "solution")
-        : undefined;
-      const note = delivered.artifacts.note ? artifactRef(delivered.artifacts.note, "note") : undefined;
-      const staged = delivered.attempts.flatMap((attempt) => attempt.artifact
-        ? [{
-            ...artifactRef(attempt.artifact, attempt.role),
-            metricName: attempt.metricName,
-            metricValue: attempt.metricValue,
-          }]
-        : []);
-      const researcher = delivered.researcherRecords.flatMap((entry) => entry.artifact
-        ? [artifactRef(entry.artifact, "researcher_record")]
-        : []);
-      return {
-        state: "delivered",
-        attempts,
-        updatedAt: now(),
-        selectedStageId: delivered.selected.stageId,
-        metricName: delivered.selected.metricName,
-        metricValue: delivered.selected.metricValue,
-        lowerIsBetter: delivered.selected.lowerIsBetter,
-        ...(solution ? { solution } : {}),
-        ...(note ? { note } : {}),
-        ...(staged.length ? { staged } : {}),
-        ...(researcher.length ? { researcher } : {}),
-      };
-    }
-    const failure = delivered.outcome;
-    if (failure.status === "failed" && failure.failedStep === "resolve" && failure.reason === "no-candidate") {
-      return { state: "no-candidate", attempts, updatedAt: now(), reason: failure.reason, message: failure.message };
-    }
-    const failed: ScienceFlowLocalResearchDelivery = failure.status === "failed"
-      ? {
-          state: "failed",
-          attempts,
-          updatedAt: now(),
-          reason: failure.reason,
-          failedStep: failure.failedStep,
-          message: failure.message,
-        }
-      : { state: "failed", attempts, updatedAt: now(), message: "Delivery returned no outcome" };
-    // A retry that fails after a successful publication keeps the delivered
-    // versions visible; the new failure is recorded beside them, not on top.
-    if (previous.state === "delivered") {
-      return { ...previous, attempts, updatedAt: now(), lastError: failed.reason ?? failed.message };
-    }
-    return failed;
-  };
-
-  /**
-   * Stage this operation's own input directory, if the profile uses dynamic
-   * inputs. The staged bytes are proven equal to the digests frozen at start.
-   */
-  const stageInputs = async (
-    record: ScienceFlowLocalResearchOperation,
-    signal: AbortSignal,
-    writer: ResearchOperationWriter<ScienceFlowLocalResearchOperation>,
-  ): Promise<ScienceFlowLocalResearchOperation | undefined> => {
-    const roles: StagedInputSelection[] = (record.inputs ?? []).flatMap((stagedInput) =>
-      stagedInput.stagedName !== undefined && stagedInput.versionId !== null
-        ? [{
-            role: stagedInput.role,
-            sha256: stagedInput.sha256,
-            size: stagedInput.size,
-            stagedName: stagedInput.stagedName,
-            versionId: stagedInput.versionId,
-          }]
-        : []);
-    // A selected or prepared task may bind ordinary Session data files; they are
-    // staged beside the plan and incumbent so the engine's dataset holds exactly
-    // the bytes this operation froze.
-    const data: StagedDataSelection[] = (record.taskBinding?.inputs ?? []).map((binding) => ({
-      logicalName: binding.logicalName,
-      sha256: binding.sha256,
-      size: binding.size,
-      versionId: binding.versionId,
-    }));
-    const destination = join(record.workDir, "input");
-    const manifestPath = join(record.workDir, "input-manifest.json");
-    try {
-      if (roles.length === 0 && data.length === 0) {
-        throw new InputPreparationRefusal("staging-failed", "This operation has no accepted input to stage");
-      }
-      // The operation's own work dir may not exist yet; the input directory
-      // itself is created non-recursively so a second staging attempt (or
-      // another operation's leftovers) is a conflict, not a silent overwrite.
-      await mkdir(record.workDir, { recursive: true, mode: 0o755 });
-      const staged = await stageResearchOperationInputs({
-        assetsDir: settings.seedDir,
-        destination,
-        readBytes: readArtifactBytes,
-        roles,
-        ...(data.length ? { data } : {}),
-        signal,
-      }, now);
-      await writeFile(manifestPath, staged.manifestJson, "utf8");
-      // Re-read the manifest so the recorded digest is the digest on disk.
-      const written = await readFile(manifestPath);
-      if (sha256(written) !== staged.manifestSha256) {
-        throw new InputPreparationRefusal("staging-failed", "The input manifest did not retain its bytes");
-      }
-      return writer.mutate(record.operationId, (current) => ({
-        ...current,
-        stagedInputs: {
-          dataDir: destination,
-          entries: staged.manifest.assets.entries,
-          manifestPath,
-          manifestSha256: staged.manifestSha256,
-          stagedAt: staged.manifest.stagedAt,
-          totalBytes: staged.manifest.assets.totalBytes,
-        },
-      }));
-    } catch (error) {
-      if (signal.aborted) {
-        // A cancel landed during preparation: record the stop, never launch.
-        writer.mutate(record.operationId, (current) => ({
-          ...current,
-          state: isTerminalResearchState(current.state) ? current.state : "stopped",
-          stop: current.stop.requestedAt
-            ? current.stop
-            : { ...current.stop, requestedAt: now(), requestedBy: "conversation-cancel" },
-        }));
-        return undefined;
-      }
-      // Every reason below is actionable: the record says the operation was
-      // accepted and never launched, and why. A stop that landed during the
-      // failure keeps its stopped state instead of becoming a failure.
-      writer.mutate(record.operationId, (current) => current.stop.requestedAt
-        ? { ...current, state: isTerminalResearchState(current.state) ? current.state : "stopped" }
-        : {
-            ...current,
-            state: "failed",
-            error: {
-              step: "staging",
-              message: error instanceof InputPreparationRefusal
-                ? `${error.reason}: ${error.message}`
-                : errorMessage(error),
-            },
-          });
-      return undefined;
-    }
-  };
-
-  /**
-   * Freeze a prepared task's evaluator and contract into this operation's own
-   * directory. The contract body is re-read and its digest must equal the one
-   * frozen at start, so a task version edited after acceptance cannot change
-   * what this run executes.
-   */
-  const stageTaskAssets = async (
-    record: ScienceFlowLocalResearchOperation,
-    writer: ResearchOperationWriter<ScienceFlowLocalResearchOperation>,
-  ): Promise<ScienceFlowLocalResearchOperation | undefined> => {
-    const binding = record.taskBinding;
-    if (!binding || binding.source !== "prepared") return record;
-    if (binding.assetDir !== undefined) return record;
-    if (binding.taskVersionId === undefined || binding.contractHash === undefined) {
-      writer.mutate(record.operationId, (current) => ({
-        ...current,
-        state: "failed",
-        error: { step: "task", message: "The prepared task version is incomplete" },
-      }));
-      return undefined;
-    }
-    try {
-      const assets = await materializePreparedTaskAssets(store, { readBytes: readArtifactBytes }, {
-        contractHash: binding.contractHash,
-        projectId: record.identity.projectId,
-        sessionId: record.identity.sessionId,
-        targetDir: join(record.workDir, "task"),
-        taskVersionId: binding.taskVersionId,
-      });
-      return writer.mutate(record.operationId, (current) => ({
-        ...current,
-        taskBinding: {
-          ...binding,
-          assetDir: join(record.workDir, "task"),
-          assetManifestSha256: assets.manifestSha256,
-        },
-      }));
-    } catch (error) {
-      writer.mutate(record.operationId, (current) => ({
-        ...current,
-        state: "failed",
-        error: { step: "task", message: errorMessage(error) },
-      }));
-      return undefined;
-    }
-  };
-
-  /** The model the Session resolves to must still be the one this start froze. */
-  const frozenModelRefusal = (record: ScienceFlowLocalResearchOperation): string | undefined => {
-    const frozen = record.launch.model;
-    if (!frozen) return undefined;
-    let resolved;
-    try {
-      resolved = resolveResearchPilotModel(store, {
-        projectId: record.identity.projectId,
-        sessionId: record.identity.sessionId,
-      });
-    } catch (error) {
-      return error instanceof ResearchPilotRefusal ? error.message : errorMessage(error);
-    }
-    const mismatch = resolved.selection.providerModel !== frozen.providerModel
-      || resolved.selection.selectionSource !== frozen.selectionSource
-      || resolved.selection.profileName !== frozen.profileName;
-    return mismatch
-      ? "The Session's effective model changed after this operation was accepted; it was not launched"
-      : undefined;
-  };
-
   return {
     engine: "scienceflow",
-    transitions,
-    async prepare(
-      record: ScienceFlowLocalResearchOperation,
-      signal: AbortSignal,
-      writer: ResearchOperationWriter<ScienceFlowLocalResearchOperation>,
-    ): Promise<ResearchEnginePreparation<ScienceFlowLocalResearchOperation>> {
-      if (settings.inputMode !== "dynamic") return { proceed: true, record };
-      const staged = await stageInputs(record, signal, writer);
-      if (!staged) return { proceed: false, record: writer.get(record.operationId) ?? record };
-      let current = staged;
-      // Preparation is asynchronous: the session may have been cancelled or the
-      // run stopped while the bytes were staged, with no worker left to read a
-      // result. Re-check both before the launch.
-      if (current.stop.requestedAt) {
-        return { proceed: false, record: writer.mutate(current.operationId, (item) => ({ ...item, state: "stopped" })) };
-      }
-      if (await input.ownerStopped(current.identity.sessionId, current.ownerRunId)) {
-        return {
-          proceed: false,
-          record: writer.mutate(current.operationId, (item) => transitions.stoppedByConversation(item, now())),
-        };
-      }
-      const modelRefusal = frozenModelRefusal(current);
-      if (modelRefusal !== undefined) {
-        return {
-          proceed: false,
-          record: writer.mutate(current.operationId, (item) => transitions.failed(item, "model-selection", modelRefusal)),
-        };
-      }
-      const withAssets = await stageTaskAssets(current, writer);
-      if (!withAssets) return { proceed: false, record: writer.get(record.operationId) ?? current };
-      current = withAssets;
-      return { proceed: true, record: current };
-    },
-
-    beforeLaunch(
-      record: ScienceFlowLocalResearchOperation,
-      writer: ResearchOperationWriter<ScienceFlowLocalResearchOperation>,
-      budget?: ResearchEngineLaunchBudget,
-    ): ResearchEngineBeforeLaunch<ScienceFlowLocalResearchOperation> {
-      const grant = record.launch.grant;
-      const totalAllowanceSec = budget?.allowanceSec ?? grant.totalAllowanceSec;
-      if (totalAllowanceSec >= grant.totalAllowanceSec) {
-        return { record, appliedAllowanceSec: grant.totalAllowanceSec };
-      }
-      // Only the engine-specific minimums and research/report split belong here.
-      // The shared service computes the line's deadline and remaining allowance.
-      if (totalAllowanceSec < 60) return { record, refusal: { step: "budget",
-        message: `The research line has ${totalAllowanceSec}s before its deadline; a launch needs at least 60s` } };
-      const reportBudgetSec = Math.min(grant.reportBudgetSec, Math.max(10, totalAllowanceSec - 30));
-      const researchBudgetSec = Math.min(grant.researchBudgetSec, totalAllowanceSec - reportBudgetSec);
-      if (researchBudgetSec < 30) return { record, refusal: { step: "budget",
-        message: `The research line has ${totalAllowanceSec}s before its deadline; the engine's research/report minimums do not fit` } };
-      const tightened = writer.mutate(record.operationId, (current) => ({ ...current,
-        launch: { ...current.launch, grant: { ...grant, reportBudgetSec, researchBudgetSec, totalAllowanceSec } },
-      }));
-      return { record: tightened, appliedAllowanceSec: totalAllowanceSec };
-    },
-
     async launch(
       record: ScienceFlowLocalResearchOperation,
       writer: ResearchOperationWriter<ScienceFlowLocalResearchOperation>,
@@ -712,9 +284,8 @@ export function createScienceFlowEngineAdapter(
         launch: { ...current.launch, launchedAt: now() },
       }));
       const current = writer.get(record.operationId) ?? record;
-      const receipt = await runResearchPilot(store, pilotRequest(current), {
+      const receipt = await runResearchPilotEngine(store, pilotRequest(current), {
         ...(input.launch ? { launch: input.launch } : {}),
-        ...(input.readSnapshot ? { readSnapshot: input.readSnapshot } : {}),
         now,
       });
       const observedEngine = await readEngineFacts(current);
@@ -774,59 +345,6 @@ export function createScienceFlowEngineAdapter(
       return await confirmStop(record, sleep);
     },
 
-    async deliver(
-      record: ScienceFlowLocalResearchOperation,
-      _options: { readonly force: boolean },
-    ): Promise<ScienceFlowLocalResearchDelivery> {
-      const delivered = await deliver(store, {
-        projectId: record.identity.projectId,
-        sessionId: record.identity.sessionId,
-        runId: record.engineRunId,
-        workDir: record.workDir,
-        pythonExecutable: record.launch.pythonExecutable,
-        readerScriptPath: record.launch.readerScriptPath,
-        task: record.task,
-        ...(record.taskBinding
-          ? {
-              evaluatorAuthority: record.taskBinding.source === "prepared" ? "generated-command" as const : "task-package" as const,
-              taskSummary: record.taskBinding.summary,
-              ...(record.taskBinding.source === "prepared" && record.taskBinding.evaluator.kind === "generated-command"
-                ? { evaluatorSha256: record.taskBinding.evaluator.sha256 }
-                : {}),
-            }
-          : {}),
-        ...(record.planVersionId ? { planVersionId: record.planVersionId } : {}),
-        ...(record.incumbentVersionId ? { incumbentVersionId: record.incumbentVersionId } : {}),
-        includeAttempts: true,
-        includeResearcherRecords: true,
-        recordPath: record.deliveryRecordPath,
-        launchReceiptPath: record.receiptPath,
-        // This deployment started the run; the note must not claim otherwise.
-        runOrigin: "experimental-local",
-      }, { now });
-      // The operation record is authoritative; this file is the same delivery
-      // record the operator command writes, kept for local evidence.
-      await writeDeliveryRecord(record.deliveryRecordPath, delivered).catch(() => undefined);
-      return deliveryState(record, delivered);
-    },
-  };
-}
-
-function artifactRef(
-  artifact: {
-    readonly artifactId: string;
-    readonly logicalName: string;
-    readonly version: number;
-    readonly versionId: string;
-  },
-  role: ScienceFlowLocalResearchArtifactRef["role"],
-): ScienceFlowLocalResearchArtifactRef {
-  return {
-    artifactId: artifact.artifactId,
-    logicalName: artifact.logicalName,
-    role,
-    version: artifact.version,
-    versionId: artifact.versionId,
   };
 }
 
@@ -936,11 +454,6 @@ except Exception as error:
     raise SystemExit(1)
 emit({"protocol": PROTOCOL, "outcome": "stopped"})
 `;
-
-function errorMessage(error: unknown): string {
-  const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
-  return message.slice(0, 500);
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

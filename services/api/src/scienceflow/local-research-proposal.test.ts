@@ -22,6 +22,7 @@ import {
   assertExperimentProposalAdvances,
   ExperimentProposalRefusal,
   parseExperimentProposal,
+  resolveScienceFlowProposal,
   type ExperimentProposalInput,
 } from "./local-research-proposal.js";
 
@@ -130,4 +131,18 @@ test("a new method, a new candidate or new evidence advances the round", () => {
     { incumbentVersionId: "version-1", proposal: previous },
     "version-1",
   ));
+});
+
+test("proposal domain resolves Session-owned evidence and refuses foreign or missing continuation evidence", () => {
+  const base = { identity: { projectId: "project", sessionId: "session" }, maxSubBudgetSeconds: 900,
+    now: "2026-11-27T00:00:00Z", required: false, operations: [], incumbentVersionId: null,
+    version: () => ({ artifactId: "artifact", sessionId: "session", content: { hash: "a".repeat(64) } }),
+    artifact: () => ({ createdInSessionId: "other-session" }), operation: () => undefined };
+  const input = proposal({ evidence: [{ kind: "artifact-version", versionId: "version", fact: "Observed input data" }] });
+  assert.equal(resolveScienceFlowProposal({ ...base, input })?.evidence[0]?.sha256, "a".repeat(64));
+  assert.throws(() => resolveScienceFlowProposal({ ...base, input, version: () => undefined }), ExperimentProposalRefusal);
+  assert.throws(() => resolveScienceFlowProposal({ ...base, required: true }), ExperimentProposalRefusal);
+  assert.equal(resolveScienceFlowProposal(base), undefined);
+  assert.throws(() => resolveScienceFlowProposal({ ...base, input: proposal(),
+    operation: () => ({ identity: { projectId: "other-project", sessionId: "session" } }) }), ExperimentProposalRefusal);
 });

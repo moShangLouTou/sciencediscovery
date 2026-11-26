@@ -46,6 +46,7 @@ import {
   researchPilotPlan,
   resolveResearchPilotModel,
   runResearchPilot,
+  runResearchPilotEngine,
   summarizeResult,
   type ResearchPilotOptions,
   type ResearchPilotResolvedModel,
@@ -1198,3 +1199,18 @@ function fakeSnapshot(runId: string): ScienceFlowRunSnapshot {
     diagnostics: [],
   };
 }
+
+test("engine transport requires no registration store and publishes no SD readback", async () => {
+  await withTempDir("pilot-engine-only-", async (base) => {
+    const store = fakeStore({ models: [[modelProfile({ id: "model-1" }), MODEL_TOKEN]], sessionModel: "model-1" });
+    let launches = 0;
+    const receipt = await runResearchPilotEngine(store, {
+      projectId: "project-1", sessionId: "session-1", runId: "engine-only",
+      workDir: join(base, "work"), privateRoot: join(base, "private"), seedDir: join(base, "seed"),
+      engineCheckout: "/opt/engine", pythonExecutable: "/opt/python/bin/python", readerScriptPath: "/opt/reader/snapshot.py",
+    }, { launch: async () => { launches += 1; return { outcome: "finished", status: "completed" }; } });
+    assert.equal(launches, 1); assert.equal(receipt.outcome.status, "completed");
+    assert.equal(receipt.outcome.engineRunId, "engine-only");
+    assert.equal(receipt.registration, null); assert.equal(receipt.snapshot, null); assert.equal(receipt.result, null);
+  });
+});

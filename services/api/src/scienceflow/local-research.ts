@@ -65,7 +65,10 @@ import {
   type ResearchStartPlan,
 } from "../research/task-service.js";
 import type { ResearchBudgetLine } from "../research/budget.js";
-import { createScienceFlowEngineAdapter } from "./engine-adapter.js";
+import { assertScienceFlowContinuation } from "./domain/continuation.js";
+import { withRoundContext } from "./domain/experiment-proposal.js";
+import { summarizeResearchOverhead, captureResearchUsage } from "../research/overhead-ledger.js";
+import { createScienceFlowEngineAdapter } from "./execution-service.js";
 import {
   deliverScienceFlowResult,
   type ScienceFlowResultDeliveryRecord,
@@ -159,9 +162,8 @@ import {
   type ScienceFlowResearchPreparation,
 } from "./local-research-overhead-repository.js";
 import {
-  assertExperimentProposalAdvances,
+  resolveScienceFlowProposal,
   ExperimentProposalRefusal,
-  parseExperimentProposal,
   type ExperimentProposal,
   type ExperimentProposalInput,
 } from "./local-research-proposal.js";
@@ -654,19 +656,7 @@ export function createLocalResearchService(input: {
     const usage = await readModelUsage(records[0]!.identity.sessionId).catch(() => undefined);
     if (usage === undefined) return;
     for (const record of records) {
-      const rows = usage.filter((entry) => entry.runId === record.ownerRunId);
-      const known = rows.filter((entry) => entry.usageStatus === "reported"
-        && entry.inputTokens !== null && entry.outputTokens !== null);
-      const status: NonNullable<ScienceFlowLocalResearchOperation["agentUsage"]>["status"] =
-        rows.length === 0 ? "not-recorded" : known.length === 0 ? "unknown" : known.length === rows.length ? "known" : "partially-known";
-      const agentUsage = {
-        calls: rows.length,
-        capturedAt: now(),
-        inputTokens: known.reduce((total, entry) => total + (entry.inputTokens ?? 0), 0),
-        outputTokens: known.reduce((total, entry) => total + (entry.outputTokens ?? 0), 0),
-        status,
-        unknownUsageCalls: rows.length - known.length,
-      };
+      const agentUsage = { ...captureResearchUsage(usage.filter((entry) => entry.runId === record.ownerRunId)), capturedAt: now() };
       mutate(record.operationId, (current) => ({ ...current, agentUsage }));
     }
   };
@@ -985,7 +975,7 @@ export function createLocalResearchService(input: {
   };
 
   // ScienceFlow is one concrete engine behind the shared operation lifecycle.
-  // The adapter owns engine calls and domain minimums. Product hooks supply
+  // The service composes engine communication with domain grant policy. Product hooks supply
   // task contracts and comparisons to the shared task/budget service.
   const engineAdapter = dependencies.adapter ?? createScienceFlowEngineAdapter({
     deadlineFor: lineDeadlineFor,
@@ -1199,39 +1189,17 @@ export function createLocalResearchService(input: {
     const version = store.getProjectArtifactVersion(request.projectId, versionId);
     if (!version) return;
     const artifact = store.getProjectArtifact(request.projectId, version.artifactId);
-    const operationsInSession = operations().listForSession(request.projectId, request.sessionId);
-    const references = (operation: ScienceFlowLocalResearchOperation): boolean => {
-      const refs = [operation.delivery.solution, ...(operation.delivery.staged ?? [])];
-      return refs.some((ref) => ref !== undefined && ref.versionId === version.id);
-    };
-    let source = operationsInSession.find(references);
-    if (!source) {
-      const meta = artifact?.originMeta;
-      if (meta?.deliveredBy !== "scienceflow-result-delivery" || meta.externalEngine !== "scienceflow"
-        || typeof meta.sourceRunId !== "string") {
-        // No delivery provenance: an ordinary uploaded or authored candidate.
-        return;
-      }
-      const sourceRunId = meta.sourceRunId;
-      source = operationsInSession.find((operation) => operation.engineRunId === sourceRunId);
-      if (!source) {
-        throw new LocalResearchRefusal(
-          "continuation-provenance-unknown",
-          "The starting candidate carries delivery metadata for a run this Session has no record of",
-        );
-      }
-    }
-    const sourceBinding = source.taskBinding;
-    const compatible = sourceBinding === undefined
-      ? source.task === selection.binding.taskId
-      : compatibleTaskContracts(sourceBinding, selection.binding);
-    if (!compatible) {
-      throw new LocalResearchRefusal(
-        "continuation-task-mismatch",
-        "The starting candidate was delivered by a different task contract. Start a new experiment without it, "
-          + "or import it deliberately as a new baseline; it cannot continue this task's run.",
-      );
-    }
+    const meta = artifact?.originMeta;
+    const reason = assertScienceFlowContinuation({ binding: selection.binding, versionId: version.id,
+      operations: operations().listForSession(request.projectId, request.sessionId),
+      sourceRunId: typeof meta?.sourceRunId === "string" ? meta.sourceRunId : undefined,
+      hasDeliveryProvenance: meta?.deliveredBy === "scienceflow-result-delivery" && meta.externalEngine === "scienceflow"
+        && typeof meta.sourceRunId === "string",
+    });
+    if (reason) throw new LocalResearchRefusal(reason, reason === "continuation-provenance-unknown"
+      ? "The starting candidate carries delivery metadata for a run this Session has no record of"
+      : "The starting candidate was delivered by a different task contract. Start a new experiment without it, "
+        + "or import it deliberately as a new baseline; it cannot continue this task's run.");
   };
 
   /** Preparation wall clock attributable to one frozen scientific contract. */
@@ -1240,12 +1208,7 @@ export function createLocalResearchService(input: {
     sessionId: string,
     contract: ResearchContractIdentity,
   ): number => {
-    return attributableResearchPreparations(contract, preparationsFor(projectId, sessionId))
-      .reduce(
-        (total, preparation) => total
-          + (preparation.wallClock.status === "known" ? preparation.wallClock.seconds : 0),
-        0,
-      );
+    return summarizeResearchOverhead(attributableResearchPreparations(contract, preparationsFor(projectId, sessionId))).knownSeconds;
   };
 
   const lineFactsFor = (
@@ -1405,66 +1368,19 @@ export function createLocalResearchService(input: {
     // method change. First rounds stay compatible with the older entry; the
     // production tool always supplies the structured proposal.
     let proposal: ExperimentProposal | undefined;
-    const previousOperation = [...groupOps].reverse().find((operation) => operation.proposal !== undefined);
-    if (request.proposal !== undefined) {
-      try {
-        const parsed = parseExperimentProposal(request.proposal, {
-          maxSubBudgetSeconds: settings.defaults.totalAllowanceSec,
-          now: now(),
-        });
-        const resolvedEvidence: Array<ExperimentProposal["evidence"][number]> = [];
-        for (const entry of parsed.evidence) {
-          if (entry.kind === "artifact-version" && entry.versionId !== undefined) {
-            const version = store.getProjectArtifactVersion(request.projectId, entry.versionId);
-            const artifact = version ? store.getProjectArtifact(request.projectId, version.artifactId) : undefined;
-            const ownsArtifact = artifact !== undefined && artifact.deletedAt === undefined
-              && artifact.createdInSessionId === request.sessionId;
-            const ownsVersion = version !== undefined && version.sessionId === request.sessionId;
-            if (!version || !artifact || artifact.deletedAt || (!ownsArtifact && !ownsVersion)) {
-              throw new LocalResearchRefusal(
-                "proposal-invalid",
-                `Evidence artifact version ${entry.versionId} is not a live version of this Session`,
-              );
-            }
-            resolvedEvidence.push({ ...entry, sha256: version.content.hash });
-          } else if (entry.kind === "operation-result" && entry.operationId !== undefined) {
-            const evidenceOperation = operations().get(entry.operationId);
-            if (!evidenceOperation || evidenceOperation.identity.projectId !== request.projectId
-              || evidenceOperation.identity.sessionId !== request.sessionId) {
-              throw new LocalResearchRefusal(
-                "proposal-invalid",
-                `Evidence operation ${entry.operationId} is not a research operation of this Session`,
-              );
-            }
-            resolvedEvidence.push({ ...entry });
-          }
-        }
-        proposal = { ...parsed, evidence: resolvedEvidence };
-        assertExperimentProposalAdvances(
-          proposal,
-          previousOperation?.proposal === undefined
-            ? undefined
-            : {
-                incumbentVersionId: previousOperation.incumbentVersionId ?? null,
-                proposal: previousOperation.proposal,
-              },
-          effectiveRequest.incumbentVersionId ?? null,
-        );
-      } catch (error) {
-        if (error instanceof LocalResearchRefusal) throw error;
-        if (error instanceof ExperimentProposalRefusal) {
-          throw new LocalResearchRefusal(
-            error.reason === "proposal-not-new" ? "proposal-not-new" : "proposal-invalid",
-            error.message,
-          );
-        }
-        throw new LocalResearchRefusal("proposal-invalid", errorMessage(error));
-      }
-    } else if (settings.taskMode === "task-dynamic" && groupOps.length > 0) {
-      throw new LocalResearchRefusal(
-        "proposal-invalid",
-        "A continuation round needs a structured experiment proposal with its evidence, method change, expected observation, evaluation method, stop condition and sub-budget",
-      );
+    try {
+      proposal = resolveScienceFlowProposal({ input: request.proposal, identity: request,
+        maxSubBudgetSeconds: settings.defaults.totalAllowanceSec, now: now(),
+        required: settings.taskMode === "task-dynamic" && groupOps.length > 0, operations: groupOps,
+        incumbentVersionId: effectiveRequest.incumbentVersionId ?? null,
+        version: (id) => store.getProjectArtifactVersion(request.projectId, id),
+        artifact: (id) => store.getProjectArtifact(request.projectId, id),
+        operation: (id) => operations().get(id),
+      });
+    } catch (error) {
+      if (error instanceof ExperimentProposalRefusal) throw new LocalResearchRefusal(
+        error.reason === "proposal-not-new" ? "proposal-not-new" : "proposal-invalid", error.message);
+      throw new LocalResearchRefusal("proposal-invalid", errorMessage(error));
     }
 
     const childTotalAllowanceSec = proposal?.subBudgetSeconds ?? settings.defaults.totalAllowanceSec;
@@ -2099,32 +2015,6 @@ function titleFromDescription(description: string, taskId: string): string {
  * re-prepared task (new contract version or digest) is a new experiment even
  * when its title or slug matches.
  */
-function compatibleTaskContracts(source: ScienceFlowTaskBinding, target: ScienceFlowTaskBinding): boolean {
-  if (source.source !== target.source || source.taskId !== target.taskId) return false;
-  if (source.artifactPath !== target.artifactPath || source.artifactKind !== target.artifactKind) return false;
-  if (source.metricName !== target.metricName || source.lowerIsBetter !== target.lowerIsBetter) return false;
-  if (source.source === "prepared" && source.contractHash !== target.contractHash) return false;
-  const left = source.evaluator;
-  const right = target.evaluator;
-  if (left.kind !== right.kind) return false;
-  if (left.kind === "generated-command" && right.kind === "generated-command" && left.sha256 !== right.sha256) {
-    return false;
-  }
-  if (left.kind === "task-package" && right.kind === "task-package") {
-    if (left.entrypoint !== right.entrypoint) return false;
-    // When both sides carry the actual package identity, it must agree. An
-    // older record without hashes is left readable but never treated as proof
-    // that the evaluated bytes were the same.
-    if (left.entrypointSha256 !== undefined && right.entrypointSha256 !== undefined
-      && left.entrypointSha256 !== right.entrypointSha256) return false;
-    if (left.packageSha256 !== undefined && right.packageSha256 !== undefined
-      && left.packageSha256 !== right.packageSha256) return false;
-  }
-  return source.inputs.length === target.inputs.length && source.inputs.every((binding, index) => {
-    const other = target.inputs[index];
-    return other !== undefined && binding.logicalName === other.logicalName && binding.sha256 === other.sha256;
-  });
-}
 
 
 /**
@@ -2132,53 +2022,7 @@ function compatibleTaskContracts(source: ScienceFlowTaskBinding, target: Science
  * the researcher's instruction. The engine still runs one bounded task; this
  * text is what makes the round's evidence and stopping rule visible to it.
  */
-function withRoundContext(
-  base: string | undefined,
-  proposal: ExperimentProposal | undefined,
-  selection: ScienceFlowLocalResearchOperation["followedSelection"] | undefined,
-): string | undefined {
-  const parts: string[] = [];
-  if (base?.trim()) parts.push(base.trim());
-  if (selection) {
-    parts.push([
-      "## Explicit starting-point decision",
-      "",
-      `This round follows the result of operation \`${selection.operationId}\` (artifact version \`${selection.versionId}\`).`,
-      `Recorded reason: ${selection.reason}`,
-      "Do not silently replace this starting candidate; report any deviation.",
-    ].join("\n"));
-  }
-  if (proposal) {
-    const evidence = proposal.evidence.map((entry) => entry.kind === "artifact-version"
-      ? `- artifact version \`${entry.versionId}\`: ${entry.fact}`
-      : `- research operation \`${entry.operationId}\`: ${entry.fact}`).join("\n");
-    parts.push([
-      "## This round's structured proposal",
-      "",
-      `Research question: ${proposal.researchQuestion}`,
-      "",
-      `Evidence read for this round:\n${evidence}`,
-      "",
-      `Concrete method change: ${proposal.methodChange}`,
-      "",
-      `Expected observable result: ${proposal.expectedObservation}`,
-      "",
-      `Fixed evaluation method: ${proposal.evaluationMethod}`,
-      "",
-      `Stop condition for this round: ${proposal.stopCondition}`,
-      ...(proposal.subBudgetSeconds === null ? [] : ["", `Sub-budget: ${proposal.subBudgetSeconds}s of engine wall clock.`]),
-      ...(proposal.repeat === null ? [] : [
-        "",
-        `Declared randomized repeat (${proposal.repeat.repetitions} repetitions): ${proposal.repeat.purpose}. Randomness: ${proposal.repeat.randomness}.`,
-      ]),
-      "",
-      "Carry out this method change. Do not merely restate the previous plan, and do not substitute a different experiment.",
-    ].join("\n"));
-  }
-  return parts.length ? parts.join("\n\n") : undefined;
-}
 
-/** Map a shared input-binding refusal to this service's stable reason codes. */
 function inputRefusal(error: unknown): unknown {
   if (!(error instanceof ResearchInputRefusal)) return error;
   const reason: LocalResearchRefusalReason = error.reason;

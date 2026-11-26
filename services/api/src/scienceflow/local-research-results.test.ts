@@ -1640,3 +1640,15 @@ test("the real interpreter yields a stable execution environment fingerprint wit
   assert.match(first.python, /^\d+\.\d+\.\d+$/u);
   assert.ok(!JSON.stringify(first).includes("/"), "no host path is exposed");
 });
+
+test("continuation domain distinguishes a new seed, missing provenance and a changed task contract", async () => {
+  const { assertScienceFlowContinuation } = await import("./domain/continuation.js");
+  const source = operation();
+  const versionId = source.delivery.solution?.versionId;
+  assert.ok(versionId);
+  const input = { binding: preparedBinding(), versionId, operations: [source], hasDeliveryProvenance: true };
+  assert.equal(assertScienceFlowContinuation(input), undefined);
+  assert.equal(assertScienceFlowContinuation({ ...input, binding: preparedBinding({ contractHash: "b".repeat(64) }) }), "continuation-task-mismatch");
+  assert.equal(assertScienceFlowContinuation({ ...input, operations: [], sourceRunId: source.engineRunId }), "continuation-provenance-unknown");
+  assert.equal(assertScienceFlowContinuation({ ...input, operations: [], hasDeliveryProvenance: false }), undefined);
+});

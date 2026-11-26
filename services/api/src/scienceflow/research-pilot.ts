@@ -497,7 +497,7 @@ type ResearchPilotRequest = ResearchPilotOptions & {
 };
 
 interface ResearchPilotContext {
-  readonly store: ResearchPilotReadbackStore;
+  readonly store: ResearchPilotSessionStore & { readonly scienceFlowRegistrations?: ScienceFlowRegistrationStore };
   readonly identity: { readonly projectId: string; readonly sessionId: string };
   readonly request: ResearchPilotRequest;
   readonly grant: ResearchPilotGrant;
@@ -782,6 +782,24 @@ export async function runResearchPilot(
   request: ResearchPilotRequest,
   dependencies: ResearchPilotDependencies = {},
 ): Promise<ResearchPilotReceipt> {
+  return runResearchPilotInvocation(store, request, dependencies, false);
+}
+
+/** Engine-only invocation: registration and artifact delivery belong to the operation service. */
+export async function runResearchPilotEngine(
+  store: ResearchPilotSessionStore,
+  request: ResearchPilotRequest,
+  dependencies: Pick<ResearchPilotDependencies, "launch" | "now"> = {},
+): Promise<ResearchPilotReceipt> {
+  return runResearchPilotInvocation(store, request, dependencies, true);
+}
+
+async function runResearchPilotInvocation(
+  store: ResearchPilotSessionStore & { readonly scienceFlowRegistrations?: ScienceFlowRegistrationStore },
+  request: ResearchPilotRequest,
+  dependencies: ResearchPilotDependencies,
+  executionOnly: boolean,
+): Promise<ResearchPilotReceipt> {
   const now = dependencies.now ?? (() => new Date().toISOString());
   const startedAt = now();
   const identity = { projectId: request.projectId, sessionId: request.sessionId };
@@ -954,6 +972,7 @@ export async function runResearchPilot(
     launch: launched,
     dependencies,
     startedAt,
+    executionOnly,
   });
 }
 
@@ -1052,6 +1071,7 @@ async function finishResearchPilot(input: {
   readonly dependencies: ResearchPilotDependencies;
   readonly startedAt: string;
   readonly previous?: ResearchPilotReceipt;
+  readonly executionOnly?: boolean;
 }): Promise<ResearchPilotReceipt> {
   const { context, resolved, launch, dependencies, startedAt, previous } = input;
   const { store, identity, request, grant, paths } = context;
@@ -1105,11 +1125,20 @@ async function finishResearchPilot(input: {
     );
   }
 
+  if (input.executionOnly) {
+    return writeReceipt({ ...base, finishedAt: context.now(),
+      outcome: { status: launch.outcome === "finished" ? "completed" : "observation-failed",
+        ...(launch.outcome === "finished" ? {} : { failedStep: "observe" }), engineRunId },
+      launch: launchRecord, registration: null, snapshot: null, result: null, usage: null,
+    }, paths.receiptPath);
+  }
+  const registrationStore = store.scienceFlowRegistrations;
+  if (!registrationStore) throw new ResearchPilotRefusal("invalid-option", "Registration storage is unavailable");
   const registrationService = createScienceFlowRegistrationService({
     identities: store,
     requireWritable: (sessionId) => store.assertSessionWritable(sessionId),
     resolveBinding: () => bindingFor(identity, request.runId, paths),
-    store: () => store.scienceFlowRegistrations,
+    store: () => registrationStore,
   });
   let registered: ResearchPilotReceipt["registration"] = null;
   let step: "register" | "readback" = "register";

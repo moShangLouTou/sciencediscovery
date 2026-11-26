@@ -28,6 +28,7 @@
  * written. Reads re-validate the row and throw instead of repairing it.
  */
 import type { DatabaseSync } from "node:sqlite";
+import { ResearchVersionRepository } from "../research/version-repository.js";
 
 import type {
   PreparedTaskInputBinding,
@@ -92,65 +93,16 @@ interface ValidationRow {
   record_json: string;
 }
 
-export class PreparedTaskValidationRepository implements PreparedTaskValidationStore {
-  constructor(readonly database: DatabaseSync) {
-    database.exec(`
-      CREATE TABLE IF NOT EXISTS science_flow_prepared_task_validations (
-        contract_version_id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        recorded_at TEXT NOT NULL,
-        record_json TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS science_flow_prepared_task_validations_session
-        ON science_flow_prepared_task_validations(session_id);
-      CREATE INDEX IF NOT EXISTS science_flow_prepared_task_validations_project
-        ON science_flow_prepared_task_validations(project_id);
-    `);
-  }
-
-  record(validation: PreparedTaskValidation): void {
-    const body = JSON.stringify(validation);
-    this.database
-      .prepare(
-        `INSERT INTO science_flow_prepared_task_validations
-           (contract_version_id, project_id, session_id, recorded_at, record_json)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(contract_version_id) DO NOTHING`,
-      )
-      .run(
-        validation.contractVersionId,
-        validation.projectId,
-        validation.sessionId,
-        validation.recordedAt,
-        body,
-      );
-    const stored = this.get(validation.projectId, validation.contractVersionId);
-    if (!stored || JSON.stringify(stored) !== body) {
-      throw new PreparedTaskValidationCorruptError();
-    }
-  }
-
-  get(projectId: string, contractVersionId: string): PreparedTaskValidation | undefined {
-    const row = this.database
-      .prepare(
-        `SELECT * FROM science_flow_prepared_task_validations
-          WHERE project_id = ? AND contract_version_id = ?`,
-      )
-      .get(projectId, contractVersionId) as ValidationRow | undefined;
-    return row ? parseRow(row) : undefined;
-  }
-
-  deleteSession(sessionId: string): void {
-    this.database
-      .prepare("DELETE FROM science_flow_prepared_task_validations WHERE session_id = ?")
-      .run(sessionId);
-  }
-
-  deleteProject(projectId: string): void {
-    this.database
-      .prepare("DELETE FROM science_flow_prepared_task_validations WHERE project_id = ?")
-      .run(projectId);
+export class PreparedTaskValidationRepository extends ResearchVersionRepository<PreparedTaskValidation> implements PreparedTaskValidationStore {
+  constructor(database: DatabaseSync) {
+    super(database, { table: "science_flow_prepared_task_validations", keyColumn: "contract_version_id",
+      identity: (record) => ({ versionId: record.contractVersionId, projectId: record.projectId,
+        sessionId: record.sessionId, recordedAt: record.recordedAt }),
+      decode: (value, identity) => parseRow({ contract_version_id: identity.versionId,
+        project_id: identity.projectId, session_id: identity.sessionId, recorded_at: identity.recordedAt,
+        record_json: JSON.stringify(value) }),
+      corrupt: () => new PreparedTaskValidationCorruptError(),
+    });
   }
 }
 

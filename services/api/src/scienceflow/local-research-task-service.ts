@@ -29,10 +29,10 @@
  */
 import { publishArtifactVersion, type ResearchArtifactStore } from "../research/artifact-publisher.js";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 
-import { CasStore } from "@sciencediscovery/cas";
+import { withResearchPreparationWorkspace } from "../research/preparation.js";
 import type { ScientificArtifact, ScientificArtifactVersion } from "@sciencediscovery/schema";
 
 import {
@@ -201,9 +201,7 @@ export async function prepareResearchTask(
   const evaluatorSha = createHash("sha256").update(evaluatorBytes).digest("hex");
 
   // Probe in a private preparation directory; nothing here becomes live state.
-  await mkdir(dependencies.tasksRoot, { recursive: true, mode: 0o755 });
-  const root = await mkdtemp(join(dependencies.tasksRoot, ".prepare-"));
-  let probes: readonly PreparedTaskProbe[];  try {
+  const probes = await withResearchPreparationWorkspace(dependencies.tasksRoot, async (root) => {
     const evaluatorPath = join(root, "evaluator.py");
     await writeFile(evaluatorPath, evaluatorBytes, { mode: 0o600 });
     const datasetFiles: Array<{ name: string; path: string }> = [];
@@ -224,7 +222,7 @@ export async function prepareResearchTask(
       await writeFile(path, sample.content, { mode: 0o600 });
       samplePaths.push({ artifactPath: path, expect: sample.expect, label: sample.label });
     }
-    probes = await (dependencies.probe ?? probePreparedEvaluator)(dependencies.settings, {
+    return await (dependencies.probe ?? probePreparedEvaluator)(dependencies.settings, {
       artifactKind,
       artifactPath,
       datasetFiles,
@@ -235,16 +233,12 @@ export async function prepareResearchTask(
       taskRoot: join(root, "task-root"),
       workspaceRoot: join(root, "workspaces"),
     }, input.signal);
-  } finally {
-    await rm(root, { force: true, recursive: true }).catch(() => undefined);
-  }
+  });
 
   assertProbeAccepted(probes, lowerIsBetter, metricName);
 
   // Publish the evaluator first: the contract refers to its version id, and a
   // later edit to the artifact creates a new version instead of changing this one.
-  const cas = new CasStore(store.dataDir);
-  const evaluatorStored = await cas.put(evaluatorBytes);
   const evaluatorPublication = await publishTaskFile(store, {
     artifactKind: "other",
     bytes: evaluatorBytes,
@@ -252,7 +246,6 @@ export async function prepareResearchTask(
     mediaType: "text/x-python",
     originMeta: { agentRunId: input.runId, publishedBy: "research-task-tool" },
     sessionId: input.sessionId,
-    stored: evaluatorStored,
     title: `${title} evaluator`,
   });
 
@@ -294,7 +287,7 @@ export async function prepareResearchTask(
   // The contract is read back through the same parser a start uses, so a writing
   // bug cannot publish a contract this deployment cannot consume.
   parsePreparedTaskContract(contractBytes);
-  const contractStored = await cas.put(contractBytes);
+  const contractHash = createHash("sha256").update(contractBytes).digest("hex");
   const contractPublication = await publishTaskFile(store, {
     artifactKind: "json",
     bytes: contractBytes,
@@ -302,7 +295,6 @@ export async function prepareResearchTask(
     mediaType: "application/json",
     originMeta: { agentRunId: input.runId, publishedBy: "research-task-tool" },
     sessionId: input.sessionId,
-    stored: contractStored,
     title: `${title} task contract`,
   });
 
@@ -311,7 +303,7 @@ export async function prepareResearchTask(
   // one that copies this probe array — cannot inherit this validation.
   const validation: PreparedTaskValidation = {
     artifact: { kind: artifactKind, path: artifactPath },
-    contractHash: contractStored.hash,
+    contractHash,
     contractVersionId: contractPublication.version.id,
     evaluator: {
       sha256: evaluatorSha,
@@ -372,13 +364,12 @@ async function publishTaskFile(
     readonly mediaType: string;
     readonly originMeta: Record<string, string>;
     readonly sessionId: string;
-    readonly stored: { readonly hash: string; readonly size: number };
     readonly title: string;
   },
 ): Promise<{ artifact: { id: string }; version: { id: string; version: number } }> {
   try {
     const published = await publishArtifactVersion(store, {
-      bytes: input.bytes, digest: input.stored.hash, description: input.title,
+      bytes: input.bytes, description: input.title,
       kind: input.artifactKind, logicalName: input.logicalName, mediaType: input.mediaType,
       origin: "llm_declared", originMeta: input.originMeta, sessionId: input.sessionId, title: input.title,
     });

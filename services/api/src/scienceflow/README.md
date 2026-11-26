@@ -165,24 +165,45 @@ and settlement, background execution, observation, stop/cancel and delivery
 retry. ScienceFlow supplies the product hooks: `planStart` resolves the
 Session's SD model, validates the profile, task and input versions, builds the
 proposal and lease, and returns the record; `lineFactsFor` supplies the frozen
-contract group. Task catalog/preparation, proposals, evaluator identity,
-comparison groups, best/selected candidates and continuation rules stay in
-`local-research.ts`. The shared service refreshes admission facts after planning
-and recomputes the remaining allowance/deadline after preparation. The SF
-adapter applies that cap to its frozen grant, keeping only its 60-second total
-minimum and research/report split. It does not compute platform budget policy.
+contract group. The shared service refreshes admission facts after planning and
+recomputes the remaining allowance/deadline after preparation.
 
-`engine-adapter.ts` owns dynamic input staging, prepared-task assets, the model
-freeze check, Python pilot launch, receipt and engine-record reads, stop calls
-and result publication through `result-delivery.ts`. The pilot still launches
-and observes within one call; this refactor changes neither its local process
-execution nor its sandbox guarantees. Persisted records, configuration names,
-tool/HTTP contracts and result bytes retain their existing formats.
+The final adapter is assembled by `execution-service.ts`:
+
+| Responsibility | Owner |
+| --- | --- |
+| Preparation ordering, cancellation checks and failure persistence | `research/engine-service.ts` |
+| Private probe workspace lifetime and attempt observation | `research/preparation.ts` |
+| Preparation cost, probe count and recorded model usage arithmetic | `research/overhead-ledger.ts` |
+| Immutable version-bound evidence and conflict checks | `research/version-repository.ts` |
+| CAS/artifact versions and plan-head publication | `research/artifact-publisher.ts`, `research/plan-publication.ts` |
+| SF input layout, task asset mapping and frozen model policy | `operation-preparation.ts` |
+| SF record transitions, minimum allowance and research/report grant split | `operation-policy.ts` |
+| SF result request and delivery-record mapping | `operation-delivery.ts`, calling `result-delivery.ts` and the shared publisher |
+| Engine launch, receipt/progress conversion and stop protocol | `engine-adapter.ts` (`ResearchExecutionTransport`) |
+
+`domain/experiment-comparison.ts` owns contract comparability, result validity,
+ranking and explicit selection. `domain/experiment-proposal.ts` owns structured
+evidence, novelty and round instructions through read-only ports.
+`domain/continuation.ts` checks candidate provenance and frozen task compatibility.
+`domain/research-line.ts` supplies scientific attribution and maps SF records to
+the shared budget/overhead ledger. These modules perform no process, filesystem
+or database I/O. Engine source/environment reads live in `engine-identity.ts`.
+The old result/proposal module paths remain compatibility exports.
+
+The execution transport uses `runResearchPilotEngine`: it emits the engine
+receipt without SD registration or snapshot publication. The service's delivery
+phase performs registration and publication, including retries. The operator
+`runResearchPilot` / attach entry points retain their full readback workflow.
+This separation does not change the pilot's host process isolation or expand its
+cancellation guarantees. Existing record schema versions, table/column names,
+configuration names and tool/HTTP contracts are retained; no data migration is
+required. Internal engine-only receipts keep the existing optional readback
+fields null until delivery owns that work.
 
 The delivery payload remains `ScienceFlowLocalResearchDelivery`. The shared
-lifecycle handles publication scheduling and retry; the adapter maps stage
-results and artifact references. A retry republishes existing results and
-does not restart the pilot.
+lifecycle schedules publication and retry; SF services map result content and
+artifact references. Retrying delivery never restarts the pilot.
 
 The service-level substitution seam continues to use ScienceFlow admission,
 model resolution and record shapes. Another product needs its own entry point
