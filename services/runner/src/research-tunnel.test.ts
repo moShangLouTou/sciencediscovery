@@ -21,7 +21,7 @@
  * - the real Runner path runs (`prepareSandboxLaunch`, `spawnSandboxProcess`,
  *   `runSandboxed`), real `bwrap`, the real `research-gateway` filter, and a
  *   real `exec` into a Python child;
- * - the workload is a synthetic payload, never the ScienceFlow engine, and the
+ * - the workload is a synthetic payload, independent of any product engine, and the
  *   host responder is a socket reader in this process, never a model service;
  * - nothing here is a gateway, a budget, a credential or a product route.
  */

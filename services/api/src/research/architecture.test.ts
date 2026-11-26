@@ -48,3 +48,19 @@ test("shared research modules never import ScienceFlow", async () => {
   }
   assert.deepEqual(offenders, []);
 });
+
+
+test("shared Runner mechanisms and input contracts never import a product", async () => {
+  const runner = join(RESEARCH_DIR, "../../../runner/src");
+  const schema = join(RESEARCH_DIR, "../../../../packages/schema/src");
+  const files = [
+    ...["research-run.ts", "research-input-bundles.ts", "research-input-bundles-http.ts", "execution-manager.ts",
+      "execution-boundary.ts", "execution-resource-fences.ts", "termination-resources.ts", "research-tunnel.ts"]
+      .map((name) => join(runner, name)),
+    ...["research-run.ts", "research-input-bundle.ts"].map((name) => join(schema, name)),
+  ];
+  for (const file of files) {
+    const source = await readFile(file, "utf8");
+    for (const pattern of FORBIDDEN) assert.equal(pattern.test(source), false, file);
+  }
+});

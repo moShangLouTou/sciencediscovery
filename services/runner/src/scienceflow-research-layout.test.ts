@@ -17,7 +17,8 @@
  * lease, against the same pinned source.
  *
  * These cases are gated on `SCIENCEFLOW_TEST_ENGINE_PYTHON`, an interpreter that
- * satisfies the engine's `requires-python` and can import its runtime package
+ * satisfies the engine's `requires-python` and can import { SCIENCEFLOW_ENGINE_MOUNT as RESEARCH_ENGINE_MOUNT } from "./scienceflow-engine-bridge.js";
+import its runtime package
  * set. When it is absent the cases skip with that reason rather than pretending
  * a substitute environment is the engine.
  *
@@ -42,7 +43,6 @@ import { promisify } from "node:util";
 import type { ExecutorConfig } from "./executor.js";
 import {
   prepareSandboxLaunch,
-  RESEARCH_ENGINE_MOUNT,
   runSandboxed,
   workspaceBindArguments,
 } from "./executor.js";
@@ -239,7 +239,7 @@ async function runInLayout(options: {
     language: "python",
     pathEnv: "/opt/science-env/bin:/usr/bin",
     pythonPathEnv: RESEARCH_ENGINE_MOUNT,
-    researchEngine: { maskVirtualEnv: options.maskVirtualEnv, sourceRoot: options.sourceRoot },
+    researchEngine: { mountPath: RESEARCH_ENGINE_MOUNT, maskVirtualEnv: options.maskVirtualEnv, sourceRoot: options.sourceRoot },
     workspaceBindArgs: binds.args,
     workspaceRoot: options.workspace,
   });

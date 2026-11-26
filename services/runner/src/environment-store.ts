@@ -977,7 +977,7 @@ export class EnvironmentStore {
   }
 
   /**
-   * Record that a ScienceFlow runtime probe could not prove its sandbox ended.
+   * Record that a runtime probe could not prove its sandbox ended.
    *
    * The in-memory entry is installed first: it is what the mutation gate checks,
    * and it must exist before the durable write can fail. The ledger row is the

@@ -58,3 +58,5 @@ export * from "./tool-graph-registry.js";
 export * from "./scienceflow.js";
 export * from "./scienceflow-input-bundle.js";
 export * from "@sciencediscovery/external-urls";
+
+export * from "./research-input-bundle.js";

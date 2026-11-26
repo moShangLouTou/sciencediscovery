@@ -27,6 +27,7 @@
  * Both tables join the existing `catalog.sqlite` additively. Reads re-validate
  * a row and throw instead of repairing it.
  */
+import { ResearchScopeRepository } from "../research/scope-repository.js";
 import type { DatabaseSync } from "node:sqlite";
 
 import {
@@ -61,74 +62,13 @@ interface SelectionRow {
   record_json: string;
 }
 
-export class ResearchResultSelectionRepository implements ResearchResultSelectionStore {
-  constructor(readonly database: DatabaseSync) {
-    database.exec(`
-      CREATE TABLE IF NOT EXISTS science_flow_research_result_selections (
-        project_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        group_id TEXT NOT NULL,
-        selected_at TEXT NOT NULL,
-        record_json TEXT NOT NULL,
-        PRIMARY KEY (project_id, session_id, group_id)
-      );
-      CREATE INDEX IF NOT EXISTS science_flow_research_result_selections_session
-        ON science_flow_research_result_selections(session_id);
-      CREATE INDEX IF NOT EXISTS science_flow_research_result_selections_project
-        ON science_flow_research_result_selections(project_id);
-    `);
-  }
-
-  get(projectId: string, sessionId: string, groupId: string): ScienceFlowResearchResultSelection | undefined {
-    const row = this.database
-      .prepare(
-        `SELECT * FROM science_flow_research_result_selections
-          WHERE project_id = ? AND session_id = ? AND group_id = ?`,
-      )
-      .get(projectId, sessionId, groupId) as SelectionRow | undefined;
-    return row ? parseSelectionRow(row) : undefined;
-  }
-
-  listForSession(projectId: string, sessionId: string): ScienceFlowResearchResultSelection[] {
-    const rows = this.database
-      .prepare(
-        `SELECT * FROM science_flow_research_result_selections
-          WHERE project_id = ? AND session_id = ?
-          ORDER BY selected_at, group_id`,
-      )
-      .all(projectId, sessionId) as unknown as SelectionRow[];
-    return rows.map(parseSelectionRow);
-  }
-
-  put(selection: ScienceFlowResearchResultSelection): void {
-    this.database
-      .prepare(
-        `INSERT INTO science_flow_research_result_selections
-           (project_id, session_id, group_id, selected_at, record_json)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(project_id, session_id, group_id) DO UPDATE SET
-           selected_at = excluded.selected_at,
-           record_json = excluded.record_json`,
-      )
-      .run(
-        selection.projectId,
-        selection.sessionId,
-        selection.groupId,
-        selection.selectedAt,
-        JSON.stringify(selection),
-      );
-  }
-
-  deleteSession(sessionId: string): void {
-    this.database
-      .prepare("DELETE FROM science_flow_research_result_selections WHERE session_id = ?")
-      .run(sessionId);
-  }
-
-  deleteProject(projectId: string): void {
-    this.database
-      .prepare("DELETE FROM science_flow_research_result_selections WHERE project_id = ?")
-      .run(projectId);
+export class ResearchResultSelectionRepository extends ResearchScopeRepository<ScienceFlowResearchResultSelection> implements ResearchResultSelectionStore {
+  constructor(database: DatabaseSync) {
+    super(database, { table: "science_flow_research_result_selections", corrupt: () => new ResearchResultStoreCorruptError("selection"), keyColumn: "group_id", timeColumn: "selected_at", codec: {
+      identity: (record) => ({ projectId: record.projectId, sessionId: record.sessionId, scopeKey: record.groupId, changedAt: record.selectedAt }),
+      decode: (value, row) => parseSelectionRow({ project_id: row.projectId, session_id: row.sessionId,
+        group_id: row.scopeKey, selected_at: row.changedAt, record_json: JSON.stringify(value) }),
+    } });
   }
 }
 
@@ -148,74 +88,14 @@ interface ParentRow {
   record_json: string;
 }
 
-export class ResearchParentRepository implements ResearchParentStore {
-  constructor(readonly database: DatabaseSync) {
-    database.exec(`
-      CREATE TABLE IF NOT EXISTS science_flow_research_parents (
-        project_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        group_id TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        record_json TEXT NOT NULL,
-        PRIMARY KEY (project_id, session_id, group_id)
-      );
-      CREATE INDEX IF NOT EXISTS science_flow_research_parents_session
-        ON science_flow_research_parents(session_id);
-      CREATE INDEX IF NOT EXISTS science_flow_research_parents_project
-        ON science_flow_research_parents(project_id);
-    `);
-  }
-
-  get(projectId: string, sessionId: string, groupId: string): ScienceFlowResearchParent | undefined {
-    const row = this.database
-      .prepare(
-        `SELECT * FROM science_flow_research_parents
-          WHERE project_id = ? AND session_id = ? AND group_id = ?`,
-      )
-      .get(projectId, sessionId, groupId) as ParentRow | undefined;
-    return row ? parseParentRow(row) : undefined;
-  }
-
-  listForSession(projectId: string, sessionId: string): ScienceFlowResearchParent[] {
-    const rows = this.database
-      .prepare(
-        `SELECT * FROM science_flow_research_parents
-          WHERE project_id = ? AND session_id = ?
-          ORDER BY updated_at, group_id`,
-      )
-      .all(projectId, sessionId) as unknown as ParentRow[];
-    return rows.map(parseParentRow);
-  }
-
-  put(parent: ScienceFlowResearchParent): void {
-    this.database
-      .prepare(
-        `INSERT INTO science_flow_research_parents
-           (project_id, session_id, group_id, updated_at, record_json)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(project_id, session_id, group_id) DO UPDATE SET
-           updated_at = excluded.updated_at,
-           record_json = excluded.record_json`,
-      )
-      .run(
-        parent.identity.projectId,
-        parent.identity.sessionId,
-        parent.groupId,
-        parent.updatedAt,
-        JSON.stringify(parent),
-      );
-  }
-
-  deleteSession(sessionId: string): void {
-    this.database
-      .prepare("DELETE FROM science_flow_research_parents WHERE session_id = ?")
-      .run(sessionId);
-  }
-
-  deleteProject(projectId: string): void {
-    this.database
-      .prepare("DELETE FROM science_flow_research_parents WHERE project_id = ?")
-      .run(projectId);
+export class ResearchParentRepository extends ResearchScopeRepository<ScienceFlowResearchParent> implements ResearchParentStore {
+  constructor(database: DatabaseSync) {
+    super(database, { table: "science_flow_research_parents", corrupt: () => new ResearchResultStoreCorruptError("parent"), keyColumn: "group_id", codec: {
+      identity: (record) => ({ projectId: record.identity.projectId, sessionId: record.identity.sessionId,
+        scopeKey: record.groupId, changedAt: record.updatedAt }),
+      decode: (value, row) => parseParentRow({ project_id: row.projectId, session_id: row.sessionId,
+        group_id: row.scopeKey, updated_at: row.changedAt, record_json: JSON.stringify(value) }),
+    } });
   }
 }
 

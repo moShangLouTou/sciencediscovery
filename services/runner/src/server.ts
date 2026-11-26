@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import { createResearchWorkloadRegistry, parseResearchRunRequest, ResearchRunError, type ResearchRunWiring } from "./research-run.js";
+import { RunnerResearchInputBundles } from "./research-input-bundles.js";
+import { handleResearchInputBundles } from "./research-input-bundles-http.js";
 import { createReadStream, rmSync } from "node:fs";
 import { chmod, link, lstat, mkdir, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -23,7 +26,6 @@ import { fileURLToPath } from "node:url";
 import { RunnerSkillPackages } from "./skill-packages.js";
 import {
   RunnerScienceFlowInputBundles,
-  ScienceFlowInputBundleError,
 } from "./scienceflow-input-bundles.js";
 
 import { createOperationalLogger, shortErrorMessage } from "@sciencediscovery/operational-logging";
@@ -39,6 +41,7 @@ import type {
   PythonExecutionRequest,
   RunnerExecutionBoundaryCapability,
   RunnerExecutionStatus,
+  ResearchRunRequest,
   RunnerHealth,
   RunnerRuntimeStatus,
   RemoteWorkspaceFile,
@@ -102,6 +105,8 @@ import { HostNpuJobBroker } from "./npu-broker.js";
 
 
 export interface RunnerConfig extends ExecutorConfig {
+  /** Trusted code registrations; never loaded from a request or environment variable. */
+  researchWorkloads?: readonly Omit<ResearchRunWiring, "config" | "environmentStore">[];
   authToken: string;
   host: string;
   port: number;
@@ -486,10 +491,10 @@ export function createRunnerServer(
   const sandbox = executorSandboxKind(config);
   const skillPackages = new RunnerSkillPackages(config.dataDir);
   // Input evidence bundles are opaque frozen task files addressed by content.
-  // This server only stores and reports them; a fixed internal research
-  // execution (constructed elsewhere) may verify one and materialize its own
-  // read-only copy. There is still no research start route here.
+  // Registered trusted workloads consume private read-only copies through
+  // the signed research execution route; requests cannot supply programs.
   const inputBundles = new RunnerScienceFlowInputBundles(config.dataDir);
+  const researchInputBundles = new RunnerResearchInputBundles(config.dataDir);
   const logger = createOperationalLogger({ category: "runner", dataDir: config.dataDir, service: "runner" });
   const profiles = envProfiles ?? new SessionEnvProfileStore();
   const gateways = egressGateways ?? new EgressGatewayRegistry(config.dataDir, (event, detail) => {
@@ -536,7 +541,10 @@ export function createRunnerServer(
   const executionQueues = new KeyedTaskQueue();
   const managedExecutions = new ExecutionManager(config.dataDir, detail => {
     logger.warn("execution_resources_quarantined", { ...detail });
-  });
+  }, { research: config.researchWorkloads === undefined ? undefined : createResearchWorkloadRegistry(
+    config.researchWorkloads.map((definition) => ({ ...definition, config: executorConfig, environmentStore,
+      inputBundles: definition.inputBundles ?? researchInputBundles })),
+  ) });
   const workspaceVersions = new VersionStore(config.dataDir);
   const seenExecutions = new Map<string, number>();
   const activeExecutions = new Map<string, RunnerExecutionStatus>();
@@ -685,7 +693,7 @@ export function createRunnerServer(
       }
       // Before accepting an execution, not before management/read/cancel calls.
       // A rejected request has not consumed its execution identity or run code.
-      if (request.method === "POST" && ["/execute", "/execute-shell", "/shell-executions"].includes(url.pathname)) {
+      if (request.method === "POST" && ["/execute", "/execute-shell", "/shell-executions", "/research-executions"].includes(url.pathname)) {
         const capability = await readiness.get();
         if (!capability.ready) {
           sendJson(response, 503, { error: capability.detail ?? capability.reason, code: "EXECUTION_UNAVAILABLE", capability });
@@ -1069,12 +1077,30 @@ export function createRunnerServer(
         sendJson(response, 201, revision);
         return;
       }
-      const managedMatch = url.pathname.match(/^\/shell-executions\/([^/]+)(?:\/(logs|cancel))?$/);
+      const managedMatch = url.pathname.match(/^\/(?:shell|research)-executions\/([^/]+)(?:\/(logs|cancel|files))?$/);
       if (managedMatch) {
         const id = decodeURIComponent(managedMatch[1]!);
         const owner = { sessionId: url.searchParams.get("sessionId") ?? "", agentId: url.searchParams.get("agentId") ?? "" };
         if (request.method === "GET" && managedMatch[2] === "logs") {
           sendJson(response, 200, managedExecutions.logs(id, owner, Number(url.searchParams.get("cursor") ?? "0")));
+          return;
+        }
+        if (request.method === "GET" && managedMatch[2] === "files") {
+          const execution = managedExecutions.get(id, owner);
+          const snapshot = execution.result?.workspaceSnapshot;
+          if (!execution.version || !snapshot) {
+            sendJson(response, 409, { error: "Execution has no committed output", code: "EXECUTION_OUTPUT_PENDING" });
+            return;
+          }
+          const pathValue = url.searchParams.get("path");
+          const path = pathValue === null ? undefined : validateRelativeWorkspacePath(pathValue);
+          const files = await workspaceSnapshotFiles(workspaceVersions, snapshot, path === undefined ? undefined : [path]);
+          if (path === undefined) { sendJson(response, 200, { executionId: id, version: execution.version, files }); return; }
+          const file = files.find((entry) => entry.path === path);
+          if (!file) { sendJson(response, 404, { error: "File is absent from this execution's committed output" }); return; }
+          response.writeHead(200, { "content-type": "application/octet-stream", "cache-control": "no-store",
+            "content-length": file.content.size, "x-content-sha256": file.content.digest.slice("sha256:".length) });
+          await pipeline(streamSnapshotFile(workspaceVersions, file.content), response);
           return;
         }
         if (request.method === "GET" && !managedMatch[2]) {
@@ -1086,54 +1112,11 @@ export function createRunnerServer(
           return;
         }
       }
-      const inputBundleMatch = /^\/scienceflow\/input-bundles\/([a-f0-9]{64})$/.exec(url.pathname);
-      if (request.method === "GET" && inputBundleMatch) {
-        // A read verifies the stored tree again and answers one fixed state:
-        // ready, missing, or corrupt. It publishes nothing and names no path.
-        try {
-          sendJson(response, 200, await inputBundles.status(inputBundleMatch[1]!));
-        } catch {
-          sendJson(response, 500, {
-            error: "ScienceFlow input bundle storage is unavailable",
-            code: "SCIENCEFLOW_INPUT_BUNDLE_UNAVAILABLE",
-          } satisfies ApiError);
-        }
-        return;
-      }
-      if (request.method === "POST" && url.pathname === "/scienceflow/input-bundles") {
-        const bytes = await readBytes(request, SCIENCE_FLOW_INPUT_BUNDLE_LIMITS.maxBodyBytes);
-        const body = bytes.toString("utf8");
-        if (!verifyExecutionSignature(config.authToken, request.headers[EXECUTION_TIMESTAMP_HEADER] as string | undefined,
-          body, request.headers[EXECUTION_SIGNATURE_HEADER] as string | undefined)) {
-          sendJson(response, 401, { error: "Invalid or expired execution signature" } satisfies ApiError);
-          return;
-        }
-        let bundle: unknown;
-        try {
-          bundle = JSON.parse(body);
-        } catch {
-          sendJson(response, 400, {
-            error: "ScienceFlow input bundle body is not valid JSON",
-            code: "SCIENCEFLOW_INPUT_BUNDLE_INVALID",
-          } satisfies ApiError);
-          return;
-        }
-        // The store re-derives the digest and every entry's bytes; the sender's
-        // claim is never taken as verification.
-        try {
-          sendJson(response, 200, await abortOnDisconnect(response, (signal) => inputBundles.put(bundle, signal)));
-        } catch (error) {
-          if (!(error instanceof ScienceFlowInputBundleError)) throw error;
-          const answer = {
-            invalid: [400, "ScienceFlow input bundle is invalid", "SCIENCEFLOW_INPUT_BUNDLE_INVALID"],
-            corrupt: [409, "Stored ScienceFlow input bundle is corrupt", "SCIENCEFLOW_INPUT_BUNDLE_CORRUPT"],
-            unavailable: [500, "ScienceFlow input bundle storage is unavailable", "SCIENCEFLOW_INPUT_BUNDLE_UNAVAILABLE"],
-          } as const;
-          const [status, message, code] = answer[error.kind];
-          sendJson(response, status, { error: message, code } satisfies ApiError);
-        }
-        return;
-      }
+      const bundleHttp = { authToken: config.authToken, readBytes, sendJson, abortOnDisconnect };
+      if (await handleResearchInputBundles(request, response, url, { ...bundleHttp, store: researchInputBundles })) return;
+      if (await handleResearchInputBundles(request, response, url, { ...bundleHttp, store: inputBundles,
+        prefix: "/scienceflow/input-bundles", label: "ScienceFlow", codePrefix: "SCIENCEFLOW",
+        maxBodyBytes: SCIENCE_FLOW_INPUT_BUNDLE_LIMITS.maxBodyBytes })) return;
       if (request.method === "POST" && url.pathname === "/scienceflow/runtime-check") {
         const body = await readBody(request);
         if (!verifyExecutionSignature(config.authToken, request.headers[EXECUTION_TIMESTAMP_HEADER] as string | undefined,
@@ -1172,6 +1155,26 @@ export function createRunnerServer(
           return;
         }
         sendJson(response, 200, await scienceFlowRuntime.check(probe));
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/research-executions") {
+        const body = await readBody(request);
+        if (!verifyExecutionSignature(config.authToken, request.headers[EXECUTION_TIMESTAMP_HEADER] as string | undefined,
+          body, request.headers[EXECUTION_SIGNATURE_HEADER] as string | undefined)) {
+          sendJson(response, 401, { error: "Invalid or expired execution signature" });
+          return;
+        }
+        let execution: ResearchRunRequest;
+        try { execution = parseResearchRunRequest(JSON.parse(body)); }
+        catch (error) {
+          if (error instanceof ResearchRunError) { sendJson(response, 400, { error: error.message, code: error.code }); return; }
+          throw error;
+        }
+        const root = execution.runnerWorkspaceKey
+          ? await remoteWorkspaceRoot(config.dataDir, execution.runnerWorkspaceKey) : execution.workspaceRoot;
+        const workspaceRoot = await validatedWorkspace(config.dataDir, root, config.extraWorkspaceRoots);
+        const accepted = managedExecutions.submitResearch({ ...execution, workspaceRoot });
+        sendJson(response, accepted.accepted ? 202 : 200, accepted.execution);
         return;
       }
       if (request.method === "POST" && ["/shell-executions", "/direct-shell-executions"].includes(url.pathname)) {

@@ -78,7 +78,7 @@ export interface ResearchArtifactStore {
     readonly kind: ScientificArtifactKind;
     readonly logicalName: string;
     readonly mediaType: string;
-    readonly origin: ArtifactOrigin;
+    readonly origin?: ArtifactOrigin;
     readonly originMeta?: ArtifactOriginMeta;
     readonly sessionId: string;
     readonly title?: string;

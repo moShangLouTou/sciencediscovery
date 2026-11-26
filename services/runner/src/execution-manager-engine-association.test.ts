@@ -39,7 +39,7 @@ import type {
   ResearchRunStatus,
   ShellExecutionResult,
 } from "@sciencediscovery/schema";
-import { canonicalScienceFlowInputBundleManifest, SCIENCE_FLOW_INPUT_BUNDLE_VERSION } from "@sciencediscovery/schema";
+import { canonicalResearchInputBundleManifest, RESEARCH_INPUT_BUNDLE_VERSION } from "@sciencediscovery/schema";
 
 import { ExecutionManager, mergeResearchEngine, validResearchEngine } from "./execution-manager.js";
 import type { ResearchRunExecutor } from "./research-run.js";
@@ -70,12 +70,12 @@ const INPUTS = (() => {
     sha256: createHash("sha256").update(entry.content).digest("hex"),
   }));
   const manifest = {
-    schemaVersion: SCIENCE_FLOW_INPUT_BUNDLE_VERSION as typeof SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
+    schemaVersion: RESEARCH_INPUT_BUNDLE_VERSION as typeof RESEARCH_INPUT_BUNDLE_VERSION,
     contractDigest,
     files,
   };
   const bundleDigest = createHash("sha256")
-    .update(canonicalScienceFlowInputBundleManifest(manifest), "utf8")
+    .update(canonicalResearchInputBundleManifest(manifest), "utf8")
     .digest("hex");
   return {
     identity: { bundleDigest, contractDigest },
@@ -108,7 +108,7 @@ function request(id: string, workspace: string): ResearchRunRequest {
       stopGraceMs: 100, verificationWindowMs: 500,
     },
     schemaVersion: 1,
-    workload: "scienceflow-fixed",
+    workload: "fixed-program",
     workspaceRoot: workspace,
   };
 }
@@ -126,7 +126,7 @@ function status(engineEvidence: ResearchEngineEvidence | undefined): ResearchRun
     schemaVersion: 1,
     stop: "none",
     verificationWindowMs: 500,
-    workload: "scienceflow-fixed",
+    workload: "fixed-program",
     inputs: INPUTS.evidence,
     ...(engineEvidence !== undefined ? { engine: engineEvidence } : {}),
   };
@@ -325,4 +325,14 @@ test("a failed durable write never claims the association and disables new work"
   assert.equal(manager.get("write-failed", OWNER).research?.engine, undefined);
   assert.throws(() => manager.submitResearch(request("after-write-failure", workspace)),
     /cannot be trusted/u);
+});
+
+
+test("a registered non-metric engine needs only its own id and durable handle", () => {
+  const evidence = { engineId: "proof-checker", engineRunId: "proof-1" };
+  assert.deepEqual(validResearchEngine(evidence), evidence);
+  assert.deepEqual(validResearchEngine({ ...evidence, revision: REVISION }), { ...evidence, revision: REVISION });
+  assert.equal(validResearchEngine({ engineRunId: "proof-1" }), null);
+  assert.equal(validResearchEngine({ ...evidence, command: "untrusted" }), null);
+  assert.equal(mergeResearchEngine(evidence, { ...evidence, engineRunId: "proof-2" }).conflict, true);
 });

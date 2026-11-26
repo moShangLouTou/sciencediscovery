@@ -28,13 +28,12 @@
  * process exit code is an operating-system fact, not a research result.
  */
 import type { PermissionEpoch } from "./permission.js";
-import type { ScienceFlowInputFileRole } from "./scienceflow-input-bundle.js";
+
 
 export const RESEARCH_RUN_SCHEMA_VERSION = 1;
 
-/** Workloads the Runner may run. One fixed workload exists; nothing is generic. */
-export const RESEARCH_WORKLOAD_KINDS = ["scienceflow-fixed"] as const;
-export type ResearchWorkloadKind = typeof RESEARCH_WORKLOAD_KINDS[number];
+/** A business id resolved only through the Runner's trusted workload registry. */
+export type ResearchWorkloadKind = string;
 
 /**
  * The input evidence bundle one new research execution is bound to.
@@ -54,7 +53,7 @@ export interface ResearchInputIdentity {
 export interface ResearchInputFileEvidence {
   /** Logical bundle path: never a host path. */
   readonly path: string;
-  readonly roles: readonly ScienceFlowInputFileRole[];
+  readonly roles: readonly string[];
   readonly size: number;
   readonly sha256: string;
 }
@@ -218,17 +217,13 @@ export type ResearchRefusalCode = typeof RESEARCH_REFUSAL_CODES[number];
  */
 export interface ResearchEngineEvidence {
   readonly engineRunId: string;
-  readonly attempt: number;
-  readonly revision: string;
-  readonly version: string;
-  /**
-   * SHA-256 of the derived launch manifest the bridge generated from the
-   * frozen inputs, and the version of the fixed mapping that produced it. The
-   * original bundle bytes are unchanged; this digest describes only the
-   * Runner-side derivative and never stands in for `contractDigest`.
-   */
-  readonly derivedManifestDigest: string;
-  readonly mappingVersion: number;
+  readonly engineId?: string;
+  /** Optional execution provenance; older records keep these exact fields. */
+  readonly attempt?: number;
+  readonly revision?: string;
+  readonly version?: string;
+  readonly derivedManifestDigest?: string;
+  readonly mappingVersion?: number;
 }
 
 /**

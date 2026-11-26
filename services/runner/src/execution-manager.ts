@@ -84,32 +84,30 @@ const STOP_RANK: Readonly<Record<ResearchStopState, number>> = { none: 0, reques
  */
 export function validResearchEngine(value: unknown): ResearchEngineEvidence | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  const allowed = ["attempt", "derivedManifestDigest", "engineRunId", "mappingVersion", "revision", "version"];
+  const record: Record<string, unknown> = Object.fromEntries(Object.entries(value));
+  const allowed = ["engineId", "attempt", "derivedManifestDigest", "engineRunId", "mappingVersion", "revision", "version"];
   if (Object.keys(record).some((key) => !allowed.includes(key))) return null;
+  const legacy = ["attempt", "revision", "version", "derivedManifestDigest", "mappingVersion"];
+  if (record.engineId === undefined && legacy.some((key) => record[key] === undefined)) return null;
   if (typeof record.engineRunId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/.test(record.engineRunId)) return null;
-  if (!Number.isSafeInteger(record.attempt) || (record.attempt as number) < 1) return null;
-  if (typeof record.revision !== "string" || !/^[0-9a-f]{40}$/.test(record.revision)) return null;
-  if (typeof record.version !== "string" || record.version.trim().length === 0 || record.version.length > 64) return null;
-  if (typeof record.derivedManifestDigest !== "string" || !/^[0-9a-f]{64}$/.test(record.derivedManifestDigest)) return null;
-  if (!Number.isSafeInteger(record.mappingVersion) || (record.mappingVersion as number) < 1) return null;
-  return {
-    attempt: record.attempt as number,
-    derivedManifestDigest: record.derivedManifestDigest,
-    engineRunId: record.engineRunId,
-    mappingVersion: record.mappingVersion as number,
-    revision: record.revision,
-    version: record.version,
+  if (record.engineId !== undefined && (typeof record.engineId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$/.test(record.engineId))) return null;
+  if (record.attempt !== undefined && (typeof record.attempt !== "number" || !Number.isSafeInteger(record.attempt) || record.attempt < 1)) return null;
+  if (record.revision !== undefined && (typeof record.revision !== "string" || !/^[0-9a-f]{40}$/.test(record.revision))) return null;
+  if (record.version !== undefined && (typeof record.version !== "string" || !record.version.trim() || record.version.length > 64)) return null;
+  if (record.derivedManifestDigest !== undefined && (typeof record.derivedManifestDigest !== "string" || !/^[0-9a-f]{64}$/.test(record.derivedManifestDigest))) return null;
+  if (record.mappingVersion !== undefined && (typeof record.mappingVersion !== "number" || !Number.isSafeInteger(record.mappingVersion) || record.mappingVersion < 1)) return null;
+  return { engineRunId: record.engineRunId,
+    ...(typeof record.engineId === "string" ? { engineId: record.engineId } : {}),
+    ...(typeof record.attempt === "number" ? { attempt: record.attempt } : {}),
+    ...(typeof record.revision === "string" ? { revision: record.revision } : {}),
+    ...(typeof record.version === "string" ? { version: record.version } : {}),
+    ...(typeof record.derivedManifestDigest === "string" ? { derivedManifestDigest: record.derivedManifestDigest } : {}),
+    ...(typeof record.mappingVersion === "number" ? { mappingVersion: record.mappingVersion } : {}),
   };
 }
 
 function sameResearchEngine(left: ResearchEngineEvidence, right: ResearchEngineEvidence): boolean {
-  return left.engineRunId === right.engineRunId
-    && left.attempt === right.attempt
-    && left.revision === right.revision
-    && left.version === right.version
-    && left.derivedManifestDigest === right.derivedManifestDigest
-    && left.mappingVersion === right.mappingVersion;
+  return canonicalJson(left) === canonicalJson(right);
 }
 
 /**
@@ -149,9 +147,9 @@ function isResearchRequest(request: ShellExecutionRequest | ResearchRunRequest):
  * no shell text, so the published record describes the fixed workload instead
  * of inventing an empty program that could be mistaken for one.
  */
-const RESEARCH_WORKLOAD_CODE_MARKER = [
-  "# research workload: scienceflow-fixed",
-  "# The program is Runner code, not submitted shell text.",
+const researchWorkloadCodeMarker = (workload: string) => [
+  `# research workload: ${workload}`,
+  "# The program is trusted Runner code.",
 ].join("\n");
 
 export interface ExecutionQuarantineDiagnostic {
@@ -358,6 +356,9 @@ export class ExecutionManager {
     } catch (error) {
       if (error instanceof ResearchRunError) throw new ExecutionManagerError(error.code, error.message, 400);
       throw error;
+    }
+    if (executor.accepts && !executor.accepts(request.workload)) {
+      throw new ExecutionManagerError("RESEARCH_WORKLOAD_UNKNOWN", researchRefusalMessage("RESEARCH_WORKLOAD_UNKNOWN"), 400);
     }
     // Every new execution consumes one prepared bundle. A request without that
     // identity is refused before the ledger is touched: there is no fallback to
@@ -659,7 +660,7 @@ export class ExecutionManager {
             .all(execution.id, stream).map((row) => String(row.text)).join("");
           const stdout = await this.versions.put("agent-state", readLog("stdout") || execution.result?.stdout || "");
           const stderr = await this.versions.put("agent-state", readLog("stderr") || execution.result?.stderr || execution.error || "");
-          const code = await this.versions.put("agent-state", shell?.code ?? RESEARCH_WORKLOAD_CODE_MARKER);
+          const code = await this.versions.put("agent-state", shell?.code ?? researchWorkloadCodeMarker(researchRequest?.workload ?? "unknown"));
           const collected = shell
             ? await collectExecutionRecovery(this.versions, this.recoveryStoreId, shell, execution)
             : { recovery: unknownRecovery() };

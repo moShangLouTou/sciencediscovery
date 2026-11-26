@@ -57,12 +57,11 @@ import { lstat, mkdir, open, readFile, realpath, rename, rm, stat, unlink, write
 import { basename, dirname, resolve, sep } from "node:path";
 
 import {
-  canonicalScienceFlowInputBundleManifest,
-  parseScienceFlowInputBundleManifest,
+  canonicalResearchInputBundleManifest,
+  parseResearchInputBundleManifest,
   RESEARCH_RUN_SCHEMA_VERSION,
-  RESEARCH_WORKLOAD_KINDS,
-  SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
-  isScienceFlowInputBundleDigest,
+  RESEARCH_INPUT_BUNDLE_VERSION,
+  isResearchInputBundleDigest,
   type ResearchEngineEvidence,
   type ResearchInputEvidence,
   type ResearchInputFileEvidence,
@@ -79,23 +78,11 @@ import {
   type ShellExecutionResult,
 } from "@sciencediscovery/schema";
 import { SYSTEM_SHELL_ENVIRONMENT_REVISION_ID } from "@sciencediscovery/schema";
-import { checkEngineRevision } from "@sciencediscovery/scienceflow-reader";
 import {
-  scienceFlowInputBundleDigest,
-  verifyScienceFlowInputCopy,
-  type ScienceFlowInputSnapshot,
-} from "./scienceflow-input-bundles.js";
-import {
-  ENGINE_CONTRACT_REFUSAL_FILE,
-  ENGINE_REFUSAL_MAX_BYTES,
-  parseScienceFlowEngineLink,
-  parseScienceFlowEngineRefusal,
-  researchEngineStateRoot,
-  SCIENCEFLOW_ENGINE_BRIDGE_SOURCE,
-  SCIENCEFLOW_ENGINE_MOUNT,
-  SCIENCEFLOW_ENGINE_STATE_MOUNT,
-} from "./scienceflow-engine-bridge.js";
-
+  researchInputBundleDigest,
+  verifyResearchInputCopy,
+  type ResearchInputSnapshot,
+} from "./research-input-bundles.js";
 import type { EnvironmentRuntime, EnvironmentStore } from "./environment-store.js";
 import {
   boundaryTerminationVerified,
@@ -117,11 +104,6 @@ import {
   type SandboxLaunch,
 } from "./executor.js";
 import { RUNNER_VERSION } from "./version.js";
-import {
-  verifyScienceFlowSourceBinding,
-} from "./scienceflow-runtime-check.js";
-import type { ScienceFlowRuntimeBindings } from "./scienceflow-runtime-config.js";
-
 /** The protocol the fixed program and this module share. */
 export const RESEARCH_CONTROL_PROTOCOL_VERSION = 1;
 /** Mount point of the control directory inside the sandbox. */
@@ -180,10 +162,10 @@ const REFUSAL_MESSAGES: Readonly<Record<ResearchRefusalCode, string>> = {
   RESEARCH_INPUT_REQUIRED: "A research run requires the prepared input bundle it consumes",
   RESEARCH_INPUT_UNAVAILABLE: "The prepared input bundle this run named is not available or is not the one it claims",
   RESEARCH_INPUT_COPY_FAILED: "The execution's private input copy could not be prepared and verified",
-  RESEARCH_ENGINE_NOT_CONFIGURED: "This Runner has no revision-pinned ScienceFlow engine to run",
-  RESEARCH_ENGINE_UNAVAILABLE: "The pinned ScienceFlow checkout is not the verified revision this Runner requires",
+  RESEARCH_ENGINE_NOT_CONFIGURED: "This Runner has no revision-pinned Research engine to run",
+  RESEARCH_ENGINE_UNAVAILABLE: "The pinned Research checkout is not the verified revision this Runner requires",
   RESEARCH_ENGINE_IDENTITY_MISMATCH: "The engine run does not match the pinned revision and version this Runner requires",
-  RESEARCH_ENGINE_CONTRACT_UNSUPPORTED: "The frozen ScienceFlow contract is outside the single-task, dataset-free subset this Runner supports",
+  RESEARCH_ENGINE_CONTRACT_UNSUPPORTED: "The frozen Research contract is outside the single-task, dataset-free subset this Runner supports",
 };
 
 /** A fixed refusal. The message is from the table above, never an inner one. */export class ResearchRunError extends Error {
@@ -251,7 +233,7 @@ export function parseResearchRunRequest(value: unknown): ResearchRunRequest {
   if (value.kind !== "research" || value.schemaVersion !== RESEARCH_RUN_SCHEMA_VERSION) {
     throw new ResearchRunError("RESEARCH_REQUEST_INVALID");
   }
-  if (!RESEARCH_WORKLOAD_KINDS.includes(value.workload as never)) {
+  if (typeof value.workload !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$/.test(value.workload)) {
     throw new ResearchRunError("RESEARCH_WORKLOAD_UNKNOWN");
   }
   const required = (key: string, maximum: number): string => {
@@ -321,8 +303,8 @@ export function parseResearchInputIdentity(value: unknown): ResearchInputIdentit
   if (keys.length !== 2 || keys[0] !== "bundleDigest" || keys[1] !== "contractDigest") {
     throw new ResearchRunError("RESEARCH_REQUEST_INVALID");
   }
-  if (!isScienceFlowInputBundleDigest(value.contractDigest)
-    || !isScienceFlowInputBundleDigest(value.bundleDigest)) {
+  if (!isResearchInputBundleDigest(value.contractDigest)
+    || !isResearchInputBundleDigest(value.bundleDigest)) {
     throw new ResearchRunError("RESEARCH_REQUEST_INVALID");
   }
   return { contractDigest: value.contractDigest, bundleDigest: value.bundleDigest };
@@ -854,35 +836,28 @@ export class ResearchControlChannel {
   }
 }
 
-/**
- * The real engine, as the Runner's own trusted configuration binds it.
- *
- * Every field is Runner-side configuration: a request, a route, a bundle or an
- * environment variable cannot name a checkout, a revision or a version. The
- * checkout is verified as the declared commit before any process exists, and
- * is bound read-only into the sandbox at a fixed mount.
- */
-export interface ResearchEngineBinding {
-  /** Absolute path of the revision-pinned checkout. */
-  readonly sourceRoot: string;
-  /** The full commit the checkout must be at. */
-  readonly revision: string;
-  /** The package version the checkout must declare and the bridge must report. */
-  readonly version: string;
-  /**
-   * The administrator-declared source binding this checkout is served under.
-   * Production requires it; the spawn then proves, in the same environment
-   * lease that runs the workload, that the interpreter resolves `scienceflow`
-   * from this checkout. A test wiring that names a fixture runtime is the
-   * explicit test-only assembly and may omit it.
-   */
-  readonly runtimeBindingId?: string;
-  /**
-   * Test-only seam: an importable module inside the sandbox that supplies the
-   * research step (`run(manifest)`). Production never sets it; the engine's own
-   * `run_manifest` is then the only research step.
-   */
-  readonly researchStepModule?: string;
+/** Trusted engine integration; the request can only name its registered id. */
+export interface ResearchWorkloadPreparation {
+  readonly bindArgs: readonly string[];
+  readonly writableHostRoots: readonly string[];
+  readonly arguments: readonly string[];
+  readContractRefusal?(): Promise<{ readonly reason: string } | null>;
+}
+export interface ResearchWorkloadContext {
+  readonly config: ExecutorConfig;
+  readonly request: ResearchRunRequest;
+  readonly environment?: EnvironmentRuntime;
+  readonly environmentStore?: Pick<EnvironmentStore, "withRuntime"> & Partial<Pick<EnvironmentStore, "reserveRuntimeCheck">>;
+  readonly procRoot?: string;
+  readonly fixtureRuntime?: { readonly identity: string; readonly interpreterPath: string };
+  readonly diagnose: (event: string, detail?: Record<string, unknown>) => void;
+}
+export interface ResearchWorkloadAdapter {
+  readonly id: string;
+  readonly program: string;
+  readonly requiresEngineEvidence?: boolean;
+  prepare(context: ResearchWorkloadContext): Promise<ResearchWorkloadPreparation>;
+  parseEngineLink?(text: string, executionId: string): ResearchEngineEvidence | null;
 }
 
 /** What the fixed program may be, and how the Runner reaches it. */
@@ -890,30 +865,20 @@ export interface ResearchRunWiring {
   /**
    * The trusted fixed program. It is Runner code: a request, a route, a config
    * file or an environment variable can never supply or replace it. Exactly one
-   * of `program` and `engine` is configured.
+   * of `program` and `workload` is configured.
    */
   readonly program?: string;
-  /**
-   * The real patched engine. When set, the program is the Runner's fixed
-   * bridge, the engine checkout is mounted read-only and the engine's managed
-   * lifecycle is what runs inside the sandbox.
-   */
-  readonly engine?: ResearchEngineBinding;
-  /**
-   * The Runner's administrator-declared source bindings. A production engine
-   * wiring names one by id so the research spawn can prove, inside its own
-   * environment lease, that the interpreter resolves `scienceflow` from the
-   * pinned checkout. Absent (or naming an unknown binding) is a fixed refusal
-   * before the spawn, never a fallback to a bare Git check.
-   */
-  readonly runtimeBindings?: ScienceFlowRuntimeBindings;
+  /** Engine-specific program, source verification and launch configuration. */
+  readonly workload?: ResearchWorkloadAdapter;
+  /** Stable id for a trusted fixed program; defaults to `fixed-program`. */
+  readonly workloadId?: string;
   readonly config: ExecutorConfig;
   /**
    * The real store leases the environment and keeps its mutation gate for the
    * whole workload. A production wiring always sets it; a request without an
    * environment is refused rather than falling back to the host interpreter.
    */
-  readonly environmentStore?: Pick<EnvironmentStore, "withRuntime">;
+  readonly environmentStore?: Pick<EnvironmentStore, "withRuntime"> & Partial<Pick<EnvironmentStore, "reserveRuntimeCheck">>;
   /**
    * The Runner's own content-addressed bundle store. A request names a digest;
    * this store re-verifies that the named bundle is exactly the manifest and
@@ -922,7 +887,7 @@ export interface ResearchRunWiring {
    * refuses an input-bound execution before spawn.
    */
   readonly inputBundles?: {
-    snapshot(bundleDigest: string): Promise<ScienceFlowInputSnapshot>;
+    snapshot(bundleDigest: string): Promise<ResearchInputSnapshot>;
     /** Host roots this store owns, so a launcher can prove no writable bind covers them. */
     hostRoots(): readonly string[];
   };
@@ -948,18 +913,18 @@ export interface ResearchRunWiring {
  */
 export function verifiedResearchInputs(value: unknown): ResearchInputEvidence | null {
   if (!isRecord(value) || value.state !== "verified") return null;
-  if (!isScienceFlowInputBundleDigest(value.contractDigest)
-    || !isScienceFlowInputBundleDigest(value.bundleDigest)) {
+  if (!isResearchInputBundleDigest(value.contractDigest)
+    || !isResearchInputBundleDigest(value.bundleDigest)) {
     return null;
   }
-  const parsed = parseScienceFlowInputBundleManifest({
-    schemaVersion: SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
+  const parsed = parseResearchInputBundleManifest({
+    schemaVersion: RESEARCH_INPUT_BUNDLE_VERSION,
     contractDigest: value.contractDigest,
     files: value.files,
   });
   if (parsed.status !== "ok") return null;
   const digest = createHash("sha256")
-    .update(canonicalScienceFlowInputBundleManifest(parsed.manifest), "utf8")
+    .update(canonicalResearchInputBundleManifest(parsed.manifest), "utf8")
     .digest("hex");
   if (digest !== value.bundleDigest) return null;
   return {
@@ -1006,7 +971,7 @@ async function prepareResearchInputs(
   if (inputs === undefined) throw new ResearchRunError("RESEARCH_INPUT_REQUIRED");
   const store = wiring.inputBundles;
   if (store === undefined) throw new ResearchRunError("RESEARCH_INPUT_UNAVAILABLE");
-  let snapshot: ScienceFlowInputSnapshot;
+  let snapshot: ResearchInputSnapshot;
   try {
     snapshot = await store.snapshot(inputs.bundleDigest);
   } catch {
@@ -1014,7 +979,7 @@ async function prepareResearchInputs(
   }
   const manifest = snapshot.manifest;
   if (manifest.contractDigest !== inputs.contractDigest
-    || scienceFlowInputBundleDigest(manifest) !== inputs.bundleDigest) {
+    || researchInputBundleDigest(manifest) !== inputs.bundleDigest) {
     throw new ResearchRunError("RESEARCH_INPUT_UNAVAILABLE");
   }
   for (const file of manifest.files) {
@@ -1064,7 +1029,7 @@ async function prepareResearchInputs(
     // The copy that will be mounted is checked against the same manifest the
     // bytes were verified against; a partial or damaged staging tree never
     // reaches the rename.
-    await verifyScienceFlowInputCopy(staging, manifest.files);
+    await verifyResearchInputCopy(staging, manifest.files);
     await rename(staging, root);
   } catch (error) {
     await rm(staging, { force: true, recursive: true }).catch(() => undefined);
@@ -1086,7 +1051,7 @@ async function prepareResearchInputs(
   return {
     root,
     index: JSON.stringify({
-      schemaVersion: SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
+      schemaVersion: RESEARCH_INPUT_BUNDLE_VERSION,
       contractDigest: inputs.contractDigest,
       bundleDigest: inputs.bundleDigest,
       files,
@@ -1112,6 +1077,7 @@ export interface ResearchRunOutcome {
 }
 
 export interface ResearchRunExecutor {
+  accepts?(workload: string): boolean;
   run(request: ResearchRunRequest, launch: ResearchRunLaunch): Promise<ResearchRunOutcome>;
 }
 
@@ -1121,28 +1087,39 @@ export interface ResearchRunExecutor {
  * can reach it.
  */
 export function createResearchRunExecutor(wiring: ResearchRunWiring): ResearchRunExecutor {
-  if ((wiring.program === undefined) === (wiring.engine === undefined)) {
-    // Exactly one program source: the fixture program a test injects, or the
-    // Runner's fixed bridge to a pinned engine. Neither is reachable from a
-    // request, and a wiring with both is ambiguous rather than convenient.
-    throw new ResearchRunError(wiring.engine === undefined ? "RESEARCH_RUN_NOT_CONFIGURED" : "RESEARCH_ENGINE_NOT_CONFIGURED");
+  if ((wiring.program === undefined) === (wiring.workload === undefined)) {
+    throw new ResearchRunError("RESEARCH_RUN_NOT_CONFIGURED");
   }
-  if (wiring.engine !== undefined) {
-    const engine = wiring.engine;
-    if (!engine.sourceRoot.startsWith("/") || engine.sourceRoot.split("/").includes("..")
-      || !/^[0-9a-f]{40}$/.test(engine.revision)
-      || typeof engine.version !== "string" || engine.version.trim().length === 0
-      || (engine.runtimeBindingId !== undefined
-        && !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$/.test(engine.runtimeBindingId))
-      || (engine.researchStepModule !== undefined
-        && !/^[A-Za-z_][A-Za-z0-9_.]*$/.test(engine.researchStepModule))) {
-      throw new ResearchRunError("RESEARCH_ENGINE_NOT_CONFIGURED");
-    }
-  } else if (typeof wiring.program !== "string" || wiring.program.trim().length === 0) {
+  const program = wiring.workload?.program ?? wiring.program;
+  const id = wiring.workload?.id ?? wiring.workloadId ?? "fixed-program";
+  if (typeof program !== "string" || !program.trim() || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$/.test(id)
+    || (wiring.workload?.requiresEngineEvidence && !wiring.workload.parseEngineLink)) {
     throw new ResearchRunError("RESEARCH_RUN_NOT_CONFIGURED");
   }
   return {
-    run: (request, launch) => runResearchWorkload(wiring, request, launch),
+    accepts: (workload) => workload === id,
+    run(request, launch) {
+      if (request.workload !== id) throw new ResearchRunError("RESEARCH_WORKLOAD_UNKNOWN");
+      return runResearchWorkload(wiring, request, launch);
+    },
+  };
+}
+
+/** One immutable registry is shared by all products on a Runner. */
+export function createResearchWorkloadRegistry(definitions: readonly ResearchRunWiring[]): ResearchRunExecutor {
+  const executors = new Map<string, ResearchRunExecutor>();
+  for (const definition of definitions) {
+    const id = definition.workload?.id ?? definition.workloadId ?? "fixed-program";
+    if (executors.has(id)) throw new ResearchRunError("RESEARCH_RUN_NOT_CONFIGURED");
+    executors.set(id, createResearchRunExecutor(definition));
+  }
+  return {
+    accepts: (id) => executors.has(id),
+    run(request, launch) {
+      const executor = executors.get(request.workload);
+      if (!executor) throw new ResearchRunError("RESEARCH_WORKLOAD_UNKNOWN");
+      return executor.run(request, launch);
+    },
   };
 }
 
@@ -1234,18 +1211,6 @@ export function researchPublishable(status: ResearchRunStatus | undefined): bool
  * (absent, oversized, foreign, malformed) is not a refusal and leaves the run
  * to its ordinary record handling.
  */
-async function readEngineContractRefusal(
-  root: string,
-  executionId: string,
-): Promise<{ readonly reason: string } | null> {
-  const path = resolve(root, ENGINE_CONTRACT_REFUSAL_FILE);
-  const info = await stat(path).catch(() => undefined);
-  if (info === undefined || !info.isFile() || info.size > ENGINE_REFUSAL_MAX_BYTES) return null;
-  const text = await readFile(path, "utf8").catch(() => undefined);
-  if (text === undefined) return null;
-  return parseScienceFlowEngineRefusal(text, executionId);
-}
-
 /** Mutable observation state for one run, so failures keep their owner. */
 interface RunState {
   stopState: ResearchStopState;
@@ -1295,7 +1260,7 @@ function runResearchWorkload(
     consumed: false,
     deadlineViolated: false,
     engine: undefined,
-    engineRequired: wiring.engine !== undefined,
+    engineRequired: wiring.workload?.requiresEngineEvidence ?? false,
     facts: null,
     forceReclaimRequested: false,
     inputs: request.inputs === undefined
@@ -1591,102 +1556,16 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
     };
   }
 
-  // The real engine, when this wiring runs it, must be the pinned checkout
-  // before anything else happens: a source root that is not the declared
-  // commit is a fixed pre-spawn refusal, never a fallback to another checkout
-  // or another interpreter.
-  const engine = wiring.engine;
-  let engineRoot: string | undefined;
-  if (engine !== undefined) {
-    // In a production wiring the checkout is served under an administrator
-    // binding, and this spawn proves in its own environment lease that the
-    // interpreter resolves `scienceflow` from that checkout. A Git identity
-    // check alone cannot answer that question, and no historical probe is an
-    // authorization for this attempt: without the binding and a fresh proof
-    // the run is refused before any process exists. A fixture wiring is the
-    // explicit test-only assembly and is the only shape that skips the proof.
-    if (environment !== undefined) {
-      const binding = engine.runtimeBindingId === undefined
-        ? undefined
-        : wiring.runtimeBindings?.bindingFor(engine.runtimeBindingId);
-      if (binding === undefined
-        || binding.sourceRoot !== engine.sourceRoot
-        || binding.expectedRevision !== engine.revision) {
-        options.diagnose("research_engine_source_binding_missing");
-        return {
-          research: statusOf("not_started", {
-            phase: "unknown",
-            outcome: null,
-            refusal: engine.runtimeBindingId === undefined
-              ? "RESEARCH_ENGINE_NOT_CONFIGURED"
-              : "RESEARCH_ENGINE_UNAVAILABLE",
-          }),
-          result: options.emptyResult(1, environment),
-        };
-      }
-      const verdict = await verifyScienceFlowSourceBinding({
-        binding,
-        config,
-        environment,
-        procRoot: wiring.procRoot,
-      });
-      if (verdict.status !== "verified") {
-        options.diagnose("research_engine_source_binding_refused", {
-          reason: verdict.reason ?? verdict.status,
-        });
-        // A probe whose own termination was not proven leaves the environment
-        // fenced through the store's reservation, exactly as the runtime check
-        // does; without a store the diagnostic is the only record and the run
-        // is still refused.
-        if (verdict.boundary !== undefined && request.environmentId !== undefined) {
-          const store = wiring.environmentStore as
-            | { reserveRuntimeCheck?: (id: string, boundary: ExecutionBoundaryHandle | "unproven") => void }
-            | undefined;
-          try {
-            store?.reserveRuntimeCheck?.(request.environmentId, verdict.boundary);
-          } catch {
-            options.diagnose("research_engine_binding_fence_failed");
-          }
-        }
-        return {
-          research: statusOf("not_started", {
-            phase: "unknown", outcome: null, refusal: "RESEARCH_ENGINE_UNAVAILABLE",
-          }),
-          result: options.emptyResult(1, environment),
-        };
-      }
-    }
-    let check: Awaited<ReturnType<typeof checkEngineRevision>> | undefined;
-    try {
-      check = await checkEngineRevision({ path: engine.sourceRoot, expectedRevision: engine.revision });
-    } catch {
-      check = undefined;
-    }
-    if (check === undefined || check.status !== "verified-clean") {
-      return {
-        research: statusOf("not_started", {
-          phase: "unknown", outcome: null, refusal: "RESEARCH_ENGINE_UNAVAILABLE",
-        }),
-        result: options.emptyResult(1, environment),
-      };
-    }
-    engineRoot = researchEngineStateRoot(config.dataDir, request.executionId);
-    try {
-      await mkdir(engineRoot, { recursive: true, mode: 0o700 });
-      const info = await lstat(engineRoot);
-      if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o022) !== 0) {
-        throw new ResearchRunError("RESEARCH_STATE_ROOT_UNSAFE");
-      }
-    } catch (error) {
-      return {
-        research: statusOf("not_started", {
-          phase: "unknown",
-          outcome: null,
-          refusal: error instanceof ResearchRunError ? error.code : "RESEARCH_STATE_ROOT_UNSAFE",
-        }),
-        result: options.emptyResult(1, environment),
-      };
-    }
+  let workload: ResearchWorkloadPreparation;
+  try {
+    workload = await wiring.workload?.prepare({ config, request, environment,
+      environmentStore: wiring.environmentStore, procRoot: wiring.procRoot,
+      fixtureRuntime: wiring.fixtureRuntime, diagnose: options.diagnose,
+    }) ?? { bindArgs: [], writableHostRoots: [], arguments: [] };
+  } catch (error) {
+    return { research: statusOf("not_started", { phase: "unknown", outcome: null,
+      refusal: error instanceof ResearchRunError ? error.code : "RESEARCH_ENGINE_UNAVAILABLE" }),
+      result: options.emptyResult(1, environment) };
   }
 
   // Verify the named bundle and build this execution's private copy inside the
@@ -1699,7 +1578,7 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
     // all are checked against every Runner-owned input location before the copy
     // is materialized.
     inputs = await prepareResearchInputs(wiring, request, [
-      request.workspaceRoot, channel.hostPath, ...(engineRoot === undefined ? [] : [engineRoot]),
+      request.workspaceRoot, channel.hostPath, ...workload.writableHostRoots,
     ]);
   } catch (error) {
     const code = error instanceof ResearchRunError ? error.code : "RESEARCH_INPUT_UNAVAILABLE";
@@ -1737,10 +1616,6 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
   // only extra writable bind; both mount points are Runner constants. They are
   // bound after the workspace and control binds for the same reason the input
   // copy is: nothing later can replace them with a writable view.
-  const engineBinds = engine === undefined || engineRoot === undefined ? [] : [
-    "--ro-bind", engine.sourceRoot, SCIENCEFLOW_ENGINE_MOUNT,
-    "--bind", engineRoot, SCIENCEFLOW_ENGINE_STATE_MOUNT,
-  ];
   let prepared: SandboxLaunch;
   try {
     prepared = await prepareSandboxLaunch(config, {
@@ -1755,7 +1630,7 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
       language: "python",
       pathEnv: environment ? "/opt/science-env/bin:/usr/bin" : "/usr/bin",
       workspaceBindArgs: [...workspaceBinds.args, "--bind", channel.hostPath, RESEARCH_CONTROL_MOUNT,
-        "--ro-bind", inputs.root, RESEARCH_INPUTS_MOUNT, ...engineBinds],
+        "--ro-bind", inputs.root, RESEARCH_INPUTS_MOUNT, ...workload.bindArgs],
       workspaceRoot: request.workspaceRoot,
     });
   } catch {
@@ -1776,17 +1651,9 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
   const interpreter = environment
     ? sandboxCommandPath(prepared, "/opt/science-env/bin/python", environment.interpreterPath)
     : sandboxCommandPath(prepared, fixture!.interpreterPath, fixture!.interpreterPath);
-  const engineArguments = engine === undefined ? [] : [
-    SCIENCEFLOW_ENGINE_MOUNT,
-    SCIENCEFLOW_ENGINE_STATE_MOUNT,
-    engine.revision,
-    engine.version,
-    JSON.stringify({ reportBudgetMs: schedule.reportBudgetMs, researchBudgetMs: schedule.researchBudgetMs }),
-    ...(engine.researchStepModule === undefined ? [] : [engine.researchStepModule]),
-  ];
   const commandArguments = [interpreter, "-I", "-B", "-", RESEARCH_CONTROL_MOUNT, request.executionId,
-    RESEARCH_INPUTS_MOUNT, inputs.index, ...engineArguments];
-  const program = engine === undefined ? wiring.program! : SCIENCEFLOW_ENGINE_BRIDGE_SOURCE;
+    RESEARCH_INPUTS_MOUNT, inputs.index, ...workload.arguments];
+  const program = wiring.workload?.program ?? wiring.program;
 
   let spawned = false;
   let boundary: ExecutionBoundaryHandle | "ended" | "unavailable" | undefined;
@@ -1907,8 +1774,8 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
    * what makes the result independent of the last poll's timing.
    */
   const refreshContractRefusal = async (): Promise<boolean> => {
-    if (engineRoot === undefined || state.refusal !== undefined || state.invalid) return false;
-    const refusal = await readEngineContractRefusal(engineRoot, request.executionId);
+    if (!workload.readContractRefusal || state.refusal !== undefined || state.invalid) return false;
+    const refusal = await workload.readContractRefusal();
     if (refusal === null) return false;
     state.refusal = "RESEARCH_ENGINE_CONTRACT_UNSUPPORTED";
     options.diagnose("research_engine_contract_refused", { reason: refusal.reason });
@@ -1922,10 +1789,10 @@ async function launchWorkload(options: LaunchOptions): Promise<ResearchRunOutcom
    * version is not another engine run, it is no engine run.
    */
   const readEngineLink = async (): Promise<void> => {
-    if (engine === undefined || state.engine !== undefined || state.invalid) return;
+    if (!wiring.workload?.parseEngineLink || state.engine !== undefined || state.invalid) return;
     const link = await channel.read(ENGINE_LINK_FILE);
     if (link.status === "text") {
-      const parsed = parseScienceFlowEngineLink(link.text, request.executionId, engine);
+      const parsed = wiring.workload.parseEngineLink(link.text, request.executionId);
       if (parsed === null) invalidate("RESEARCH_ENGINE_IDENTITY_MISMATCH");
       else {
         state.engine = parsed;

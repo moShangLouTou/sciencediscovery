@@ -842,7 +842,7 @@ export interface SandboxEgress {
 }
 
 /** Fixed sandbox path the research workload's engine source is mounted at. */
-export const RESEARCH_ENGINE_MOUNT = "/scienceflow-engine";
+export const RESEARCH_ENGINE_MOUNT = "/research-engine";
 /**
  * The checkout's own `.venv`, when the host has one. It is masked by an empty
  * tmpfs so `resolve_project_python()` cannot pick a source-side interpreter.
@@ -858,6 +858,8 @@ export const RESEARCH_ENGINE_VENV_MASK = `${RESEARCH_ENGINE_MOUNT}/.venv`;
 export interface SandboxResearchEngine {
   /** Host path of the trusted checkout; absolute and never the root. */
   readonly sourceRoot: string;
+  /** Trusted product mount; never read from a request. */
+  readonly mountPath?: string;
   /**
    * Mask `<sourceRoot>/.venv` with an empty tmpfs so the interpreter walk in
    * `resolve_project_python()` cannot pick a source-side interpreter.
@@ -865,7 +867,7 @@ export interface SandboxResearchEngine {
    * The mask is applied **only when the host checkout really has a `.venv`
    * directory**. That is a measured constraint, not a preference: bubblewrap
    * refuses to create the mount point of a `--tmpfs` inside a read-only bind —
-   * `bwrap: Can't create file /scienceflow-engine/.venv: Read-only file
+   * `bwrap: Can't create file /research-engine/.venv: Read-only file
    * system` — so masking an absent directory would fail the whole launch. A
    * checkout without `.venv` needs no mask, because the walk already falls back
    * to `sys.executable`; a `.venv` that is not a directory is refused rather
@@ -982,7 +984,7 @@ export function buildSandboxLaunch(options: {
   pythonPathEnv?: string;
   /**
    * Extra host paths bound read-only at their own location. Only an internal
-   * caller may pass one (the ScienceFlow runtime check binds the trusted
+   * caller may pass one (the product runtime check binds the trusted
    * checkout this way); it is never derived from a request field.
    */
   readOnlyHostBinds?: readonly string[];
@@ -1007,7 +1009,8 @@ export function buildSandboxLaunch(options: {
   // Runner-owned baseline first; profile variables never override it
   // (profileKeyAllowed re-checks the reserved/blocked policy defensively).
   if (options.researchEngine) {
-    const { sourceRoot } = options.researchEngine;
+    const { sourceRoot, mountPath } = options.researchEngine;
+    if (mountPath !== undefined && !/^\/[A-Za-z0-9_-]+$/.test(mountPath)) throw new TypeError("Invalid engine mount");
     if (!isAbsolute(sourceRoot) || sourceRoot.includes("\0") || sourceRoot === "/") {
       throw new TypeError("researchEngine.sourceRoot must be an absolute non-root path");
     }
@@ -1061,16 +1064,16 @@ export function buildSandboxLaunch(options: {
       ...options.hostInterpreterMasks,
       "--tmpfs", "/tmp",
       ...options.environmentBinds,
-      // Extra read-only host paths (this round: the trusted ScienceFlow
+      // Extra read-only host paths (this round: the trusted product
       // checkout only). Mounted at their own path so an interpreter inside the
       // sandbox resolves exactly the `sys.path` a future execution would see.
       ...(options.readOnlyHostBinds ?? []).flatMap((path) => ["--ro-bind", path, path]),
       ...(options.researchEngine
         ? [
-            "--ro-bind", options.researchEngine.sourceRoot, RESEARCH_ENGINE_MOUNT,
+            "--ro-bind", options.researchEngine.sourceRoot, options.researchEngine.mountPath ?? RESEARCH_ENGINE_MOUNT,
             // An empty tmpfs over the checkout's `.venv`: the host directory is
             // not exposed, and the interpreter walk cannot resolve into it.
-            ...(options.researchEngine.maskVirtualEnv ? ["--tmpfs", RESEARCH_ENGINE_VENV_MASK] : []),
+            ...(options.researchEngine.maskVirtualEnv ? ["--tmpfs", `${options.researchEngine.mountPath ?? RESEARCH_ENGINE_MOUNT}/.venv`] : []),
           ]
         : []),
       ...(options.egress?.bindArgs ?? []),
@@ -1286,6 +1289,7 @@ async function resolvedResearchEngine(
   return {
     maskVirtualEnv: engine.maskVirtualEnv === true && kind === "directory",
     sourceRoot,
+    ...(engine.mountPath === undefined ? {} : { mountPath: engine.mountPath }),
   };
 }
 

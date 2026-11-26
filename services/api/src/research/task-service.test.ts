@@ -35,6 +35,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { TestContext } from "node:test";
 
+import { ResearchBudgetRepository } from "./budget-repository.js";
 import { SessionStore } from "../store.js";
 import { publishArtifactVersion } from "./artifact-publisher.js";
 import {
@@ -174,7 +175,7 @@ async function fixture(
     codec: fakeCodec,
     table: "fake_research_operations",
   });
-  const lines = new SqliteLineStore(database);
+  const lines = new ResearchBudgetRepository(database, "fake_research_lines");
   const engineRuns = new Map<string, EngineRun>();
   const counters = { deliverCalls: 0, engineRecordsVisible: true, failDelivery: false, launches: 0 };
 
@@ -290,37 +291,6 @@ const fakeCodec: ResearchOperationCodec<FakeRecord> = {
   encode: (record) => record,
   schemaVersion: FAKE_VERSION,
 };
-
-class SqliteLineStore implements ResearchTaskLineStore<FakeRecord> {
-  constructor(private readonly database: DatabaseSync) {
-    database.exec(`
-      CREATE TABLE IF NOT EXISTS fake_research_lines (
-        project_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        line_key TEXT NOT NULL,
-        record_json TEXT NOT NULL,
-        PRIMARY KEY (project_id, session_id, line_key)
-      )
-    `);
-  }
-
-  get(projectId: string, sessionId: string, lineKey: string): ResearchBudgetLine | undefined {
-    const row = this.database
-      .prepare("SELECT record_json FROM fake_research_lines WHERE project_id = ? AND session_id = ? AND line_key = ?")
-      .get(projectId, sessionId, lineKey) as { record_json: string } | undefined;
-    return row ? JSON.parse(row.record_json) as ResearchBudgetLine : undefined;
-  }
-
-  put(line: ResearchBudgetLine, _record: FakeRecord): void {
-    this.database
-      .prepare(
-        `INSERT INTO fake_research_lines (project_id, session_id, line_key, record_json)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT(project_id, session_id, line_key) DO UPDATE SET record_json = excluded.record_json`,
-      )
-      .run(line.identity.projectId, line.identity.sessionId, line.lineKey, JSON.stringify(line));
-  }
-}
 
 function dedupeKey(request: FakeRequest): string {
   return createHash("sha256")

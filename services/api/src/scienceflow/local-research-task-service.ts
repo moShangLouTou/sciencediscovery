@@ -27,6 +27,7 @@
  * from a contract whose evaluator never evaluated a sample. A prepared task is
  * exploratory by construction; it is not an authoritative benchmark.
  */
+import { publishArtifactVersion, type ResearchArtifactStore } from "../research/artifact-publisher.js";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
@@ -99,20 +100,7 @@ export interface PreparedTaskStore {
     readonly id: string;
     readonly version: number;
   }[];
-  createArtifactVersion(input: {
-    artifactId?: string;
-    baseVersionId?: string;
-    content: { readonly hash: string; readonly size: number };
-    description?: string;
-    forceNewArtifact?: boolean;
-    kind: "json" | "other";
-    logicalName: string;
-    mediaType: string;
-    origin?: "llm_declared";
-    originMeta?: Record<string, string>;
-    sessionId: string;
-    title?: string;
-  }): Promise<{ artifact: ScientificArtifact; version: ScientificArtifactVersion }>;
+  createArtifactVersion: ResearchArtifactStore["createArtifactVersion"];
 }
 
 export interface PrepareTaskInput {
@@ -387,38 +375,14 @@ async function publishTaskFile(
     readonly stored: { readonly hash: string; readonly size: number };
     readonly title: string;
   },
-): Promise<{ artifact: ScientificArtifact; version: ScientificArtifactVersion }> {
-  const existing = store.getArtifactByName(input.sessionId, input.logicalName);
-  let artifactId: string | undefined;
-  let baseVersionId: string | undefined;
-  if (existing && !existing.deletedAt && existing.createdInSessionId === input.sessionId) {
-    const projectId = store.getSession(input.sessionId)!.projectId;
-    const versions = store.listProjectArtifactVersions(projectId, existing.id);
-    const head = versions.at(-1);
-    if (head && head.content.hash === input.stored.hash && head.content.size === input.stored.size) {
-      // Reuse the head: a retried preparation must not fork an identical version.
-      const artifact = store.getProjectArtifact(projectId, existing.id);
-      const version = store.getProjectArtifactVersion(projectId, head.id);
-      if (artifact && version) {
-        return { artifact: artifact as ScientificArtifact, version: version as ScientificArtifactVersion };
-      }
-    }
-    artifactId = existing.id;
-    baseVersionId = head?.id;
-  }
+): Promise<{ artifact: { id: string }; version: { id: string; version: number } }> {
   try {
-    return await store.createArtifactVersion({
-      ...(artifactId === undefined ? {} : { artifactId }),
-      ...(baseVersionId === undefined ? {} : { baseVersionId }),
-      content: input.stored,
-      kind: input.artifactKind,
-      logicalName: input.logicalName,
-      mediaType: input.mediaType,
-      origin: "llm_declared",
-      originMeta: input.originMeta,
-      sessionId: input.sessionId,
-      title: input.title,
+    const published = await publishArtifactVersion(store, {
+      bytes: input.bytes, digest: input.stored.hash, description: input.title,
+      kind: input.artifactKind, logicalName: input.logicalName, mediaType: input.mediaType,
+      origin: "llm_declared", originMeta: input.originMeta, sessionId: input.sessionId, title: input.title,
     });
+    return { artifact: { id: published.artifactId }, version: { id: published.versionId, version: published.version } };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new TaskPreparationRefusal("publication-failed", message.slice(0, 300));

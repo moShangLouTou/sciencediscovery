@@ -43,7 +43,8 @@ import {
   type ResearchTimeSchedule,
 } from "@sciencediscovery/schema";
 
-import { createResearchRunExecutor, type ResearchEngineBinding, type ResearchRunWiring } from "./research-run.js";
+import { createScienceFlowResearchRunExecutor as createResearchRunExecutor, type ScienceFlowEngineBinding as ResearchEngineBinding } from "./scienceflow-workload.js";
+import { type ResearchRunWiring } from "./research-run.js";
 import { pythonRequirementAllows, readRequiresPython } from "./scienceflow-runtime-check.js";
 import type { EnvironmentRuntime } from "./environment-store.js";
 

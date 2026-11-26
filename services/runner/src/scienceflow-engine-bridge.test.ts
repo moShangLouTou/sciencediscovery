@@ -48,11 +48,7 @@ import {
   SCIENCEFLOW_BRIDGE_PROTOCOL_VERSION,
   SCIENCEFLOW_LAUNCH_MAPPING_VERSION,
 } from "./scienceflow-engine-bridge.js";
-import {
-  createResearchRunExecutor,
-  type ResearchEngineBinding,
-  type ResearchRunWiring,
-} from "./research-run.js";
+import { createScienceFlowResearchRunExecutor as createResearchRunExecutor, type ScienceFlowEngineBinding as ResearchEngineBinding, type ScienceFlowResearchRunWiring as ResearchRunWiring } from "./scienceflow-workload.js";
 import type { ExecutorConfig } from "./executor.js";
 
 const SCHEDULE: ResearchTimeSchedule = {
@@ -126,7 +122,7 @@ test("a wiring must name exactly one program source", () => {
   assert.throws(() => createResearchRunExecutor({ config }), /no trusted research workload/);
   assert.throws(
     () => createResearchRunExecutor({ config, engine, program: "print(1)" }),
-    /no revision-pinned ScienceFlow engine/,
+    { code: "RESEARCH_ENGINE_NOT_CONFIGURED" },
   );
   assert.throws(
     () => createResearchRunExecutor({ config, program: "   " }),
@@ -144,7 +140,7 @@ test("a wiring must name exactly one program source", () => {
   ]) {
     assert.throws(
       () => createResearchRunExecutor({ config, engine: bad }),
-      /no revision-pinned ScienceFlow engine/,
+      { code: "RESEARCH_ENGINE_NOT_CONFIGURED" },
       JSON.stringify(bad),
     );
   }

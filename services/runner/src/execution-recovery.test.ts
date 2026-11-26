@@ -348,6 +348,7 @@ test("queued, running, cancelled, and unknown originals are not failed-process e
     db.prepare("INSERT INTO executions VALUES (?, ?, ?, ?)").run(stored.id, stored.sessionId, stored.agentId, JSON.stringify(stored));
     db.close();
     f.manager = new ExecutionManager(f.root);
+    await f.manager.ready();
     const parent = f.manager.get(stored.id, owner);
     if (state === "queued" || state === "running") assert.equal(parent.state, "unknown");
     const input = continuation(f.workspace, parent, `child-${state}`);

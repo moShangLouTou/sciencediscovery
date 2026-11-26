@@ -35,10 +35,10 @@ import {
   publishResearchPlan,
   ResearchPlanRefusal,
   RESEARCH_PLAN_MAX_BYTES,
-} from "./research-plan-publication.js";
+} from "./plan-publication.js";
 
-const PLAN_TEXT = "# Plan\n\nRun four paired searches from the fixed start and report honestly.\n";
-const PLAN_TEXT_V2 = "# Plan v2\n\nChange the starting candidate and rerun one paired search.\n";
+const PLAN_TEXT = "# Plan\n\nCheck a fixed arithmetic statement and report the verified facts.\n";
+const PLAN_TEXT_V2 = "# Plan v2\n\nCheck the revised statement using its exact input versions.\n";
 
 interface Fixture {
   readonly projectId: string;

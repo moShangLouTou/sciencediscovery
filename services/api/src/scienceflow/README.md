@@ -43,7 +43,31 @@ The conversation research mode uses the shared task service described in
 the [research engine integration guide](../../../../docs/en/design/research-engine-adapter.md).
 The ScienceFlow-specific wiring is described below.
 
-### Shared task service and ScienceFlow's retained rules
+### Shared execution boundary after extraction
+
+Runner is a shared execution platform. Its workload registry, signed research
+submission and immutable input/output routes, private bundle storage, sandbox
+layout, process supervision, phase deadlines, termination evidence, resource
+fences, recovery ledger and CAS publication live in the common branch. The
+API task service also provides a Runner transport adapter and concrete budget,
+scoped-record and preparation-event repositories. See the [integration guide](../../../../docs/en/design/research-engine-adapter.md).
+
+`services/runner/src/scienceflow-workload.ts` supplies the SF workload policy:
+pinned checkout/source-binding verification, engine-specific mounts and bridge
+arguments, and SF evidence/refusal parsing. `scienceflow-engine-bridge.ts`
+retains the engine protocol. `scienceflow-input-bundles.ts` selects the legacy
+cache directories and strict SF role protocol on the shared bundle store; its
+canonical manifests, digests and on-disk layout remain compatible.
+
+SF domain code retains task/evaluator contracts, probes, metric direction,
+comparability, parent/result selection policy, engine projections and product
+entry points. SQLite wrappers supply those codecs and existing table/column
+names to shared repositories. Compatibility exports for plan publication and
+the explicit host execution backend preserve existing imports. The local pilot
+still uses its explicitly selected host boundary; this extraction does not
+silently activate the sandboxed Runner or strengthen its cancellation guarantee.
+
+## Shared task service and ScienceFlow's retained rules
 
 `local-research.ts` builds a `ResearchTaskProduct` and one
 `createResearchTaskService` instance. The shared service (under

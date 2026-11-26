@@ -21,12 +21,15 @@ import {
   EXECUTION_TIMESTAMP_HEADER,
 } from "@sciencediscovery/runner";
 import {
-  canonicalScienceFlowInputBundleManifest,
-  SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
-  type ScienceFlowInputBundleManifest,
+  canonicalResearchInputBundleManifest,
+  RESEARCH_INPUT_BUNDLE_VERSION,
+  type ResearchRunRequest,
+  type ResearchInputBundleManifest,
+  type ResearchInputBundlePublication,
+  type ResearchInputBundleRequest,
+  type ResearchInputBundleStatusDto,
   type ScienceFlowInputBundlePublication,
   type ScienceFlowInputBundleRequest,
-  type ScienceFlowInputBundleStatusDto,
 } from "@sciencediscovery/schema";
 import type {
   CreateEnvironmentRequest,
@@ -75,6 +78,11 @@ const RUNNER_ERROR_CODE_MESSAGES: Readonly<Record<string, string>> = {
   RESULT_DIGEST_MISMATCH: "Runner execution result digest mismatch",
   EXECUTION_RESULT_CONFLICT: "Runner execution result conflict",
   EXECUTION_ID_CONFLICT: "Runner execution identity conflict",
+  RESEARCH_INPUT_BUNDLE_INVALID: "Research input bundle was refused by the Runner",
+  RESEARCH_INPUT_BUNDLE_CORRUPT: "Stored research input bundle on the Runner is corrupt",
+  RESEARCH_INPUT_BUNDLE_UNAVAILABLE: "Research input bundle storage on the Runner is unavailable",
+  RESEARCH_WORKLOAD_UNKNOWN: "Research workload is not registered on the Runner",
+  RESEARCH_RUN_NOT_CONFIGURED: "Research execution is not configured on the Runner",
   SCIENCEFLOW_RUNTIME_CHECK_DISABLED: "ScienceFlow runtime identity checks are not configured on the Runner",
   SCIENCEFLOW_RUNTIME_BINDING_UNKNOWN: "ScienceFlow runtime binding is not configured on the Runner",
   SCIENCEFLOW_INPUT_BUNDLE_INVALID: "ScienceFlow input bundle was refused by the Runner",
@@ -205,7 +213,7 @@ export class RunnerClient {
   }
 
   /**
-   * Make this Runner hold one frozen ScienceFlow task-input bundle.
+   * Make this Runner hold one frozen research input bundle.
    *
    * The identity is derived here from the manifest, so a request whose claimed
    * digest does not describe its own entries is refused before anything is
@@ -215,28 +223,34 @@ export class RunnerClient {
    * publication must echo this exact identity; anything else is a protocol
    * difference, never a success.
    */
-  async prepareScienceFlowInputBundle(
-    request: ScienceFlowInputBundleRequest,
+  async prepareResearchInputBundle(request: ResearchInputBundleRequest, signal?: AbortSignal): Promise<ResearchInputBundlePublication> {
+    return this.prepareInputBundle(request, "/research/input-bundles", signal);
+  }
+
+  private async prepareInputBundle(
+    request: ResearchInputBundleRequest,
+    prefix: string,
     signal?: AbortSignal,
-  ): Promise<ScienceFlowInputBundlePublication> {
-    const manifest: ScienceFlowInputBundleManifest = {
+    label = "Research",
+  ): Promise<ResearchInputBundlePublication> {
+    const manifest: ResearchInputBundleManifest = {
       schemaVersion: request.schemaVersion,
       contractDigest: request.contractDigest,
       files: request.entries.map(({ content: _content, ...file }) => file),
     };
     const digest = createHash("sha256")
-      .update(canonicalScienceFlowInputBundleManifest(manifest), "utf8")
+      .update(canonicalResearchInputBundleManifest(manifest), "utf8")
       .digest("hex");
     const totalBytes = manifest.files.reduce(
       (total, file) => total + file.size,
       0,
     );
     if (digest !== request.bundleDigest) {
-      throw new Error("ScienceFlow input bundle identity does not match its manifest");
+      throw new Error(`${label} input bundle identity does not match its manifest`);
     }
 
-    const status = await this.request<ScienceFlowInputBundleStatusDto>(
-      `/scienceflow/input-bundles/${digest}`,
+    const status = await this.request<ResearchInputBundleStatusDto>(
+      `${prefix}/${digest}`,
       { signal },
     );
     if (status.status === "ready") {
@@ -246,10 +260,10 @@ export class RunnerClient {
         status.fileCount !== manifest.files.length ||
         status.totalBytes !== totalBytes
       ) {
-        throw new Error("Runner answered for a different ScienceFlow input bundle");
+        throw new Error(`Runner answered for a different ${label} input bundle`);
       }
       return {
-        schemaVersion: SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
+        schemaVersion: RESEARCH_INPUT_BUNDLE_VERSION,
         bundleDigest: digest,
         contractDigest: request.contractDigest,
         status: "ready",
@@ -259,14 +273,14 @@ export class RunnerClient {
     }
     if (status.status === "corrupt") {
       throw new Error(
-        RUNNER_ERROR_CODE_MESSAGES.SCIENCEFLOW_INPUT_BUNDLE_CORRUPT,
+        `Stored ${label} input bundle on the Runner is corrupt`,
       );
     }
 
     const body = JSON.stringify(request);
     const timestamp = this.signingTimestamp();
-    const answer = await this.request<ScienceFlowInputBundlePublication>(
-      "/scienceflow/input-bundles",
+    const answer = await this.request<ResearchInputBundlePublication>(
+      prefix,
       {
         method: "POST",
         body,
@@ -284,16 +298,20 @@ export class RunnerClient {
     if (
       answer === null ||
       typeof answer !== "object" ||
-      answer.schemaVersion !== SCIENCE_FLOW_INPUT_BUNDLE_VERSION ||
+      answer.schemaVersion !== RESEARCH_INPUT_BUNDLE_VERSION ||
       answer.bundleDigest !== digest ||
       answer.contractDigest !== request.contractDigest ||
       answer.status !== "ready" ||
       answer.fileCount !== manifest.files.length ||
       answer.totalBytes !== totalBytes
     ) {
-      throw new Error("Runner did not confirm ScienceFlow input bundle publication");
+      throw new Error(`Runner did not confirm ${label} input bundle publication`);
     }
     return answer;
+  }
+
+  async prepareScienceFlowInputBundle(request: ScienceFlowInputBundleRequest, signal?: AbortSignal): Promise<ScienceFlowInputBundlePublication> {
+    return this.prepareInputBundle(request, "/scienceflow/input-bundles", signal, "ScienceFlow");
   }
 
   async health(): Promise<RunnerHealth> {
@@ -643,6 +661,30 @@ export class RunnerClient {
         [EXECUTION_TIMESTAMP_HEADER]: timestamp,
       },
     }));
+  }
+
+  async submitResearchExecution(request: ResearchRunRequest, signal?: AbortSignal): Promise<ManagedExecution> {
+    const timestamp = this.signingTimestamp();
+    const body = JSON.stringify(request);
+    return this.managedExecutionTimes(await this.request<ManagedExecution>("/research-executions", {
+      method: "POST", body, signal, headers: {
+        [EXECUTION_SIGNATURE_HEADER]: createExecutionSignature(this.token, timestamp, body),
+        [EXECUTION_TIMESTAMP_HEADER]: timestamp,
+      },
+    }));
+  }
+
+  /** Read committed execution output, never the mutable live Workspace. */
+  async readResearchExecutionFile(id: string, owner: ExecutionOwner, path: string, signal?: AbortSignal): Promise<Buffer> {
+    const query = new URLSearchParams({ ...owner, path });
+    const response = await fetch(`${this.baseUrl}/research-executions/${encodeURIComponent(id)}/files?${query}`, {
+      headers: { authorization: `Bearer ${this.token}` }, signal,
+    });
+    if (!response.ok) throw new Error(`Execution output read failed (${response.status})`);
+    const bytes = Buffer.from(await response.arrayBuffer());
+    const digest = response.headers.get("x-content-sha256");
+    if (!digest || createHash("sha256").update(bytes).digest("hex") !== digest) throw new Error("Execution output integrity failure");
+    return bytes;
   }
 
   async getShellExecution(id: string, owner: ExecutionOwner, signal?: AbortSignal): Promise<ManagedExecution> {

@@ -35,25 +35,26 @@ import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import {
-  canonicalScienceFlowInputBundleManifest,
-  SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
+  canonicalResearchInputBundleManifest,
+  RESEARCH_INPUT_BUNDLE_VERSION,
   type ExecutionOwner,
   type ResearchInputFileEvidence,
   type ResearchRunRequest,
   type ResearchTimeSchedule,
-  type ScienceFlowInputBundleManifest,
-  type ScienceFlowInputBundleRequest,
+  type ResearchInputBundleManifest,
+  type ResearchInputBundleRequest,
 } from "@sciencediscovery/schema";
 import { VersionStore } from "@sciencediscovery/cas";
 
 import {
-  RunnerScienceFlowInputBundles,
-  ScienceFlowInputBundleError,
-  scienceFlowInputBundleDigest,
-} from "./scienceflow-input-bundles.js";
+  RunnerResearchInputBundles,
+  ResearchInputBundleError,
+  researchInputBundleDigest,
+} from "./research-input-bundles.js";
 import {
   RESEARCH_INPUTS_MOUNT,
   createResearchRunExecutor,
+  createResearchWorkloadRegistry,
   researchInputRoot,
   type ResearchRunWiring,
 } from "./research-run.js";
@@ -210,10 +211,11 @@ interface BundleFixture {
   readonly bundleDigest: string;
   readonly files: readonly ResearchInputFileEvidence[];
   readonly contents: ReadonlyMap<string, Buffer>;
-  readonly request: ScienceFlowInputBundleRequest;
+  readonly request: ResearchInputBundleRequest;
 }
 
 function bundleFixture(options: {
+  readonly proofOnly?: boolean;
   readonly sharedDefaults?: boolean;
   readonly dualRole?: boolean;
   readonly contractDigest?: string;
@@ -223,7 +225,9 @@ function bundleFixture(options: {
     { content: "contract: 1\n", path: "manifest.yaml", roles: ["manifest"] },
     { content: "task: 1\n", path: "package/task.yaml", roles: ["task_yaml"] },
   ];
-  if (options.dualRole) {
+  if (options.proofOnly) {
+    raw.splice(0, raw.length, { content: "checked fact: 2 + 2 = 4\n", path: "facts.txt", roles: ["facts"] });
+  } else if (options.dualRole) {
     raw.push({ content: "shared description and evaluator\n", path: "package/description.md",
       roles: ["description", "evaluator"] });
   } else {
@@ -240,12 +244,12 @@ function bundleFixture(options: {
     size: Buffer.byteLength(entry.content),
     sha256: sha256(entry.content),
   }));
-  const manifest: ScienceFlowInputBundleManifest = {
-    schemaVersion: SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
+  const manifest: ResearchInputBundleManifest = {
+    schemaVersion: RESEARCH_INPUT_BUNDLE_VERSION,
     contractDigest,
     files,
   };
-  const bundleDigest = scienceFlowInputBundleDigest(manifest);
+  const bundleDigest = researchInputBundleDigest(manifest);
   const entries = raw.map((entry) => Object.freeze({
     path: entry.path,
     roles: entry.roles,
@@ -259,7 +263,7 @@ function bundleFixture(options: {
     files,
     contents: new Map(raw.map((entry) => [entry.path, Buffer.from(entry.content)])),
     request: {
-      schemaVersion: SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
+      schemaVersion: RESEARCH_INPUT_BUNDLE_VERSION,
       contractDigest,
       bundleDigest,
       entries,
@@ -300,7 +304,7 @@ function request(
     permissionEpoch: { sessionId: owner.sessionId } as ResearchRunRequest["permissionEpoch"],
     schedule: { ...SCHEDULE },
     schemaVersion: 1,
-    workload: "scienceflow-fixed",
+    workload: "fixed-program",
     workspaceRoot,
     ...overrides,
   };
@@ -308,7 +312,7 @@ function request(
 
 function wiring(
   dataDir: string,
-  store: RunnerScienceFlowInputBundles | undefined,
+  store: RunnerResearchInputBundles | undefined,
   scenario: Scenario,
 ): ResearchRunWiring {
   return {
@@ -327,12 +331,12 @@ async function managerFixture(
 ): Promise<{
   readonly dataDir: string;
   readonly manager: ExecutionManager;
-  readonly store: RunnerScienceFlowInputBundles;
+  readonly store: RunnerResearchInputBundles;
   readonly workspace: string;
   readonly root: string;
 }> {
   const { close, dataDir, root, workspace } = await scratch(context, label);
-  const store = new RunnerScienceFlowInputBundles(dataDir);
+  const store = new RunnerResearchInputBundles(dataDir);
   const manager = new ExecutionManager(dataDir, undefined, {
     research: createResearchRunExecutor(wiring(dataDir, store, scenario)),
   });
@@ -471,7 +475,7 @@ test("INPUT-RUN-04 mutating the shared source after verification does not change
   // The verified record is durable before the process exists; only then is the
   // shared source removed, while the workload has not read the mount yet.
   await until(() => manager.get("run-frozen", owner).research?.inputs?.state === "verified");
-  await rm(resolve(dataDir, ".scienceflow-input-bundles", bundle.bundleDigest),
+  await rm(resolve(dataDir, ".research-input-bundles", bundle.bundleDigest),
     { recursive: true, force: true });
   await until(() => manager.get("run-frozen", owner).state === "completed", 30_000);
   const seen = await consumed(workspace);
@@ -556,7 +560,7 @@ test("INPUT-RUN-07 a missing or corrupt bundle refuses before spawn and stays us
   // A published then tampered bundle is refused, not repaired.
   const bundle = bundleFixture();
   await store.put(bundle.request);
-  const stored = resolve(dataDir, ".scienceflow-input-bundles", bundle.bundleDigest, "manifest.yaml");
+  const stored = resolve(dataDir, ".research-input-bundles", bundle.bundleDigest, "manifest.yaml");
   // Stored entries are immutable (mode 0444); replacing the file is how an
   // out-of-band edit presents itself, and the store must report it.
   await rm(stored);
@@ -571,7 +575,7 @@ test("INPUT-RUN-07 a missing or corrupt bundle refuses before spawn and stays us
 
 test("INPUT-SNAP-01 the snapshot door refuses aliases, non-files and missing trees", async (context) => {
   const { dataDir, root } = await scratch(context, "snapshot");
-  const store = new RunnerScienceFlowInputBundles(dataDir);
+  const store = new RunnerResearchInputBundles(dataDir);
   const bundle = bundleFixture();
   await store.put(bundle.request);
   const snapshot = await store.snapshot(bundle.bundleDigest);
@@ -581,38 +585,38 @@ test("INPUT-SNAP-01 the snapshot door refuses aliases, non-files and missing tre
   }
   const missing = bundleFixture({ contractDigest: "e".repeat(64) });
   await assert.rejects(store.snapshot(missing.bundleDigest),
-    (error: unknown) => error instanceof ScienceFlowInputBundleError);
+    (error: unknown) => error instanceof ResearchInputBundleError);
 
   // A hardlink alias outside the tree is not a controlled snapshot.
   const aliasBundle = bundleFixture({ contractDigest: "d".repeat(64) });
   await store.put(aliasBundle.request);
-  const aliasRoot = resolve(dataDir, ".scienceflow-input-bundles", aliasBundle.bundleDigest);
+  const aliasRoot = resolve(dataDir, ".research-input-bundles", aliasBundle.bundleDigest);
   const outside = resolve(root, "outside-manifest");
   await link(resolve(aliasRoot, "manifest.yaml"), outside);
   await assert.rejects(store.snapshot(aliasBundle.bundleDigest),
-    (error: unknown) => error instanceof ScienceFlowInputBundleError && error.kind === "corrupt");
+    (error: unknown) => error instanceof ResearchInputBundleError && error.kind === "corrupt");
 
   // A parent component replaced by a symlink is refused, never followed.
   const linkedBundle = bundleFixture({ contractDigest: "c".repeat(64) });
   await store.put(linkedBundle.request);
-  const linkedRoot = resolve(dataDir, ".scienceflow-input-bundles", linkedBundle.bundleDigest);
+  const linkedRoot = resolve(dataDir, ".research-input-bundles", linkedBundle.bundleDigest);
   const realPackage = resolve(root, "real-package");
   await mkdir(realPackage);
   await writeFile(resolve(realPackage, "task.yaml"), bundle.contents.get("package/task.yaml")!);
   await rm(resolve(linkedRoot, "package"), { recursive: true, force: true });
   await symlink(realPackage, resolve(linkedRoot, "package"));
   await assert.rejects(store.snapshot(linkedBundle.bundleDigest),
-    (error: unknown) => error instanceof ScienceFlowInputBundleError && error.kind === "corrupt");
+    (error: unknown) => error instanceof ResearchInputBundleError && error.kind === "corrupt");
 
   // A FIFO at a file name is refused without waiting for a writer.
   const fifoBundle = bundleFixture({ contractDigest: "b".repeat(64) });
   await store.put(fifoBundle.request);
-  const fifoRoot = resolve(dataDir, ".scienceflow-input-bundles", fifoBundle.bundleDigest);
+  const fifoRoot = resolve(dataDir, ".research-input-bundles", fifoBundle.bundleDigest);
   await rm(resolve(fifoRoot, "package", "evaluate.py"));
   execFileSync("mkfifo", [resolve(fifoRoot, "package", "evaluate.py")]);
   const refused = await Promise.race([
     store.snapshot(fifoBundle.bundleDigest).then(() => "ready" as const,
-      (error: unknown) => error instanceof ScienceFlowInputBundleError ? error.kind : "other"),
+      (error: unknown) => error instanceof ResearchInputBundleError ? error.kind : "other"),
     delay(2_000).then(() => "timeout" as const),
   ]);
   assert.equal(refused, "corrupt");
@@ -625,7 +629,7 @@ test("INPUT-RUN-08 a bundle with an extra entry refuses before spawn, like statu
   // The published tree gains an entry the manifest does not name. `status`
   // already answers corrupt; a consuming run must not accept what the public
   // query rejects.
-  await writeFile(resolve(dataDir, ".scienceflow-input-bundles", bundle.bundleDigest, "unexpected.txt"), "extra\n");
+  await writeFile(resolve(dataDir, ".research-input-bundles", bundle.bundleDigest, "unexpected.txt"), "extra\n");
   assert.equal((await store.status(bundle.bundleDigest)).status, "corrupt");
   manager.submitResearch(request("run-extra", workspace, bundle));
   await until(() => ["failed", "unknown"].includes(manager.get("run-extra", owner).state));
@@ -644,7 +648,7 @@ test("INPUT-ALIAS-01 a workspace at the input parent exposes no writable alias a
   // reachable through `/workspace/<digest>` as well as `/research-inputs`.
   const workspace = resolve(dataDir, "runner-research-inputs");
   await mkdir(workspace, { recursive: true });
-  const store = new RunnerScienceFlowInputBundles(dataDir);
+  const store = new RunnerResearchInputBundles(dataDir);
   const manager = new ExecutionManager(dataDir, undefined, {
     research: createResearchRunExecutor(wiring(dataDir, store, {})),
   });
@@ -668,7 +672,7 @@ test("INPUT-ALIAS-02 a workspace at an ancestor of the data directory is refused
   // is exercised directly here: with a workspace that contains the data
   // directory, the manager's own workspace snapshot races the state root it
   // creates, which would mask this refusal with an unrelated failure.
-  const store = new RunnerScienceFlowInputBundles(dataDir);
+  const store = new RunnerResearchInputBundles(dataDir);
   const bundle = bundleFixture();
   await store.put(bundle.request);
   const executor = createResearchRunExecutor(wiring(dataDir, store, {}));
@@ -687,7 +691,7 @@ test("INPUT-ALIAS-03 a workspace that is a host symlink to the data directory is
   await symlink(dataDir, workspace);
   // The link is resolved before comparison, so the writable bind's real target
   // is what is checked, not the spelling the request used.
-  const store = new RunnerScienceFlowInputBundles(dataDir);
+  const store = new RunnerResearchInputBundles(dataDir);
   const bundle = bundleFixture();
   await store.put(bundle.request);
   const executor = createResearchRunExecutor(wiring(dataDir, store, {}));
@@ -706,7 +710,7 @@ test("INPUT-ALIAS-04 a workspace naming the not-yet-created copy root is refused
   // only existing directories would see two missing paths and allow the run;
   // the canonical future spelling must still be recognised as the same place.
   const workspace = researchInputRoot(dataDir, "run-future-root");
-  const store = new RunnerScienceFlowInputBundles(dataDir);
+  const store = new RunnerResearchInputBundles(dataDir);
   const bundle = bundleFixture();
   await store.put(bundle.request);
   const executor = createResearchRunExecutor(wiring(dataDir, store, {}));
@@ -720,33 +724,33 @@ test("INPUT-ALIAS-04 a workspace naming the not-yet-created copy root is refused
 
 test("INPUT-SNAP-03 status and snapshot refuse the same extra entries", async (context) => {
   const { dataDir, root } = await scratch(context, "extra-snapshot");
-  const store = new RunnerScienceFlowInputBundles(dataDir);
+  const store = new RunnerResearchInputBundles(dataDir);
   const corrupt = (error: unknown): boolean =>
-    error instanceof ScienceFlowInputBundleError && error.kind === "corrupt";
+    error instanceof ResearchInputBundleError && error.kind === "corrupt";
 
   const extraFile = bundleFixture({ contractDigest: "a".repeat(64) });
   await store.put(extraFile.request);
-  const extraFileRoot = resolve(dataDir, ".scienceflow-input-bundles", extraFile.bundleDigest);
+  const extraFileRoot = resolve(dataDir, ".research-input-bundles", extraFile.bundleDigest);
   await writeFile(resolve(extraFileRoot, "unexpected.txt"), "extra\n");
   assert.equal((await store.status(extraFile.bundleDigest)).status, "corrupt");
   await assert.rejects(store.snapshot(extraFile.bundleDigest), corrupt);
 
   const extraDirectory = bundleFixture({ contractDigest: "b".repeat(64) });
   await store.put(extraDirectory.request);
-  await mkdir(resolve(dataDir, ".scienceflow-input-bundles", extraDirectory.bundleDigest, "extra"));
+  await mkdir(resolve(dataDir, ".research-input-bundles", extraDirectory.bundleDigest, "extra"));
   assert.equal((await store.status(extraDirectory.bundleDigest)).status, "corrupt");
   await assert.rejects(store.snapshot(extraDirectory.bundleDigest), corrupt);
 
   const extraLink = bundleFixture({ contractDigest: "c".repeat(64) });
   await store.put(extraLink.request);
   await symlink(resolve(root, "elsewhere"),
-    resolve(dataDir, ".scienceflow-input-bundles", extraLink.bundleDigest, "link"));
+    resolve(dataDir, ".research-input-bundles", extraLink.bundleDigest, "link"));
   assert.equal((await store.status(extraLink.bundleDigest)).status, "corrupt");
   await assert.rejects(store.snapshot(extraLink.bundleDigest), corrupt);
 
   const extraFifo = bundleFixture({ contractDigest: "d".repeat(64) });
   await store.put(extraFifo.request);
-  execFileSync("mkfifo", [resolve(dataDir, ".scienceflow-input-bundles", extraFifo.bundleDigest, "pipe")]);
+  execFileSync("mkfifo", [resolve(dataDir, ".research-input-bundles", extraFifo.bundleDigest, "pipe")]);
   assert.equal((await store.status(extraFifo.bundleDigest)).status, "corrupt");
   const refused = await Promise.race([
     store.snapshot(extraFifo.bundleDigest).then(() => "ready" as const, corrupt),
@@ -757,15 +761,43 @@ test("INPUT-SNAP-03 status and snapshot refuse the same extra entries", async (c
 
 test("INPUT-SNAP-02 a re-verified copy is byte-identical to the snapshot", async (context) => {
   const { dataDir } = await scratch(context, "copy");
-  const store = new RunnerScienceFlowInputBundles(dataDir);
+  const store = new RunnerResearchInputBundles(dataDir);
   const bundle = bundleFixture({ sharedDefaults: true });
   await store.put(bundle.request);
   const snapshot = await store.snapshot(bundle.bundleDigest);
   // The canonical manifest is a function of the same fields; two reads agree.
   const again = await store.snapshot(bundle.bundleDigest);
-  assert.equal(canonicalScienceFlowInputBundleManifest(again.manifest),
-    canonicalScienceFlowInputBundleManifest(snapshot.manifest));
+  assert.equal(canonicalResearchInputBundleManifest(again.manifest),
+    canonicalResearchInputBundleManifest(snapshot.manifest));
   for (const [path, bytes] of snapshot.contents) {
     assert.deepEqual(again.contents.get(path), bytes, path);
   }
+});
+
+
+test("a proof-only workload uses the shared registry, durable ledger and immutable inputs", async (context) => {
+  const { close, dataDir, workspace } = await scratch(context, "proof-product");
+  const store = new RunnerResearchInputBundles(dataDir);
+  const bundle = bundleFixture({ proofOnly: true });
+  await store.put(bundle.request);
+  const definitions = ["proof-checker", "another-product"].map((workloadId) => ({ ...wiring(dataDir, store, {}), workloadId }));
+  const registry = createResearchWorkloadRegistry(definitions);
+  let manager = new ExecutionManager(dataDir, undefined, { research: registry });
+  close(async () => manager.close());
+  assert.throws(() => manager.submitResearch(request("unknown", workspace, bundle, { workload: "unregistered" })),
+    { code: "RESEARCH_WORKLOAD_UNKNOWN" });
+  const input = request("proof", workspace, bundle, { workload: "proof-checker" });
+  assert.equal(manager.submitResearch(input).accepted, true);
+  assert.equal(manager.submitResearch(input).accepted, false);
+  await until(() => manager.get("proof", owner).state === "completed");
+  const completed = manager.get("proof", owner);
+  assert.ok(completed.version);
+  assert.deepEqual(completed.research?.inputs?.files?.map((file) => file.roles), [["facts"]]);
+  assert.equal((await consumed(workspace)).files[0]?.sha256, bundle.files[0]?.sha256);
+  await manager.close();
+  manager = new ExecutionManager(dataDir, undefined, { research: createResearchWorkloadRegistry(definitions) });
+  assert.deepEqual(manager.get("proof", owner).version, completed.version);
+  assert.equal(manager.submitResearch(input).accepted, false);
+  manager.submitResearch(request("another", workspace, bundle, { workload: "another-product" }));
+  await until(() => manager.get("another", owner).state === "completed");
 });

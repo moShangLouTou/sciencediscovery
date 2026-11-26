@@ -65,13 +65,8 @@ import {
   type ScienceFlowInputFileRole,
 } from "@sciencediscovery/schema";
 
-import {
-  createResearchRunExecutor,
-  researchInputRoot,
-  researchStateRoot,
-  type ResearchEngineBinding,
-  type ResearchRunWiring,
-} from "./research-run.js";
+import { createScienceFlowResearchRunExecutor as createResearchRunExecutor, type ScienceFlowEngineBinding as ResearchEngineBinding, type ScienceFlowResearchRunWiring as ResearchRunWiring } from "./scienceflow-workload.js";
+import { researchInputRoot, researchStateRoot } from "./research-run.js";
 import { researchEngineStateRoot, SCIENCEFLOW_ENGINE_STATE_MOUNT } from "./scienceflow-engine-bridge.js";
 import { ExecutionManager } from "./execution-manager.js";
 import type { EnvironmentRuntime } from "./environment-store.js";

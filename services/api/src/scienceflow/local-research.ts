@@ -37,6 +37,8 @@
  *   same run, but no Agent-visible view carries them;
  * - a run whose state cannot be read is reported `unknown`, never relaunched.
  */
+import type { ResearchArtifactStore } from "../research/artifact-publisher.js";
+import { observeResearchPreparation } from "../research/preparation.js";
 import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -105,7 +107,7 @@ import {
   ResearchPlanRefusal,
   type ResearchPlanPublication,
   type ResearchPlanStore,
-} from "./research-plan-publication.js";
+} from "../research/plan-publication.js";
 import {
   isTerminalResearchState,
   SCIENCE_FLOW_LOCAL_RESEARCH_OPERATION_VERSION,
@@ -275,23 +277,7 @@ export interface LocalResearchServiceStore extends ResearchPilotReadbackStore {
   readonly listProjectArtifactVersions: ResearchPlanStore["listProjectArtifactVersions"];
   /** The Session's recorded model usage; used to account for Agent decisions. */
   readonly listModelInvocationUsage?: (sessionId: string) => Promise<ModelInvocationUsage[]>;
-  readonly createArtifactVersion: (input: {
-    readonly artifactId?: string;
-    readonly baseVersionId?: string;
-    readonly content: { readonly hash: string; readonly size: number };
-    readonly description?: string;
-    readonly forceNewArtifact?: boolean;
-    readonly kind: "json" | "markdown" | "other";
-    readonly logicalName: string;
-    readonly mediaType: string;
-    readonly origin?: ArtifactOrigin;
-    readonly originMeta?: ArtifactOriginMeta;
-    readonly sessionId: string;
-    readonly title?: string;
-  }) => Promise<{
-    readonly artifact: ScientificArtifact;
-    readonly version: ScientificArtifactVersion;
-  }>;
+  readonly createArtifactVersion: ResearchArtifactStore["createArtifactVersion"];
 }
 
 export interface LocalResearchStartInput {
@@ -1691,52 +1677,44 @@ export function createLocalResearchService(input: {
 
     async prepareTask(input: LocalResearchTaskPrepareInput): Promise<PreparedTaskPublication> {
       const adapter = requireTaskDynamic();
-      const startedAt = now();
-      let publication: PreparedTaskPublication | undefined;
-      let failure: unknown;
-      try {
-        publication = await prepareResearchTask(store, input, {
-          now,
-          readBytes: readArtifactBytes,
-          settings: adapter,
-          tasksRoot: join(settings.workRoot, "tasks"),
+      return observeResearchPreparation({
+        now,
+        work: () => prepareResearchTask(store, input, {
+          now, readBytes: readArtifactBytes, settings: adapter, tasksRoot: join(settings.workRoot, "tasks"),
           ...(dependencies.probeTask ? { probe: dependencies.probeTask } : {}),
-        });
-      } catch (error) {
-        failure = error;
-      }
-      const finishedAt = now();
-      const startedMs = Date.parse(startedAt);
-      const finishedMs = Date.parse(finishedAt);
-      const wallClockKnown = Number.isFinite(startedMs) && Number.isFinite(finishedMs) && finishedMs >= startedMs;
-      const preparation: ScienceFlowResearchPreparation = {
-        error: failure === undefined ? undefined : errorMessage(failure),
-        finishedAt,
-        identity: { projectId: input.projectId, sessionId: input.sessionId },
-        outcome: failure === undefined ? "succeeded" : "failed",
-        preparationId: newOperationId(),
-        probe: {
-          evaluations: publication === undefined ? 0 : 2,
-          evaluatorSha256: publication?.evaluatorSha256 ?? null,
-          status: publication === undefined ? "unknown" : "known",
+        }),
+        record: (observation) => {
+          const publication = observation.outcome === "succeeded" ? observation.value : undefined;
+          const failure = observation.outcome === "failed" ? observation.error : undefined;
+          const { startedAt, finishedAt } = observation;
+          const preparation: ScienceFlowResearchPreparation = {
+            error: failure === undefined ? undefined : errorMessage(failure),
+            finishedAt,
+            identity: { projectId: input.projectId, sessionId: input.sessionId },
+            outcome: observation.outcome,
+            preparationId: newOperationId(),
+            probe: {
+              evaluations: publication === undefined ? 0 : 2,
+              evaluatorSha256: publication?.evaluatorSha256 ?? null,
+              status: publication === undefined ? "unknown" : "known",
+            },
+            runId: input.runId,
+            schemaVersion: RESEARCH_PREPARATION_VERSION,
+            startedAt,
+            taskId: publication?.taskId ?? preparedTaskId(input.slug, input.objective),
+            taskVersionId: publication?.taskVersionId ?? null,
+            tokens: {
+              note: "The evaluator probe runs code, not a model call; this is not a zero-token model invocation.",
+              status: "not-applicable",
+            },
+            wallClock: {
+              seconds: observation.elapsedSeconds ?? 0,
+              status: observation.elapsedSeconds === null ? "unknown" : "known",
+            },
+          };
+          preparations().record(preparation);
         },
-        runId: input.runId,
-        schemaVersion: RESEARCH_PREPARATION_VERSION,
-        startedAt,
-        taskId: publication?.taskId ?? preparedTaskId(input.slug, input.objective),
-        taskVersionId: publication?.taskVersionId ?? null,
-        tokens: {
-          note: "The evaluator probe runs code, not a model call; this is not a zero-token model invocation.",
-          status: "not-applicable",
-        },
-        wallClock: {
-          seconds: wallClockKnown ? (finishedMs - startedMs) / 1_000 : 0,
-          status: wallClockKnown ? "known" : "unknown",
-        },
-      };
-      preparations().record(preparation);
-      if (failure !== undefined) throw failure;
-      return publication!;
+      });
     },
 
     async checkEvolvePilot(input): Promise<EvolvePilotCheckView> {

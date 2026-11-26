@@ -11,7 +11,7 @@ import {
 } from "./execution-boundary.js";
 
 /**
- * The table that keeps an environment fenced while a ScienceFlow runtime probe
+ * The table that keeps an environment fenced while a runtime probe
  * could not be proven to have stopped. It lives in the same ledger as
  * `execution_resources` so a Runner restart cannot forget it; the row is only
  * removed with the round-10 proof that the process boundary is empty.

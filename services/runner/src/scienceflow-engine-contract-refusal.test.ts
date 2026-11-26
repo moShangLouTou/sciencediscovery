@@ -53,11 +53,8 @@ import {
 
 import { ExecutionManager } from "./execution-manager.js";
 import { researchEngineStateRoot } from "./scienceflow-engine-bridge.js";
-import {
-  createResearchRunExecutor,
-  researchInputRoot,
-  type ResearchRunWiring,
-} from "./research-run.js";
+import { createScienceFlowResearchRunExecutor as createResearchRunExecutor, type ScienceFlowResearchRunWiring as ResearchRunWiring } from "./scienceflow-workload.js";
+import { researchInputRoot } from "./research-run.js";
 import type { EnvironmentRuntime } from "./environment-store.js";
 
 const ENGINE = process.env.SCIENCEFLOW_ENGINE_CHECKOUT;

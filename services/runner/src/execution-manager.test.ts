@@ -438,6 +438,7 @@ test("restart retains completed results and marks unfinished records unknown wit
     JSON.stringify({ ...owner, id: "lost", state: "running", queuedAt: new Date().toISOString() }));
   db.close();
   const restarted = new ExecutionManager(root);
+  await restarted.ready();
   try {
     assert.equal(restarted.get("finished", owner).result?.stdout, "done");
     assert.equal(restarted.get("lost", owner).state, "unknown");
@@ -599,6 +600,7 @@ test("restart preserves identity and quarantines original workspace and selected
   db.prepare("UPDATE executions SET record = ? WHERE id = ?").run(JSON.stringify(interrupted), "orphan");
   db.close();
   const restarted = new ExecutionManager(root);
+  await restarted.ready();
   try {
     assert.equal(restarted.identity.runnerInstanceId, identity.runnerInstanceId);
     assert.notEqual(restarted.identity.runnerBootId, identity.runnerBootId);
@@ -621,6 +623,7 @@ test("restart preserves identity and quarantines original workspace and selected
     await until(() => restarted.get("unrelated", owner).state === "completed");
   } finally { await restarted.close(); }
   const again = new ExecutionManager(root);
+  await again.ready();
   try {
     assert.equal(again.identity.runnerInstanceId, identity.runnerInstanceId);
     assert.throws(() => again.start(request(workspace, "still-blocked"), async () => assert.fail("quarantine expired")), { code: "EXECUTION_RESOURCE_QUARANTINED" });
@@ -638,6 +641,7 @@ test("a legacy unknown record without resource scope blocks unrelated new submis
     JSON.stringify({ ...owner, id: "legacy", state: "unknown", queuedAt: new Date().toISOString() }));
   db.close();
   const restarted = new ExecutionManager(root);
+  await restarted.ready();
   try {
     assert.throws(() => restarted.start({ ...request("/unrelated-workspace", "new-id"), npuDevices: [7] }, async () => assert.fail("legacy unknown admitted work")), { code: "EXECUTION_RESOURCE_QUARANTINED" });
   } finally { await restarted.close(); }
@@ -693,6 +697,7 @@ test("Unicode log cursors remain stable across pagination, duplicate submission 
   const terminal = manager.get("unicode", owner);
   await manager.close();
   const restarted = new ExecutionManager(root);
+  await restarted.ready();
   try {
     assert.deepEqual(restarted.get("unicode", owner), terminal);
     assert.deepEqual(restarted.logs("unicode", owner), first);
@@ -782,6 +787,7 @@ test("a crashed Runner releases the OS-owned ledger lock and restart quarantines
   child.kill("SIGKILL");
   await exited;
   const restarted = new ExecutionManager(root);
+  await restarted.ready();
   try {
     assert.equal(restarted.identity.runnerInstanceId, identity.runnerInstanceId);
     assert.notEqual(restarted.identity.runnerBootId, identity.runnerBootId);
@@ -866,10 +872,9 @@ for (const point of ["before-publication", "after-publication", "conflicting-hea
     const restarted = new ExecutionManager(root, detail => { diagnostics.push(detail); throw new Error("sink unavailable"); });
     let recoveredRevision: number | undefined;
     try {
-      if (point === "invalid-target") assert.equal(restarted.get(input.executionId, owner).state, "unknown");
-      else assert.throws(() => restarted.get(input.executionId, owner), { code: "EXECUTION_RECOVERY_PENDING", statusCode: 503 });
+      assert.throws(() => restarted.get(input.executionId, owner), { code: "EXECUTION_RECOVERY_PENDING", statusCode: 503 });
       if (point === "before-publication") {
-        assert.equal(validating, true);
+        await until(() => validating);
         assert.throws(() => restarted.get(input.executionId, { ...owner, agentId: "other" }), { code: "EXECUTION_NOT_FOUND", statusCode: 404 });
         assert.throws(() => restarted.submit(input, async () => assert.fail("recovering POST replayed")), { code: "EXECUTION_RECOVERY_PENDING", statusCode: 503 });
         assert.equal(restarted.logs(input.executionId, owner).chunks.map(chunk => chunk.text).join(""), "original-result");
@@ -927,11 +932,12 @@ test("startup quarantine diagnostics expose only scope and IDs and cannot releas
   db.close();
   const messages: ExecutionQuarantineDiagnostic[] = [];
   const restarted = new ExecutionManager(root, detail => { messages.push(detail); throw new Error("diagnostic sink unavailable"); });
+  await restarted.ready();
   try {
-    assert.deepEqual(messages, [
-      { phase: "startup", executionId: "scoped", scope: "workspace-and-devices", workspaceKeyHash: createHash("sha256").update("/workspace/example").digest("hex"), npuDevices: [2] },
-      { phase: "startup", executionId: "legacy", scope: "runner" },
-    ]);
+    assert.deepEqual(messages, ["startup", "publication-recovery"].flatMap((phase) => [
+      { phase, executionId: "scoped", scope: "workspace-and-devices", workspaceKeyHash: createHash("sha256").update("/workspace/example").digest("hex"), npuDevices: [2] },
+      { phase, executionId: "legacy", scope: "runner" },
+    ]));
     assert.ok(!JSON.stringify(messages).includes("SECRET_SENTINEL"));
     assert.ok(!JSON.stringify(messages).includes("/workspace/example"), "absolute workspace paths stay out of diagnostics");
     assert.throws(() => restarted.start(request("/unrelated", "blocked"), async () => assert.fail("diagnostic released quarantine")),
@@ -1095,6 +1101,7 @@ test("a handle from another boot is never signaled and never settles the record"
     handle: boundaryRow("other-boot", { bootId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", pid,
       processGroupId: pid, sessionId: pid }) });
   const manager = new ExecutionManager(root);
+  await manager.ready();
   try {
     const recovered = manager.get("other-boot", owner);
     assert.equal(recovered.boundary?.state, "boot-changed");
@@ -1125,6 +1132,7 @@ test("a corrupt or foreign boundary row fails closed instead of being repaired",
   await seedInterruptedExecution(root, "foreign", { workspaceKey: other,
     handle: boundaryRow("someone-else") });
   const manager = new ExecutionManager(root);
+  await manager.ready();
   try {
     for (const [id, key] of [["corrupt", workspace], ["foreign", other]] as const) {
       const recovered = manager.get(id, owner);

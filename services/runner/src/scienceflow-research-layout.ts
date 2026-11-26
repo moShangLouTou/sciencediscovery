@@ -41,7 +41,6 @@ import {
 import {
   environmentPrefixBindArguments,
   ProcessTerminationUnverifiedError,
-  RESEARCH_ENGINE_MOUNT,
   hostInterpreterMaskArguments,
   prepareSandboxLaunch,
   resolveHostRuntimeSupport,
@@ -50,6 +49,8 @@ import {
   workspaceBindArguments,
   type ExecutorConfig,
 } from "./executor.js";
+
+import { SCIENCEFLOW_ENGINE_MOUNT as RESEARCH_ENGINE_MOUNT } from "./scienceflow-engine-bridge.js";
 
 /** Bound on one research-layout probe run. */
 export const RESEARCH_LAYOUT_PROBE_TIMEOUT_MS = 60_000;
@@ -256,7 +257,7 @@ export async function runResearchLayoutProbe(
       // The child's search path, fixed by the Runner: the mount, never a host
       // directory. `-P` keeps `cwd` out, so the workspace cannot shadow it.
       pythonPathEnv: RESEARCH_ENGINE_MOUNT,
-      researchEngine: { maskVirtualEnv: options.maskVirtualEnv, sourceRoot },
+      researchEngine: { mountPath: RESEARCH_ENGINE_MOUNT, maskVirtualEnv: options.maskVirtualEnv, sourceRoot },
       workspaceBindArgs: workspaceBinds.args,
       workspaceRoot: workspace,
     });

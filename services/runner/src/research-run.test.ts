@@ -78,15 +78,15 @@ import {
   type ProvisionerExecutor,
 } from "./environment-store.js";
 import {
-  canonicalScienceFlowInputBundleManifest,
-  SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
+  canonicalResearchInputBundleManifest,
+  RESEARCH_INPUT_BUNDLE_VERSION,
   type ExecutionOwner,
   type ResearchInputEvidence,
   type ResearchInputIdentity,
   type ResearchRunRequest,
   type ResearchRunStatus,
   type ResearchTimeSchedule,
-  type ScienceFlowInputBundleManifest,
+  type ResearchInputBundleManifest,
   type ShellExecutionRequest,
 } from "@sciencediscovery/schema";
 
@@ -109,7 +109,7 @@ const SCHEDULE: ResearchTimeSchedule = {
  */
 interface InputFixture {
   readonly identity: ResearchInputIdentity;
-  readonly manifest: ScienceFlowInputBundleManifest;
+  readonly manifest: ResearchInputBundleManifest;
   readonly contents: ReadonlyMap<string, Buffer>;
   readonly evidence: ResearchInputEvidence;
 }
@@ -128,13 +128,13 @@ function inputFixture(): InputFixture {
     size: Buffer.byteLength(entry.content),
     sha256: createHash("sha256").update(entry.content).digest("hex"),
   }));
-  const manifest: ScienceFlowInputBundleManifest = {
-    schemaVersion: SCIENCE_FLOW_INPUT_BUNDLE_VERSION,
+  const manifest: ResearchInputBundleManifest = {
+    schemaVersion: RESEARCH_INPUT_BUNDLE_VERSION,
     contractDigest,
     files,
   };
   const bundleDigest = createHash("sha256")
-    .update(canonicalScienceFlowInputBundleManifest(manifest), "utf8")
+    .update(canonicalResearchInputBundleManifest(manifest), "utf8")
     .digest("hex");
   return {
     identity: { contractDigest, bundleDigest },
@@ -179,7 +179,7 @@ function researchRequest(
     permissionEpoch: { sessionId: owner.sessionId } as ResearchRunRequest["permissionEpoch"],
     schedule: { ...SCHEDULE },
     schemaVersion: 1,
-    workload: "scienceflow-fixed",
+    workload: "fixed-program",
     workspaceRoot,
     ...overrides,
   };
@@ -203,7 +203,7 @@ function status(overrides: Partial<ResearchRunStatus> = {}): ResearchRunStatus {
     schemaVersion: 1,
     stop: "none",
     verificationWindowMs: SCHEDULE.verificationWindowMs,
-    workload: "scienceflow-fixed",
+    workload: "fixed-program",
     ...overrides,
   };
   // A run that was accepted but never spawned still carries only the caller's
@@ -538,7 +538,7 @@ test("a research request cannot name a program, a path, a state root or a contro
     { stateRoot: "/tmp/elsewhere" },
     { controlPath: "/tmp/elsewhere" },
     { environment: { PATH: "/host" } },
-    { module: "scienceflow" },
+    { module: "untrusted_module" },
   ]) {
     assert.throws(() => parseResearchRunRequest({ ...researchRequest("id", "/workspace"), ...extra }),
       (error: unknown) => error instanceof ResearchRunError && error.code === "RESEARCH_REQUEST_INVALID",
@@ -550,7 +550,7 @@ test("a research request cannot name a program, a path, a state root or a contro
     (error: unknown) => error instanceof ResearchRunError && error.code === "RESEARCH_REQUEST_INVALID");
   assert.throws(() => parseResearchRunRequest(researchRequest("../escape", "/workspace")),
     (error: unknown) => error instanceof ResearchRunError && error.code === "RESEARCH_REQUEST_INVALID");
-  assert.throws(() => parseResearchRunRequest(researchRequest("id", "/workspace", { workload: "scienceflow" as never })),
+  assert.throws(() => parseResearchRunRequest(researchRequest("id", "/workspace", { workload: "../engine" as never })),
     (error: unknown) => error instanceof ResearchRunError && error.code === "RESEARCH_WORKLOAD_UNKNOWN");
   // The accepted shape carries exactly the identity, the input reference and
   // the schedule.
